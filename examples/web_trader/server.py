@@ -2944,7 +2944,12 @@ def stop_script(_: bool = Depends(get_access)) -> dict[str, str]:
 @app.get("/script/monitor")
 def get_script_monitor(_: bool = Depends(get_access)) -> dict[str, Any]:
     engine = require_script()
-    data = load_json("gex_tv_strangle_status.json") or load_json("as_option_mm_status.json") or {}
+    data = (
+        load_json("gex_tv_strangle_status.json")
+        or load_json("io_covered_call_status.json")
+        or load_json("as_option_mm_status.json")
+        or {}
+    )
     data["engine_active"] = bool(engine.strategy_active)
     data["live_supervisor"] = _live_supervisor is not None
     if _live_supervisor is not None:

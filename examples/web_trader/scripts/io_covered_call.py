@@ -18,7 +18,7 @@ import os
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, time as dtime
-from time import sleep, time as wall_time
+from time import sleep
 
 from vnpy.trader.constant import OptionType, Product
 from vnpy.trader.object import TickData

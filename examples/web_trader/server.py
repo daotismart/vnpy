@@ -2520,9 +2520,11 @@ class LiveSupervisor:
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.loop, name="live-supervisor", daemon=True)
         self.next_connect = 0.0
+        self.connect_failures = 0
         self.inited: set[str] = set()
         self.last_log = ""
         self.ctp_ok = False
+        self.connecting = False
 
     def start(self) -> None:
         os.environ.setdefault("LIVE_PORTFOLIOS", ",".join(self.portfolios))
@@ -2568,14 +2570,33 @@ class LiveSupervisor:
                 return
         self.ensure_script()
 
+    @staticmethod
+    def cffex_session_open(now: datetime | None = None) -> bool:
+        """Rough CFFEX IO/IF session gate (Asia/Shanghai wall clock)."""
+        now = now or datetime.now()
+        if now.weekday() >= 5:
+            return False
+        hhmm = now.hour * 100 + now.minute
+        # day: 09:00-11:35, 12:55-15:15 (login buffer around official hours)
+        return (900 <= hhmm <= 1135) or (1255 <= hhmm <= 1515)
+
+    def connect_backoff_sec(self) -> float:
+        # Outside session: slow down hard to avoid CTP front thrash.
+        if not self.cffex_session_open():
+            return min(900.0, 120.0 * max(1, self.connect_failures))
+        return min(300.0, 30.0 * (2 ** min(self.connect_failures, 3)))
+
     def ensure_ctp(self) -> bool:
         assert main_engine is not None
         accounts = main_engine.get_all_accounts() or []
         if accounts:
             if not self.ctp_ok:
                 self.ctp_ok = True
+                self.connect_failures = 0
+                self.connecting = False
                 self.log("CTP 账户已就绪")
             return True
+        was_ok = self.ctp_ok
         self.ctp_ok = False
         now = time.time()
         if now < self.next_connect:
@@ -2583,12 +2604,18 @@ class LiveSupervisor:
         setting = load_saved_gateway_setting(self.gateway)
         if not setting:
             self.log(f"没有 {self.gateway} 连接配置，无法自动登录")
-            self.next_connect = now + 30.0
+            self.next_connect = now + 60.0
             return False
-        self.log(f"正在连接 {self.gateway}")
+        if not self.cffex_session_open():
+            self.log(f"非 CFFEX 交易时段，降低 {self.gateway} 重连频率")
+        else:
+            self.log(f"正在连接 {self.gateway}")
         main_engine.connect(setting, self.gateway)
-        self.next_connect = now + 30.0
-        self.inited.clear()
+        self.connecting = True
+        if was_ok:
+            self.inited.clear()
+        self.connect_failures += 1
+        self.next_connect = now + self.connect_backoff_sec()
         return False
 
     def contracts_ready(self) -> bool:

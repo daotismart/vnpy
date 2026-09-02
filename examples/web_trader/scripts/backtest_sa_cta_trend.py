@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from ohlc_sanitize import filter_price_jumps, sanitize_bar  # noqa: E402
 from sa_cta_trend import realized_vol, target_lots, true_range  # noqa: E402
 
 CACHE_30MIN = ROOT.joinpath("sa_30min_cache.json")
@@ -39,11 +40,14 @@ def load_bars() -> list[dict[str, Any]]:
     if not CACHE_30MIN.exists() or CACHE_30MIN.stat().st_size < 100:
         raise RuntimeError("缺少 SA 30 分钟缓存，请先运行 fetch_sa_30min.py")
     raw = json.loads(CACHE_30MIN.read_text(encoding="utf-8"))
-    out: list[dict[str, Any]] = []
+    cleaned: list[list] = []
     for row in raw:
-        close = float(row[4])
-        if close <= 0:
-            continue
+        bar = sanitize_bar(row)
+        if bar is not None:
+            cleaned.append(bar)
+    cleaned = filter_price_jumps(cleaned)
+    out: list[dict[str, Any]] = []
+    for row in cleaned:
         stamp = str(row[0])
         out.append(
             {
@@ -52,7 +56,7 @@ def load_bars() -> list[dict[str, Any]]:
                 "open": float(row[1]),
                 "high": float(row[2]),
                 "low": float(row[3]),
-                "close": close,
+                "close": float(row[4]),
             }
         )
     if len(out) < 80:

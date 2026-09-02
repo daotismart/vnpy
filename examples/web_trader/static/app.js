@@ -458,6 +458,21 @@ async function refreshData() {
                 <button class="small danger" data-data="delete" data-symbol="${item.symbol}" data-exchange="${item.exchange}" data-interval="${item.interval}">删除</button>
             </td>
         </tr>`);
+    if ($("tick-data-body")) {
+        const ticks = await api("/data/tick/overview");
+        renderTable("tick-data-body", ticks, (item) => `
+            <tr>
+                <td>${item.symbol || ""}</td>
+                <td>${item.exchange || ""}</td>
+                <td>${item.count ?? ""}</td>
+                <td>${item.start || ""}</td>
+                <td>${item.end || ""}</td>
+                <td>
+                    <button class="small ghost" data-tick="export" data-symbol="${item.symbol}" data-exchange="${item.exchange}" data-start="${item.start || ""}" data-end="${item.end || ""}">导出</button>
+                    <button class="small danger" data-tick="delete" data-symbol="${item.symbol}" data-exchange="${item.exchange}">删除</button>
+                </td>
+            </tr>`);
+    }
 }
 
 function renderRecorder(data) {
@@ -477,7 +492,9 @@ function renderRecorder(data) {
     if (status) {
         const pending = data && data.pending != null ? data.pending : "";
         const interval = data && data.interval_sec ? data.interval_sec : 10;
-        status.textContent = `Tick ${ticks.length} ｜ K线 ${bars.length} ｜ ${interval} 秒写入一次${pending === "" ? "" : ` ｜ 待写入 ${pending}`}`;
+        const maxChains = data && data.max_chains != null ? data.max_chains : "";
+        const auto = data && data.record_ticks ? "自动录制开" : "自动录制关";
+        status.textContent = `Tick ${ticks.length} ｜ K线 ${bars.length} ｜ ${interval} 秒写入一次${pending === "" ? "" : ` ｜ 待写入 ${pending}`} ｜ ${auto}${maxChains === "" ? "" : ` 近${maxChains}月`}`;
     }
 }
 
@@ -813,6 +830,75 @@ $("data-body").addEventListener("click", async (event) => {
         appendLog(error.message);
     }
 });
+
+async function enrollTickUniverse() {
+    const portfolios = [];
+    if (typeof currentPortfolio === "function") {
+        const name = currentPortfolio();
+        if (name) {
+            portfolios.push(name);
+        }
+    }
+    const result = await api("/recorder/universe", {
+        method: "POST",
+        json: {
+            portfolios,
+            tick: true,
+            bar: false,
+            init_portfolio: true,
+        },
+    });
+    appendLog(result.message);
+    renderRecorder(result);
+    if ($("opt-record-status")) {
+        $("opt-record-status").textContent = result.message;
+    }
+    await refreshData();
+    return result;
+}
+
+if ($("tick-data-body")) {
+    $("tick-data-body").addEventListener("click", async (event) => {
+        const button = event.target.closest("[data-tick]");
+        if (!button) {
+            return;
+        }
+        const { symbol, exchange, start, end } = button.dataset;
+        try {
+            if (button.dataset.tick === "delete") {
+                const result = await api(`/data/tick?symbol=${encodeURIComponent(symbol)}&exchange=${encodeURIComponent(exchange)}`, { method: "DELETE" });
+                appendLog(`已删除 Tick ${result.count} 条`);
+                await refreshData();
+            } else {
+                const response = await fetch(`/data/tick/export?symbol=${encodeURIComponent(symbol)}&exchange=${encodeURIComponent(exchange)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`, {
+                    headers: { Authorization: `Bearer ${state.token}` },
+                });
+                if (!response.ok) {
+                    throw new Error("Tick 导出失败");
+                }
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement("a");
+                link.href = url;
+                link.download = `${symbol}_${exchange}_tick.csv`;
+                link.click();
+                URL.revokeObjectURL(url);
+            }
+        } catch (error) {
+            appendLog(error.message);
+        }
+    });
+}
+
+if ($("rec-universe-btn")) {
+    $("rec-universe-btn").addEventListener("click", async () => {
+        try {
+            await enrollTickUniverse();
+        } catch (error) {
+            appendLog(error.message);
+        }
+    });
+}
 
 $("rec-add-btn").addEventListener("click", async () => {
     try {
@@ -3151,7 +3237,7 @@ $("opt-record-btn").addEventListener("click", async () => {
                 portfolio_name: currentPortfolio(),
                 chain_symbol: $("opt-chain").value,
                 tick: true,
-                bar: true,
+                bar: false,
             },
         });
         appendLog(result.message);
@@ -3163,6 +3249,17 @@ $("opt-record-btn").addEventListener("click", async () => {
         appendLog(error.message);
     }
 });
+
+if ($("opt-record-universe-btn")) {
+    $("opt-record-universe-btn").addEventListener("click", async () => {
+        try {
+            await enrollTickUniverse();
+            await refreshRecorder();
+        } catch (error) {
+            appendLog(error.message);
+        }
+    });
+}
 
 $("opt-hedge-start").addEventListener("click", async () => {
     try {

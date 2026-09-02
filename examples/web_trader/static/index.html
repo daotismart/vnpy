@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VeighNa Web Trader</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260902a">
+    <link rel="stylesheet" href="/static/style.css?v=20260902b">
 </head>
 <body>
     <section id="login-page" class="login-page">
@@ -27,6 +27,7 @@
                 <button class="tab" data-tab="option">期权</button>
                 <button class="tab" data-tab="futures">期货</button>
                 <button class="tab" data-tab="spread">价差</button>
+                <button class="tab" data-tab="live">实盘</button>
                 <button class="tab" data-tab="script">脚本</button>
                 <button class="tab" data-tab="backtest">回测</button>
                 <button class="tab" data-tab="data">数据</button>
@@ -367,6 +368,107 @@
                             <tbody id="sp-stg-body"></tbody>
                         </table>
                     </div>
+                </article>
+            </section>
+        </main>
+
+        <main id="tab-live" class="tab-panel">
+            <aside class="side">
+                <section class="card">
+                    <h2>实盘控制</h2>
+                    <p id="live-control-hint" class="hint">配置组合与参数后启动；守护负责 CTP / 组合初始化 / 脚本拉起。</p>
+                    <div id="live-status-pills" class="live-pills"></div>
+                    <div class="btn-row">
+                        <button id="live-start" class="ok" type="button">启动</button>
+                        <button id="live-stop" class="ghost" type="button">停止</button>
+                    </div>
+                    <div class="btn-row">
+                        <button id="live-resume" class="ghost" type="button">恢复守护</button>
+                        <button id="live-pause" class="ghost" type="button">暂停守护</button>
+                    </div>
+                    <button id="live-refresh" class="ghost" type="button">刷新监控</button>
+                </section>
+                <section class="card">
+                    <h2>策略配置</h2>
+                    <label>组合<input id="live-portfolios" value="IO.CFFEX"></label>
+                    <label>脚本
+                        <select id="live-script">
+                            <option value="gex_tv_strangle.py">gex_tv_strangle.py</option>
+                            <option value="as_option_mm.py">as_option_mm.py</option>
+                            <option value="sa_cta_trend.py">sa_cta_trend.py</option>
+                        </select>
+                    </label>
+                    <label>接口<input id="live-gateway" value="CTP"></label>
+                    <label class="check-row"><input id="live-dry-run" type="checkbox">模拟盘 DRY_RUN</label>
+                    <label class="check-row"><input id="live-auto-script" type="checkbox" checked>守护自动拉起脚本</label>
+                    <div class="grid-2-fields">
+                        <label>翼宽档<input id="live-wing-steps" type="number" step="1" value="5"></label>
+                        <label>权利金/翼宽≥<input id="live-min-credit" type="number" step="0.01" value="0.30"></label>
+                        <label>IV Rank≥<input id="live-iv-rank" type="number" step="1" value="40"></label>
+                        <label>风险上限<input id="live-risk-cap" type="number" step="0.01" value="0.06"></label>
+                        <label>手数上限<input id="live-max-lots" type="number" step="1" value="80"></label>
+                        <label>移仓 DTE<input id="live-roll-dte" type="number" step="1" value="21"></label>
+                        <label>最小Δ<input id="live-min-delta" type="number" step="0.01" value="0.14"></label>
+                        <label>最大Δ<input id="live-max-delta" type="number" step="0.01" value="0.25"></label>
+                        <label>止盈收回<input id="live-take-profit" type="number" step="0.01" value="0.25"></label>
+                    </div>
+                    <button id="live-save-config" type="button">保存配置</button>
+                </section>
+            </aside>
+            <section class="workspace">
+                <article class="card">
+                    <h2>运行概览</h2>
+                    <div id="live-run-metrics" class="metric-grid"></div>
+                </article>
+                <div class="grid-2">
+                    <article class="card">
+                        <h2>指标</h2>
+                        <div id="live-indicators" class="metric-grid"></div>
+                    </article>
+                    <article class="card">
+                        <h2>开仓信号</h2>
+                        <div id="live-signals" class="signal-list"></div>
+                    </article>
+                </div>
+                <div class="grid-2">
+                    <article class="card table-card">
+                        <h2>持仓腿 / 行情</h2>
+                        <div class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>代码</th><th>最新</th><th>买一</th><th>卖一</th><th>量</th><th>跳价</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="live-market-body"></tbody>
+                            </table>
+                        </div>
+                    </article>
+                    <article class="card table-card">
+                        <h2>账户 / 持仓</h2>
+                        <div class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>类型</th><th>代码/账户</th><th>方向</th><th>数量</th><th>均价/可用</th><th>盈亏</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="live-pos-body"></tbody>
+                            </table>
+                        </div>
+                    </article>
+                </div>
+                <article class="card">
+                    <h2>当前书本 / 候选结构</h2>
+                    <div id="live-book" class="metric-grid"></div>
+                </article>
+                <article class="card">
+                    <h2>决策过程</h2>
+                    <pre id="live-decision-log" class="stats live-log">等待策略输出</pre>
+                </article>
+                <article class="card">
+                    <h2>引擎日志</h2>
+                    <pre id="live-engine-log" class="stats live-log">—</pre>
                 </article>
             </section>
         </main>
@@ -724,6 +826,6 @@
         </footer>
     </section>
 
-    <script src="/static/app.js?v=20260902a"></script>
+    <script src="/static/app.js?v=20260902b"></script>
 </body>
 </html>

@@ -427,3 +427,78 @@ tr.pin td:nth-child(7) {
     width: 100%;
     min-width: 0;
 }
+
+.live-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 0 0 12px;
+}
+
+.live-pill {
+    font-size: 11px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    color: var(--muted);
+    background: var(--panel);
+}
+
+.live-pill.on {
+    color: #0d2a1a;
+    background: rgba(46, 204, 113, 0.85);
+    border-color: transparent;
+}
+
+.live-pill.warn {
+    color: #3a2a00;
+    background: rgba(240, 180, 41, 0.85);
+    border-color: transparent;
+}
+
+.live-pill.off {
+    color: #3a1010;
+    background: rgba(255, 107, 107, 0.8);
+    border-color: transparent;
+}
+
+.grid-2-fields {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0 10px;
+}
+
+.signal-list {
+    display: grid;
+    gap: 8px;
+}
+
+.signal-item {
+    display: grid;
+    grid-template-columns: 18px 1fr;
+    gap: 8px;
+    align-items: start;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel);
+}
+
+.signal-item .dot {
+    width: 10px;
+    height: 10px;
+    margin-top: 4px;
+    border-radius: 50%;
+    background: var(--sell);
+}
+
+.signal-item.ok .dot { background: var(--buy); }
+.signal-item .title { font-size: 13px; color: var(--text); }
+.signal-item .detail { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+.live-log {
+    height: 220px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+

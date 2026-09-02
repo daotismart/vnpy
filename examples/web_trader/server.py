@@ -2771,20 +2771,81 @@ class LiveSupervisor:
         self.last_log = ""
         self.ctp_ok = False
         self.connecting = False
+        self.paused = False
+        self.auto_start_script = True
 
     def start(self) -> None:
         os.environ.setdefault("LIVE_PORTFOLIOS", ",".join(self.portfolios))
         os.environ.setdefault("LIVE_DRY_RUN", "0")
-        self.thread.start()
+        if not self.thread.is_alive():
+            self.thread.start()
         parts = [f"组合={','.join(self.portfolios)}"]
         if self.record_ticks:
             kinds = ["Tick"]
             if self.record_bar:
                 kinds.append("K线")
             parts.append(f"{'+'.join(kinds)}录制{record_scope_label(self.max_chains)}")
-        if self.run_script:
+        if self.run_script or self.auto_start_script:
             parts.append(f"脚本={self.script_name}")
         self.log("实盘守护已启动 " + " ".join(parts))
+
+    def pause(self, paused: bool = True) -> None:
+        self.paused = bool(paused)
+        self.log("实盘守护已暂停" if self.paused else "实盘守护已恢复")
+
+    def apply_setting(self, setting: dict[str, Any]) -> None:
+        portfolios = [
+            item.strip()
+            for item in str(setting.get("portfolios") or "").split(",")
+            if item.strip()
+        ]
+        if portfolios:
+            self.portfolios = portfolios
+            os.environ["LIVE_PORTFOLIOS"] = ",".join(portfolios)
+        if setting.get("gateway"):
+            self.gateway = str(setting["gateway"])
+            os.environ["LIVE_GATEWAY"] = self.gateway
+        if setting.get("script"):
+            self.script_name = str(setting["script"])
+            os.environ["LIVE_SCRIPT"] = self.script_name
+        if "dry_run" in setting:
+            os.environ["LIVE_DRY_RUN"] = "1" if bool(setting["dry_run"]) else "0"
+        for key, env_name in [
+            ("wing_steps", "LIVE_WING_STEPS"),
+            ("min_credit_frac", "LIVE_MIN_CREDIT_FRAC"),
+            ("min_delta", "LIVE_MIN_DELTA"),
+            ("max_delta", "LIVE_MAX_DELTA"),
+            ("iv_rank_min", "LIVE_IV_RANK_MIN"),
+            ("take_profit", "LIVE_TAKE_PROFIT"),
+            ("risk_cap", "LIVE_RISK_CAP"),
+            ("max_lots", "LIVE_MAX_LOTS"),
+            ("roll_dte", "LIVE_ROLL_DTE"),
+        ]:
+            if setting.get(key) is None or setting.get(key) == "":
+                continue
+            os.environ[env_name] = str(setting[key])
+        self.auto_start_script = bool(setting.get("auto_start_script", True))
+        self.inited.clear()
+        self.log(
+            f"配置已更新 组合={','.join(self.portfolios)} 脚本={self.script_name} "
+            f"dry_run={os.getenv('LIVE_DRY_RUN')} auto={self.auto_start_script}"
+        )
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "paused": self.paused,
+            "ctp_ok": self.ctp_ok,
+            "connecting": self.connecting,
+            "portfolios": list(self.portfolios),
+            "gateway": self.gateway,
+            "script": self.script_name,
+            "auto_start_script": self.auto_start_script,
+            "session_open": self.cffex_session_open(),
+            "connect_failures": self.connect_failures,
+            "inited": sorted(self.inited),
+            "next_connect_in": max(0.0, self.next_connect - time.time()),
+        }
 
     def log(self, msg: str) -> None:
         if msg == self.last_log:
@@ -2809,6 +2870,8 @@ class LiveSupervisor:
             return
         if self.run_script and script_engine is None:
             return
+        if self.paused:
+            return
         if not self.ensure_ctp():
             return
         if not self.contracts_ready():
@@ -2832,7 +2895,7 @@ class LiveSupervisor:
                 )
                 self.recorded.add(name)
                 self.log(result["message"])
-        if self.run_script:
+        if self.auto_start_script and self.run_script:
             self.ensure_script()
 
     @staticmethod
@@ -2913,14 +2976,280 @@ class LiveSupervisor:
         script_engine.start_strategy(str(path))
 
 
-def start_live_supervisor() -> None:
+def start_live_supervisor(force: bool = False) -> "LiveSupervisor | None":
     global _live_supervisor
-    if not (env_flag("LIVE_IRON_CONDOR") or env_flag("LIVE_RECORD_TICKS")):
-        return
+    if not force and not (env_flag("LIVE_IRON_CONDOR") or env_flag("LIVE_RECORD_TICKS")):
+        return _live_supervisor
+    if _live_supervisor is None:
+        _live_supervisor = LiveSupervisor()
+        _live_supervisor.start()
+        return _live_supervisor
+    if not _live_supervisor.thread.is_alive():
+        _live_supervisor.thread = threading.Thread(
+            target=_live_supervisor.loop, name="live-supervisor", daemon=True
+        )
+        _live_supervisor.start()
+    _live_supervisor.paused = False
+    return _live_supervisor
+
+
+LIVE_SETTING_FILE = "live_trader_setting.json"
+LIVE_CONFIG_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "paused": False,
+    "auto_start_script": True,
+    "portfolios": "IO.CFFEX",
+    "gateway": "CTP",
+    "script": "gex_tv_strangle.py",
+    "dry_run": True,
+    "wing_steps": 5,
+    "min_credit_frac": 0.30,
+    "min_delta": 0.14,
+    "max_delta": 0.25,
+    "iv_rank_min": 40.0,
+    "take_profit": 0.25,
+    "risk_cap": 0.06,
+    "max_lots": 80,
+    "roll_dte": 21,
+}
+
+
+def load_live_setting() -> dict[str, Any]:
+    data = load_json(LIVE_SETTING_FILE)
+    if not isinstance(data, dict):
+        data = {}
+    out = dict(LIVE_CONFIG_DEFAULTS)
+    out.update({k: v for k, v in data.items() if k in LIVE_CONFIG_DEFAULTS or k in data})
+    # Prefer process env / supervisor when already running.
+    out["portfolios"] = os.getenv("LIVE_PORTFOLIOS") or out["portfolios"]
+    out["gateway"] = os.getenv("LIVE_GATEWAY") or out["gateway"]
+    out["script"] = os.getenv("LIVE_SCRIPT") or out["script"]
+    if os.getenv("LIVE_DRY_RUN") not in (None, ""):
+        out["dry_run"] = env_flag("LIVE_DRY_RUN", bool(out["dry_run"]))
+    for key, env_name, cast in [
+        ("wing_steps", "LIVE_WING_STEPS", int),
+        ("min_credit_frac", "LIVE_MIN_CREDIT_FRAC", float),
+        ("min_delta", "LIVE_MIN_DELTA", float),
+        ("max_delta", "LIVE_MAX_DELTA", float),
+        ("iv_rank_min", "LIVE_IV_RANK_MIN", float),
+        ("take_profit", "LIVE_TAKE_PROFIT", float),
+        ("risk_cap", "LIVE_RISK_CAP", float),
+        ("max_lots", "LIVE_MAX_LOTS", int),
+        ("roll_dte", "LIVE_ROLL_DTE", int),
+    ]:
+        raw = os.getenv(env_name)
+        if raw not in (None, ""):
+            try:
+                out[key] = cast(raw)
+            except (TypeError, ValueError):
+                pass
     if _live_supervisor is not None:
-        return
-    _live_supervisor = LiveSupervisor()
-    _live_supervisor.start()
+        out["enabled"] = True
+        out["paused"] = bool(_live_supervisor.paused)
+        out["auto_start_script"] = bool(_live_supervisor.auto_start_script)
+        out["portfolios"] = ",".join(_live_supervisor.portfolios)
+        out["gateway"] = _live_supervisor.gateway
+        out["script"] = _live_supervisor.script_name
+    elif env_flag("LIVE_IRON_CONDOR"):
+        out["enabled"] = True
+    return out
+
+
+def save_live_setting(setting: dict[str, Any]) -> dict[str, Any]:
+    current = load_live_setting()
+    merged = dict(current)
+    for key in LIVE_CONFIG_DEFAULTS:
+        if key in setting and setting[key] is not None:
+            merged[key] = setting[key]
+    save_json(LIVE_SETTING_FILE, merged)
+    return merged
+
+
+def collect_live_ticks(symbols: list[str]) -> list[dict[str, Any]]:
+    engine = main_engine
+    if engine is None:
+        return []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for vt_symbol in symbols:
+        if not vt_symbol or vt_symbol in seen:
+            continue
+        seen.add(vt_symbol)
+        tick = engine.get_tick(vt_symbol)
+        contract = engine.get_contract(vt_symbol)
+        if tick is None and contract is None:
+            rows.append({"vt_symbol": vt_symbol, "missing": True})
+            continue
+        rows.append(
+            {
+                "vt_symbol": vt_symbol,
+                "last_price": getattr(tick, "last_price", None) if tick else None,
+                "bid_price_1": getattr(tick, "bid_price_1", None) if tick else None,
+                "ask_price_1": getattr(tick, "ask_price_1", None) if tick else None,
+                "volume": getattr(tick, "volume", None) if tick else None,
+                "pricetick": getattr(contract, "pricetick", None) if contract else None,
+                "name": getattr(contract, "name", "") if contract else "",
+            }
+        )
+    return rows
+
+
+def build_live_signals(monitor: dict[str, Any]) -> list[dict[str, Any]]:
+    params = monitor.get("params") or {}
+    book = monitor.get("book") or {}
+    iv_rank_min = float(params.get("iv_rank_min") or 40)
+    min_entry = int(params.get("min_entry_dte") or 28)
+    max_entry = int(params.get("max_entry_dte") or 65)
+    dte = monitor.get("dte")
+    lots = float(book.get("lots") or 0)
+    signals = [
+        {"id": "ctp", "label": "CTP 账户就绪", "ok": bool(monitor.get("ctp_ok")), "detail": ""},
+        {
+            "id": "session",
+            "label": "交易时段",
+            "ok": bool(monitor.get("session_ok")),
+            "detail": "CFFEX 日盘",
+        },
+        {
+            "id": "iv_rank",
+            "label": f"IV Rank ≥ {iv_rank_min:g}",
+            "ok": bool(monitor.get("iv_high")),
+            "detail": f"当前 {monitor.get('iv_rank', '—')}",
+        },
+        {
+            "id": "range",
+            "label": "LSP 区间过滤",
+            "ok": bool(monitor.get("range_ok", True)),
+            "detail": f"LSP={monitor.get('lsp', '—')}",
+        },
+        {
+            "id": "expand",
+            "label": "波动未扩张",
+            "ok": bool(monitor.get("expand_ok", True)),
+            "detail": "",
+        },
+        {
+            "id": "dte",
+            "label": f"DTE 开仓窗 {min_entry}-{max_entry}",
+            "ok": dte is not None and min_entry <= int(dte) <= max_entry,
+            "detail": f"DTE={dte if dte is not None else '—'}",
+        },
+        {
+            "id": "pick",
+            "label": "选出合格铁鹰",
+            "ok": bool(monitor.get("pick")),
+            "detail": "",
+        },
+        {
+            "id": "flat",
+            "label": "当前无持仓可开新仓",
+            "ok": lots <= 0,
+            "detail": f"lots={lots:g}",
+        },
+        {
+            "id": "script",
+            "label": "策略脚本运行中",
+            "ok": bool(monitor.get("engine_active") or monitor.get("active")),
+            "detail": monitor.get("reason") or "",
+        },
+    ]
+    if monitor.get("pick"):
+        pick = monitor["pick"]
+        signals.append(
+            {
+                "id": "structure",
+                "label": "候选结构",
+                "ok": True,
+                "detail": (
+                    f"{pick.get('k_put_long')}/{pick.get('k_put')}/"
+                    f"{pick.get('k_call')}/{pick.get('k_call_long')} "
+                    f"credit={pick.get('credit')}"
+                ),
+            }
+        )
+    return signals
+
+
+def live_monitor_payload() -> dict[str, Any]:
+    engine = require_script()
+    data = load_json("gex_tv_strangle_status.json") or load_json("as_option_mm_status.json") or {}
+    if not isinstance(data, dict):
+        data = {}
+    data = dict(data)
+    data["engine_active"] = bool(engine.strategy_active)
+    data["live_supervisor"] = _live_supervisor is not None
+    if _live_supervisor is not None:
+        data.update({f"supervisor_{k}": v for k, v in _live_supervisor.status().items()})
+        data["ctp_ok"] = bool(_live_supervisor.ctp_ok)
+        data["live_portfolios"] = list(_live_supervisor.portfolios)
+        data["supervisor"] = _live_supervisor.status()
+    else:
+        data["ctp_ok"] = bool(main_engine.get_all_accounts()) if main_engine else False
+        data["supervisor"] = {"enabled": False, "paused": False}
+    if not engine.strategy_active:
+        data["active"] = False
+
+    book = data.get("book") or {}
+    symbols = [
+        book.get("call_symbol"),
+        book.get("put_symbol"),
+        book.get("call_long_symbol"),
+        book.get("put_long_symbol"),
+    ]
+    pick = data.get("pick") or {}
+    chain = data.get("chain") or ""
+    # Prefer live book legs; otherwise show nothing extra.
+    market = collect_live_ticks([s for s in symbols if s])
+    accounts = []
+    positions = []
+    if main_engine is not None:
+        accounts = [
+            {
+                "accountid": getattr(item, "accountid", ""),
+                "balance": getattr(item, "balance", 0),
+                "available": getattr(item, "available", 0),
+                "frozen": getattr(item, "frozen", 0),
+            }
+            for item in (main_engine.get_all_accounts() or [])
+        ]
+        positions = [
+            {
+                "vt_symbol": getattr(item, "vt_symbol", ""),
+                "direction": getattr(getattr(item, "direction", None), "value", str(getattr(item, "direction", ""))),
+                "volume": getattr(item, "volume", 0),
+                "price": getattr(item, "price", 0),
+                "pnl": getattr(item, "pnl", 0),
+            }
+            for item in (main_engine.get_all_positions() or [])
+            if float(getattr(item, "volume", 0) or 0) != 0
+        ]
+    indicators = {
+        "spot": data.get("spot"),
+        "iv": data.get("iv"),
+        "iv_rank": data.get("iv_rank"),
+        "lsp": data.get("lsp"),
+        "dte": data.get("dte"),
+        "nav": data.get("nav"),
+        "call_wall": data.get("call_wall"),
+        "put_wall": data.get("put_wall"),
+        "kelly": data.get("kelly"),
+        "entry_credit": book.get("entry_credit"),
+        "lots": book.get("lots"),
+        "chain": chain,
+        "pick_efficiency": pick.get("efficiency") if isinstance(pick, dict) else None,
+        "pick_range_prob": pick.get("range_prob") if isinstance(pick, dict) else None,
+    }
+    data["market"] = market
+    data["indicators"] = indicators
+    # Prefer structured checklist from API builder; keep strategy raw map under signals_raw.
+    if isinstance(data.get("signals"), dict):
+        data["signals_raw"] = data.get("signals")
+    data["signals"] = build_live_signals(data)
+    data["accounts"] = accounts
+    data["positions"] = positions
+    data["config"] = load_live_setting()
+    data["logs"] = list(log_buffer)[-40:]
+    return data
 
 
 @app.post("/option/portfolio/{portfolio_name}/init")
@@ -3405,6 +3734,158 @@ def start_script_optimize(model: ScriptOptimizeModel, _: bool = Depends(get_acce
         name="script-optimize",
     ).start()
     return {"message": "已开始参数寻优"}
+
+
+class LiveConfigModel(BaseModel):
+    enabled: bool | None = None
+    paused: bool | None = None
+    auto_start_script: bool | None = None
+    portfolios: str | None = None
+    gateway: str | None = None
+    script: str | None = None
+    dry_run: bool | None = None
+    wing_steps: int | None = None
+    min_credit_frac: float | None = None
+    min_delta: float | None = None
+    max_delta: float | None = None
+    iv_rank_min: float | None = None
+    take_profit: float | None = None
+    risk_cap: float | None = None
+    max_lots: int | None = None
+    roll_dte: int | None = None
+
+
+@app.get("/live/config")
+def get_live_config(_: bool = Depends(get_access)) -> dict[str, Any]:
+    return load_live_setting()
+
+
+@app.put("/live/config")
+def put_live_config(model: LiveConfigModel, _: bool = Depends(get_access)) -> dict[str, Any]:
+    payload = {k: v for k, v in model.model_dump().items() if v is not None}
+    merged = save_live_setting(payload)
+    if merged.get("enabled"):
+        supervisor = start_live_supervisor(force=True)
+        if supervisor is not None:
+            supervisor.apply_setting(merged)
+            if merged.get("paused"):
+                supervisor.pause(True)
+            else:
+                supervisor.pause(False)
+    elif _live_supervisor is not None:
+        _live_supervisor.apply_setting(merged)
+        _live_supervisor.pause(True)
+    return {"message": "实盘配置已保存", "config": load_live_setting()}
+
+
+@app.get("/live/status")
+def get_live_status(_: bool = Depends(get_access)) -> dict[str, Any]:
+    script = require_script()
+    setting = load_live_setting()
+    supervisor = _live_supervisor.status() if _live_supervisor is not None else {
+        "enabled": False,
+        "paused": False,
+        "ctp_ok": bool(main_engine.get_all_accounts()) if main_engine else False,
+        "session_open": LiveSupervisor.cffex_session_open(),
+    }
+    return {
+        "config": setting,
+        "supervisor": supervisor,
+        "script_active": bool(script.strategy_active),
+        "script_files": [path.name for path in Path("/app/scripts").glob("*.py")]
+        if Path("/app/scripts").exists()
+        else [path.name for path in Path(__file__).resolve().parent.joinpath("scripts").glob("*.py")],
+        "gateway_connected": bool(main_engine.get_all_accounts()) if main_engine else False,
+        "account_count": len(main_engine.get_all_accounts() or []) if main_engine else 0,
+        "position_count": len(
+            [p for p in (main_engine.get_all_positions() or []) if float(getattr(p, "volume", 0) or 0)]
+        )
+        if main_engine
+        else 0,
+        "updated": datetime.now().isoformat(sep=" ", timespec="seconds"),
+    }
+
+
+@app.get("/live/monitor")
+def get_live_monitor(_: bool = Depends(get_access)) -> dict[str, Any]:
+    return live_monitor_payload()
+
+
+@app.post("/live/start")
+def live_start(_: bool = Depends(get_access)) -> dict[str, Any]:
+    setting = load_live_setting()
+    setting["enabled"] = True
+    setting["paused"] = False
+    setting["dry_run"] = bool(setting.get("dry_run", False))
+    save_live_setting(setting)
+    os.environ["LIVE_IRON_CONDOR"] = "1"
+    supervisor = start_live_supervisor(force=True)
+    assert supervisor is not None
+    supervisor.run_script = True
+    supervisor.apply_setting(setting)
+    supervisor.pause(False)
+    supervisor.auto_start_script = True
+    # Kick CTP / portfolio / script promptly.
+    try:
+        supervisor.tick()
+    except Exception:
+        traceback.print_exc()
+    script = require_script()
+    if not script.strategy_active:
+        path = resolve_script_path(supervisor.script_name)
+        script.start_strategy(str(path))
+    return {
+        "message": f"已启动实盘：{supervisor.script_name}",
+        "supervisor": supervisor.status(),
+        "script_active": bool(script.strategy_active),
+        "config": load_live_setting(),
+    }
+
+
+@app.post("/live/stop")
+def live_stop(_: bool = Depends(get_access)) -> dict[str, str]:
+    script = require_script()
+    if script.strategy_active:
+        script.stop_strategy()
+    if _live_supervisor is not None:
+        _live_supervisor.auto_start_script = False
+        _live_supervisor.pause(True)
+    setting = load_live_setting()
+    setting["paused"] = True
+    setting["auto_start_script"] = False
+    save_live_setting(setting)
+    # Mark status inactive for UI.
+    for name in ("gex_tv_strangle_status.json", "as_option_mm_status.json"):
+        data = load_json(name)
+        if isinstance(data, dict):
+            data["active"] = False
+            data["updated"] = datetime.now().isoformat(sep=" ", timespec="seconds")
+            save_json(name, data)
+    return {"message": "已停止策略脚本，并暂停自动拉起"}
+
+
+@app.post("/live/pause")
+def live_pause(_: bool = Depends(get_access)) -> dict[str, str]:
+    if _live_supervisor is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="实盘守护未启用")
+    _live_supervisor.pause(True)
+    setting = load_live_setting()
+    setting["paused"] = True
+    save_live_setting(setting)
+    return {"message": "实盘守护已暂停（不自动重连/拉起）"}
+
+
+@app.post("/live/resume")
+def live_resume(_: bool = Depends(get_access)) -> dict[str, str]:
+    supervisor = start_live_supervisor(force=True)
+    if supervisor is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="无法启用实盘守护")
+    supervisor.pause(False)
+    setting = load_live_setting()
+    setting["enabled"] = True
+    setting["paused"] = False
+    save_live_setting(setting)
+    return {"message": "实盘守护已恢复"}
 
 
 @app.websocket("/ws/")

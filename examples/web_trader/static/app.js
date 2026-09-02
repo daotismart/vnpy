@@ -548,6 +548,7 @@ async function afterLogin() {
         refreshOption,
         refreshFuturesProducts,
         refreshSpread,
+        refreshLive,
         refreshScript,
         refreshScriptBacktest,
         refreshBacktestClasses,
@@ -614,6 +615,10 @@ document.querySelectorAll(".tab").forEach((button) => {
         if (button.dataset.tab === "futures" && state.futuresCurve) {
             renderFuturesCharts(state.futuresCurve);
             renderFuturesCapitalCharts(state.futuresCurve);
+        }
+        if (button.dataset.tab === "live") {
+            scheduleLiveMonitor();
+            refreshLive().catch((error) => appendLog(error.message));
         }
         if (button.dataset.tab === "script") {
             scheduleScriptMonitor();
@@ -2301,6 +2306,230 @@ async function refreshScript() {
     }
 }
 
+async function refreshLive() {
+    if (!$("tab-live")) {
+        return;
+    }
+    const [status, monitor] = await Promise.all([
+        api("/live/status"),
+        api("/live/monitor"),
+    ]);
+    fillLiveConfig(status.config || monitor.config || {});
+    renderLiveStatus(status, monitor);
+    renderLiveMonitor(monitor);
+}
+
+function fillLiveConfig(config) {
+    const setVal = (id, value) => {
+        const el = $(id);
+        if (!el || value == null) {
+            return;
+        }
+        if (el.type === "checkbox") {
+            el.checked = Boolean(value);
+        } else {
+            el.value = value;
+        }
+    };
+    setVal("live-portfolios", config.portfolios);
+    setVal("live-script", config.script);
+    setVal("live-gateway", config.gateway);
+    setVal("live-dry-run", config.dry_run);
+    setVal("live-auto-script", config.auto_start_script !== false);
+    setVal("live-wing-steps", config.wing_steps);
+    setVal("live-min-credit", config.min_credit_frac);
+    setVal("live-iv-rank", config.iv_rank_min);
+    setVal("live-risk-cap", config.risk_cap);
+    setVal("live-max-lots", config.max_lots);
+    setVal("live-roll-dte", config.roll_dte);
+    setVal("live-min-delta", config.min_delta);
+    setVal("live-max-delta", config.max_delta);
+    setVal("live-take-profit", config.take_profit);
+}
+
+function readLiveConfig() {
+    return {
+        portfolios: $("live-portfolios").value.trim() || "IO.CFFEX",
+        script: $("live-script").value,
+        gateway: $("live-gateway").value.trim() || "CTP",
+        dry_run: $("live-dry-run").checked,
+        auto_start_script: $("live-auto-script").checked,
+        wing_steps: Number($("live-wing-steps").value || 5),
+        min_credit_frac: Number($("live-min-credit").value || 0.3),
+        iv_rank_min: Number($("live-iv-rank").value || 40),
+        risk_cap: Number($("live-risk-cap").value || 0.06),
+        max_lots: Number($("live-max-lots").value || 80),
+        roll_dte: Number($("live-roll-dte").value || 21),
+        min_delta: Number($("live-min-delta").value || 0.14),
+        max_delta: Number($("live-max-delta").value || 0.25),
+        take_profit: Number($("live-take-profit").value || 0.25),
+        enabled: true,
+    };
+}
+
+function renderLiveStatus(status, monitor) {
+    const pills = $("live-status-pills");
+    const hint = $("live-control-hint");
+    const supervisor = (status && status.supervisor) || (monitor && monitor.supervisor) || {};
+    const active = Boolean((status && status.script_active) || (monitor && (monitor.engine_active || monitor.active)));
+    const items = [
+        { text: supervisor.enabled ? (supervisor.paused ? "守护暂停" : "守护运行") : "守护关闭", cls: supervisor.enabled ? (supervisor.paused ? "warn" : "on") : "off" },
+        { text: supervisor.ctp_ok || status.gateway_connected ? "CTP已连" : "CTP未连", cls: supervisor.ctp_ok || status.gateway_connected ? "on" : "off" },
+        { text: supervisor.session_open ? "交易时段" : "非交易时段", cls: supervisor.session_open ? "on" : "warn" },
+        { text: active ? "策略运行" : "策略停止", cls: active ? "on" : "off" },
+        { text: (monitor && monitor.dry_run) ? "DRY RUN" : "实盘", cls: (monitor && monitor.dry_run) ? "warn" : "on" },
+    ];
+    if (pills) {
+        pills.innerHTML = items.map((item) => `<span class="live-pill ${item.cls}">${item.text}</span>`).join("");
+    }
+    if (hint) {
+        const reason = (monitor && monitor.reason) || "";
+        hint.textContent = reason
+            ? `最近决策：${reason}`
+            : `组合 ${(status.config && status.config.portfolios) || "—"} ｜ 更新 ${(monitor && monitor.updated) || (status && status.updated) || "—"}`;
+    }
+}
+
+function renderLiveMonitor(data) {
+    const runBox = $("live-run-metrics");
+    const indBox = $("live-indicators");
+    const sigBox = $("live-signals");
+    const bookBox = $("live-book");
+    const logBox = $("live-decision-log");
+    const engBox = $("live-engine-log");
+    const indicators = data.indicators || {};
+    const book = data.book || {};
+    const pick = data.pick || {};
+    const params = data.params || {};
+    if (runBox) {
+        runBox.innerHTML = [
+            metricHtml("引擎", (data.engine_active || data.active) ? "运行中" : "未运行"),
+            metricHtml("模式", data.dry_run ? "DRY RUN" : "实盘", data.dry_run ? -1 : 1),
+            metricHtml("组合", data.portfolio || params.portfolio_name || "—"),
+            metricHtml("链", data.chain || indicators.chain || "—"),
+            metricHtml("标的", indicators.spot ?? data.spot ?? "—"),
+            metricHtml("IV Rank", indicators.iv_rank ?? data.iv_rank ?? "—", data.iv_high ? 1 : -1),
+            metricHtml("手数", book.lots ?? 0, Number(book.lots || 0)),
+            metricHtml("净值份额", indicators.nav ?? data.nav ?? "—"),
+            metricHtml("状态", data.reason || "正常", data.reason ? 0 : 1),
+        ].join("");
+    }
+    if (indBox) {
+        const kelly = indicators.kelly || data.kelly || {};
+        indBox.innerHTML = [
+            metricHtml("IV", indicators.iv ?? "—"),
+            metricHtml("LSP", indicators.lsp ?? "—"),
+            metricHtml("DTE", indicators.dte ?? "—"),
+            metricHtml("Call墙", indicators.call_wall ?? "—"),
+            metricHtml("Put墙", indicators.put_wall ?? "—"),
+            metricHtml("权利金", indicators.entry_credit ?? book.entry_credit ?? "—"),
+            metricHtml("Kelly f", kelly.f != null ? Number(kelly.f).toFixed(3) : "—"),
+            metricHtml("θ/风险", indicators.pick_efficiency ?? pick.efficiency ?? "—"),
+            metricHtml("存活概率", indicators.pick_range_prob ?? pick.range_prob ?? "—"),
+        ].join("");
+    }
+    if (sigBox) {
+        const signals = data.signals || [];
+        sigBox.innerHTML = signals.length
+            ? signals.map((item) => `
+                <div class="signal-item ${item.ok ? "ok" : ""}">
+                    <span class="dot"></span>
+                    <div>
+                        <div class="title">${item.label || item.id || ""}</div>
+                        <div class="detail">${item.detail || (item.ok ? "通过" : "未满足")}</div>
+                    </div>
+                </div>`).join("")
+            : `<p class="hint">等待策略信号</p>`;
+    }
+    if (bookBox) {
+        bookBox.innerHTML = [
+            metricHtml("到期", book.expiry || "—"),
+            metricHtml("短Call", book.k_call || "—"),
+            metricHtml("短Put", book.k_put || "—"),
+            metricHtml("长Call", book.k_call_long || "—"),
+            metricHtml("长Put", book.k_put_long || "—"),
+            metricHtml("短Call合约", book.call_symbol || "—"),
+            metricHtml("短Put合约", book.put_symbol || "—"),
+            metricHtml("候选", pick.k_put_long
+                ? `${pick.k_put_long}/${pick.k_put}/${pick.k_call}/${pick.k_call_long}`
+                : "—"),
+            metricHtml("候选权利金", pick.credit ?? "—"),
+        ].join("");
+    }
+    renderTable("live-market-body", data.market || [], (row) => `
+        <tr class="${row.missing ? "skip" : ""}">
+            <td>${row.vt_symbol || ""}</td>
+            <td>${row.last_price ?? "—"}</td>
+            <td>${row.bid_price_1 ?? "—"}</td>
+            <td>${row.ask_price_1 ?? "—"}</td>
+            <td>${row.volume ?? "—"}</td>
+            <td>${row.pricetick ?? "—"}</td>
+        </tr>`);
+    const posRows = [];
+    (data.accounts || []).forEach((item) => {
+        posRows.push({
+            kind: "账户",
+            code: item.accountid || "",
+            direction: "",
+            volume: item.balance ?? "",
+            price: item.available ?? "",
+            pnl: item.frozen ?? "",
+        });
+    });
+    (data.positions || []).forEach((item) => {
+        posRows.push({
+            kind: "持仓",
+            code: item.vt_symbol || "",
+            direction: item.direction || "",
+            volume: item.volume ?? "",
+            price: item.price ?? "",
+            pnl: item.pnl ?? "",
+        });
+    });
+    renderTable("live-pos-body", posRows, (row) => `
+        <tr>
+            <td>${row.kind}</td>
+            <td>${row.code}</td>
+            <td class="${sideClass(row.direction)}">${row.direction}</td>
+            <td>${row.volume}</td>
+            <td>${row.price}</td>
+            <td class="${signedClass(row.pnl)}">${row.pnl}</td>
+        </tr>`);
+    if (logBox) {
+        const lines = data.decisions || [];
+        logBox.textContent = lines.length ? lines.join("\n") : "等待策略输出";
+        logBox.scrollTop = logBox.scrollHeight;
+    }
+    if (engBox) {
+        const logs = data.logs || [];
+        engBox.textContent = logs.length
+            ? logs.map((item) => `${item.time || ""} ${item.msg || ""}`).join("\n")
+            : "—";
+        engBox.scrollTop = engBox.scrollHeight;
+    }
+}
+
+let liveMonitorTimer = null;
+function scheduleLiveMonitor() {
+    if (!state.token || !$("tab-live") || !$("tab-live").classList.contains("active")) {
+        return;
+    }
+    if (liveMonitorTimer) {
+        return;
+    }
+    liveMonitorTimer = setTimeout(async () => {
+        liveMonitorTimer = null;
+        try {
+            await refreshLive();
+        } catch (error) {
+            appendLog(error.message);
+        }
+        if (state.token && $("tab-live") && $("tab-live").classList.contains("active")) {
+            scheduleLiveMonitor();
+        }
+    }, 2000);
+}
+
 let scriptMonitorTimer = null;
 function scheduleScriptMonitor() {
     if (!state.token || !$("tab-script") || !$("tab-script").classList.contains("active")) {
@@ -3381,6 +3610,68 @@ $("sp-stg-body").addEventListener("click", async (event) => {
             await api(`/spread/strategy/${encodeURIComponent(name)}/${action}`, { method: "POST" });
         }
         await refreshSpread();
+    } catch (error) {
+        appendLog(error.message);
+    }
+});
+
+$("live-save-config").addEventListener("click", async () => {
+    try {
+        const result = await api("/live/config", { method: "PUT", json: readLiveConfig() });
+        appendLog(result.message);
+        await refreshLive();
+    } catch (error) {
+        appendLog(error.message);
+    }
+});
+
+$("live-start").addEventListener("click", async () => {
+    try {
+        await api("/live/config", { method: "PUT", json: { ...readLiveConfig(), paused: false, enabled: true } });
+        const result = await api("/live/start", { method: "POST" });
+        appendLog(result.message);
+        await refreshLive();
+        scheduleLiveMonitor();
+    } catch (error) {
+        appendLog(error.message);
+    }
+});
+
+$("live-stop").addEventListener("click", async () => {
+    try {
+        const result = await api("/live/stop", { method: "POST" });
+        appendLog(result.message);
+        await refreshLive();
+    } catch (error) {
+        appendLog(error.message);
+    }
+});
+
+$("live-pause").addEventListener("click", async () => {
+    try {
+        const result = await api("/live/pause", { method: "POST" });
+        appendLog(result.message);
+        await refreshLive();
+    } catch (error) {
+        appendLog(error.message);
+    }
+});
+
+$("live-resume").addEventListener("click", async () => {
+    try {
+        const result = await api("/live/resume", { method: "POST" });
+        appendLog(result.message);
+        await refreshLive();
+        scheduleLiveMonitor();
+    } catch (error) {
+        appendLog(error.message);
+    }
+});
+
+$("live-refresh").addEventListener("click", async () => {
+    try {
+        await refreshLive();
+        appendLog("实盘监控已刷新");
     } catch (error) {
         appendLog(error.message);
     }

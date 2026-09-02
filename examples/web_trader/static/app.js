@@ -3240,7 +3240,7 @@ $("opt-record-btn").addEventListener("click", async () => {
                 portfolio_name: currentPortfolio(),
                 chain_symbol: $("opt-chain").value,
                 tick: true,
-                bar: true,
+                bar: false,
             },
         });
         appendLog(result.message);

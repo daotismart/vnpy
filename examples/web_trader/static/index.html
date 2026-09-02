@@ -378,6 +378,7 @@
                     <label>已有脚本
                         <div id="script-file-list" class="script-file-list" role="listbox">
                             <button type="button" class="script-file-item active" data-path="gex_tv_strangle.py">gex_tv_strangle.py · GEX 铁鹰</button>
+                            <button type="button" class="script-file-item" data-path="if_hf_mr.py">if_hf_mr.py · IF 高频MR</button>
                             <button type="button" class="script-file-item" data-path="as_option_mm.py">as_option_mm.py · AS 做市</button>
                             <button type="button" class="script-file-item" data-path="sa_cta_trend.py">sa_cta_trend.py · SA 趋势</button>
                         </div>
@@ -393,10 +394,11 @@
                 </section>
                 <section class="card">
                     <h2>脚本回测</h2>
-                    <p id="script-bt-status" class="hint">在页面上跑 GEX 铁鹰或 AS 期权做市</p>
+                    <p id="script-bt-status" class="hint">在页面上跑 GEX 铁鹰、IF 高频MR 或 AS 期权做市</p>
                     <label>策略
                         <select id="script-bt-engine">
                             <option value="gex" selected>GEX 铁鹰</option>
+                            <option value="hf_mr">IF 高频均值回归</option>
                             <option value="as_mm">AS 期权做市</option>
                         </select>
                     </label>

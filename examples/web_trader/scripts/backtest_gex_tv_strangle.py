@@ -27,6 +27,7 @@ from gex_tv_strangle import (  # noqa: E402
     io_strike_step,
     lsp_value,
     pick_iron_condor,
+    pick_strangle,
     sa_strike_step,
     select_expiries,
     synthetic_gex_walls,
@@ -150,6 +151,18 @@ class Params:
     iv_premium: float = 0.12
     max_lots: int = 80
     max_books: int = 1
+    # condor | strangle
+    structure: str = "condor"
+    # debit >= stop_credit_mult * entry_credit → 权利金止损；<=0 关闭
+    stop_credit_mult: float = 0.0
+    # DTE 滑动止盈：持仓早期用 tp_far（更快落袋），近移仓用 tp_near
+    dynamic_tp: bool = False
+    tp_far: float = 0.50
+    tp_near: float = 0.25
+    # 现价距短行权价 ≤ wall_stop_steps×步长 → 墙距止损；<=0 关闭
+    wall_stop_steps: float = 0.0
+    margin_rate: float = 0.12
+    min_margin_rate: float = 0.06
 
 
 PRESETS: list[Params] = [
@@ -306,7 +319,41 @@ def params_from_dict(data: dict[str, Any] | None) -> Params:
         hedge=bool(data["hedge"]) if "hedge" in data else False,
         max_lots=int(data.get("max_lots") or 80),
         max_books=int(data.get("max_books") or 1),
+        structure=str(data.get("structure") or "condor"),
+        stop_credit_mult=float(data.get("stop_credit_mult") if data.get("stop_credit_mult") is not None else 0.0),
+        dynamic_tp=bool(data["dynamic_tp"]) if "dynamic_tp" in data else False,
+        tp_far=float(data.get("tp_far") if data.get("tp_far") is not None else 0.50),
+        tp_near=float(data.get("tp_near") if data.get("tp_near") is not None else 0.25),
+        wall_stop_steps=float(data.get("wall_stop_steps") if data.get("wall_stop_steps") is not None else 0.0),
+        margin_rate=float(data.get("margin_rate") if data.get("margin_rate") is not None else 0.12),
+        min_margin_rate=float(data.get("min_margin_rate") if data.get("min_margin_rate") is not None else 0.06),
     )
+
+
+def is_strangle(params: Params | _Pos | str) -> bool:
+    if isinstance(params, str):
+        return params.lower().startswith("strangle")
+    structure = getattr(params, "structure", "condor")
+    return str(structure).lower().startswith("strangle")
+
+
+def leg_count(params: Params | _Pos | str) -> int:
+    return 2 if is_strangle(params) else 4
+
+
+def tp_threshold(params: Params, dte: int) -> float:
+    """买回成本/入场权利金 ≤ 阈值则止盈。"""
+    if not params.dynamic_tp:
+        return float(params.take_profit)
+    hi_dte = float(params.target_dte)
+    lo_dte = float(params.roll_dte)
+    if dte >= hi_dte:
+        return float(params.tp_far)
+    if dte <= lo_dte:
+        return float(params.tp_near)
+    span = max(hi_dte - lo_dte, 1.0)
+    w = (dte - lo_dte) / span
+    return float(params.tp_near) + w * (float(params.tp_far) - float(params.tp_near))
 
 
 def parse_day(text: str) -> date:
@@ -351,6 +398,7 @@ class _Pos:
     expiry: date
     entry_credit: float
     fut: float = 0.0
+    structure: str = "condor"
 
 
 def seed_daily(params: Params) -> tuple[deque[float], deque[float], deque[float], list[float]]:
@@ -378,6 +426,9 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
     skip_set: set[str] = set()
     rolls = 0
     stops = 0
+    stops_delta = 0
+    stops_credit = 0
+    stops_wall = 0
     take_profits = 0
     peak = CAPITAL
     max_dd = 0.0
@@ -394,11 +445,17 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
     day_rank: dict[str, float] = {}
     day_lots: dict[str, int] = {}
     day_delta: dict[str, float] = {}
+    n_legs = leg_count(params)
 
     def mark_pos(pos: _Pos, spot: float, today: date, iv: float) -> tuple[float, float, float, float, float]:
         t = max((pos.expiry - today).days, 1) / 365.0
         pc, dc = mark_greeks(spot, pos.k_call, t, iv, 1)
         pp, dp = mark_greeks(spot, pos.k_put, t, iv, -1)
+        if is_strangle(pos):
+            debit = pc + pp
+            opt = -pos.lots * debit * OPT_SIZE
+            delta = pos.lots * (-dc - dp) * OPT_SIZE * spot
+            return opt, debit, abs(dc), abs(dp), delta
         pcl, dcl = mark_greeks(spot, pos.k_call_l, t, iv, 1)
         ppl, dpl = mark_greeks(spot, pos.k_put_l, t, iv, -1)
         debit = (pc + pp) - (pcl + ppl)
@@ -423,17 +480,19 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
             cash -= abs(pos.fut) * FUT_COMM
         _, debit, _, _, _ = mark_pos(pos, spot, today, iv)
         cash -= pos.lots * debit * OPT_SIZE
-        cash -= 4 * pos.lots * OPT_COMM
+        cash -= leg_count(pos) * pos.lots * OPT_COMM
         trades.append(
             {
                 "date": row.get("datetime") or row["date"],
                 "action": reason,
+                "structure": pos.structure,
                 "k_put": pos.k_put,
                 "k_call": pos.k_call,
                 "k_put_long": pos.k_put_l,
                 "k_call_long": pos.k_call_l,
                 "lots": pos.lots,
                 "debit": round(debit, 2),
+                "entry_credit": round(pos.entry_credit, 2),
                 "dte": dte,
                 "expiry": pos.expiry.isoformat(),
             }
@@ -454,20 +513,36 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
             t = max((exp - today).days, 1) / 365.0
             step = STRIKE_FN(spot)
             call_wall, put_wall = synthetic_gex_walls(spot, iv, t, step, OPT_SIZE)
-            pick = pick_iron_condor(
-                spot,
-                iv,
-                t,
-                step,
-                OPT_SIZE,
-                call_wall,
-                put_wall,
-                params.min_delta,
-                params.max_delta,
-                params.wing_steps,
-                params.min_credit_frac,
-                PRICETICK,
-            )
+            if is_strangle(params):
+                pick = pick_strangle(
+                    spot,
+                    iv,
+                    t,
+                    step,
+                    OPT_SIZE,
+                    call_wall,
+                    put_wall,
+                    params.min_delta,
+                    params.max_delta,
+                    params.margin_rate,
+                    params.min_margin_rate,
+                    PRICETICK,
+                )
+            else:
+                pick = pick_iron_condor(
+                    spot,
+                    iv,
+                    t,
+                    step,
+                    OPT_SIZE,
+                    call_wall,
+                    put_wall,
+                    params.min_delta,
+                    params.max_delta,
+                    params.wing_steps,
+                    params.min_credit_frac,
+                    PRICETICK,
+                )
             if pick is None:
                 continue
             n_lots, kb = condor_lots(
@@ -476,8 +551,8 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
             if n_lots < 1:
                 continue
             cash += n_lots * pick.credit * OPT_SIZE
-            cash -= 4 * n_lots * OPT_COMM
-            working_nav -= 4 * n_lots * OPT_COMM
+            cash -= n_legs * n_lots * OPT_COMM
+            working_nav -= n_legs * n_lots * OPT_COMM
             books.append(
                 _Pos(
                     lots=n_lots,
@@ -487,12 +562,14 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
                     k_put_l=pick.k_put_long,
                     expiry=exp,
                     entry_credit=pick.credit,
+                    structure="strangle" if is_strangle(params) else "condor",
                 )
             )
             trades.append(
                 {
                     "date": row.get("datetime") or row["date"],
                     "action": "开仓",
+                    "structure": "strangle" if is_strangle(params) else "condor",
                     "k_put": pick.k_put,
                     "k_call": pick.k_call,
                     "k_put_long": pick.k_put_long,
@@ -550,18 +627,41 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
         keep: list[_Pos] = []
         for pos in books:
             dte = (pos.expiry - today).days
+            step = STRIKE_FN(cl)
             _, debit_hi, d_call_hi, _, _ = mark_pos(pos, hi, today, iv)
             _, debit_lo, _, d_put_lo, _ = mark_pos(pos, lo, today, iv)
             _, debit, _, _, _ = mark_pos(pos, cl, today, iv)
             call_hit = d_call_hi >= params.delta_stop
             put_hit = d_put_lo >= params.delta_stop
-            take_profit = pos.entry_credit > 0 and debit <= params.take_profit * pos.entry_credit
-            if call_hit or put_hit:
+            credit_stop = (
+                params.stop_credit_mult > 0
+                and pos.entry_credit > 0
+                and max(debit, debit_hi, debit_lo) >= params.stop_credit_mult * pos.entry_credit
+            )
+            wall_hit = False
+            if params.wall_stop_steps > 0:
+                buf = params.wall_stop_steps * step
+                wall_hit = hi >= pos.k_call - buf or lo <= pos.k_put + buf
+            take_profit = pos.entry_credit > 0 and debit <= tp_threshold(params, dte) * pos.entry_credit
+            if call_hit or put_hit or credit_stop or wall_hit:
                 if call_hit and put_hit:
                     stop_px = hi if debit_hi >= debit_lo else lo
+                elif call_hit or (wall_hit and hi >= pos.k_call - max(params.wall_stop_steps, 0) * step):
+                    stop_px = hi
+                elif put_hit or wall_hit:
+                    stop_px = lo
                 else:
-                    stop_px = hi if call_hit else lo
-                flatten(pos, "止损", row, stop_px, today, iv)
+                    stop_px = hi if debit_hi >= debit_lo else lo
+                if call_hit or put_hit:
+                    reason = "止损-Delta"
+                    stops_delta += 1
+                elif wall_hit:
+                    reason = "止损-墙距"
+                    stops_wall += 1
+                else:
+                    reason = "止损-权利金"
+                    stops_credit += 1
+                flatten(pos, reason, row, stop_px, today, iv)
                 stops += 1
             elif take_profit:
                 flatten(pos, "止盈", row, cl, today, iv)
@@ -619,7 +719,7 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
             break
 
     if books:
-        last_nav = last_nav - sum(4 * pos.lots * OPT_COMM + abs(pos.fut) * FUT_COMM for pos in books)
+        last_nav = last_nav - sum(leg_count(pos) * pos.lots * OPT_COMM + abs(pos.fut) * FUT_COMM for pos in books)
         keys = sorted(day_nav)
         if keys:
             day_nav[keys[-1]] = last_nav
@@ -662,6 +762,7 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
     lots_series = [day_lots[k] for k in keys]
     pos_months = sum(1 for v in months.values() if v > 0)
     month_count = max(len(months), 1)
+    calmar = (cagr * 100.0) / abs(max_dd_peak_pct) if abs(max_dd_peak_pct) > 1e-9 else 0.0
 
     return {
         "name": params.name,
@@ -674,6 +775,7 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
         "final_pnl": round(final_nav - CAPITAL, 2),
         "final_nav": round(final_nav, 2),
         "sharpe": round(sharpe, 3),
+        "calmar": round(calmar, 3),
         "max_dd": round(float(max_dd), 2),
         "max_dd_pct": round(100.0 * float(max_dd) / CAPITAL, 2),
         "max_dd_peak_pct": round(100.0 * max_dd_peak_pct, 2),
@@ -681,6 +783,9 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
         "open_days": len(open_set),
         "rolls": rolls,
         "stops": stops,
+        "stops_delta": stops_delta,
+        "stops_credit": stops_credit,
+        "stops_wall": stops_wall,
         "take_profits": take_profits,
         "opens": len(opens),
         "skip_iv": len(skip_set),
@@ -717,10 +822,202 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
 def _print_row(row: dict[str, Any]) -> None:
     print(
         f"{row['name']}: CAGR={row['cagr']:.1f}% PnL={row['final_pnl']:.0f} "
-        f"Sharpe={row['sharpe']:.2f} 峰值DD={row['max_dd_peak_pct']:.1f}% "
-        f"开仓={row['opens']} 止盈={row['take_profits']} 止损={row['stops']} 移仓={row['rolls']} "
-        f"手数={row['min_open_lots']}-{row['max_open_lots']}"
+        f"Sharpe={row['sharpe']:.2f} Calmar={row.get('calmar', 0):.2f} "
+        f"峰值DD={row['max_dd_peak_pct']:.1f}% "
+        f"开仓={row['opens']} 止盈={row['take_profits']} 止损={row['stops']}"
+        f"(Δ{row.get('stops_delta', 0)}/权{row.get('stops_credit', 0)}/墙{row.get('stops_wall', 0)}) "
+        f"移仓={row['rolls']} 手数={row['min_open_lots']}-{row['max_open_lots']}"
     )
+
+
+def structure_compare_presets() -> list[Params]:
+    """铁鹰 vs 宽跨 × 静态/动态出场 对照网格（IF 日线）。
+
+    宽跨按卖方保证金计量风险：IO 单组保证金中位数约 5% 净值，
+    risk_cap≤3% 会得到 0 手，故宽跨网格从 6% 起。
+    """
+    mild = dict(
+        dynamic_tp=True,
+        tp_far=0.50,
+        tp_near=0.25,
+        stop_credit_mult=2.0,
+        delta_stop=0.50,
+        wall_stop_steps=1.0,
+    )
+    tight = dict(
+        dynamic_tp=True,
+        tp_far=0.50,
+        tp_near=0.25,
+        stop_credit_mult=2.0,
+        delta_stop=0.35,
+        wall_stop_steps=1.0,
+    )
+    return [
+        Params(
+            "铁鹰基线-IO实盘推荐",
+            structure="condor",
+            wing_steps=5,
+            min_credit_frac=0.30,
+            risk_cap=0.06,
+            max_lots=80,
+            take_profit=0.25,
+            delta_stop=0.99,
+        ),
+        Params(
+            "铁鹰+动态出场(温和Δ0.50)",
+            structure="condor",
+            wing_steps=5,
+            min_credit_frac=0.30,
+            risk_cap=0.06,
+            max_lots=80,
+            take_profit=0.25,
+            **mild,
+        ),
+        Params(
+            "铁鹰+动态出场(紧Δ0.35)",
+            structure="condor",
+            wing_steps=5,
+            min_credit_frac=0.30,
+            risk_cap=0.06,
+            max_lots=80,
+            take_profit=0.25,
+            **tight,
+        ),
+        Params(
+            "宽跨-静态出场-风险6%",
+            structure="strangle",
+            min_delta=0.14,
+            max_delta=0.25,
+            risk_cap=0.06,
+            max_lots=80,
+            take_profit=0.25,
+            delta_stop=0.99,
+        ),
+        Params(
+            "宽跨+动态-风险6%(温和)",
+            structure="strangle",
+            min_delta=0.14,
+            max_delta=0.25,
+            risk_cap=0.06,
+            max_lots=80,
+            take_profit=0.25,
+            **mild,
+        ),
+        Params(
+            "宽跨+动态-风险10%(温和)",
+            structure="strangle",
+            min_delta=0.14,
+            max_delta=0.25,
+            risk_cap=0.10,
+            max_lots=80,
+            take_profit=0.25,
+            **mild,
+        ),
+        Params(
+            "宽跨+动态-风险12%(温和)",
+            structure="strangle",
+            min_delta=0.14,
+            max_delta=0.25,
+            risk_cap=0.12,
+            max_lots=80,
+            take_profit=0.25,
+            **mild,
+        ),
+        Params(
+            "宽跨宽Δ+动态-风险10%",
+            structure="strangle",
+            min_delta=0.08,
+            max_delta=0.28,
+            risk_cap=0.10,
+            max_lots=80,
+            take_profit=0.25,
+            **mild,
+        ),
+    ]
+
+
+def run_structure_compare(kind: str = "IF", interval: str = "1d") -> dict[str, Any]:
+    configure(kind, interval)
+    bars = load_bars()
+    presets = structure_compare_presets()
+    results = []
+    for item in presets:
+        row = run_one(bars, item)
+        results.append(row)
+        _print_row(row)
+        sys.stdout.flush()
+
+    baseline = next((r for r in results if r["name"].startswith("铁鹰基线")), results[0])
+    base_calmar = float(baseline.get("calmar") or 0.0)
+    ranking = sorted(results, key=lambda r: (r.get("calmar") or 0, r.get("sharpe") or 0), reverse=True)
+    verdict_rows = []
+    for row in ranking:
+        half_ok = float(row.get("calmar") or 0) >= 0.5 * max(base_calmar, 1e-9)
+        verdict_rows.append(
+            {
+                "name": row["name"],
+                "structure": row.get("structure"),
+                "sharpe": row["sharpe"],
+                "calmar": row.get("calmar"),
+                "cagr": row["cagr"],
+                "max_dd_peak_pct": row["max_dd_peak_pct"],
+                "opens": row["opens"],
+                "stops": row["stops"],
+                "take_profits": row["take_profits"],
+                "rolls": row["rolls"],
+                "pass_half_calmar_vs_baseline": half_ok,
+            }
+        )
+    best_strangle = next((r for r in ranking if str(r.get("structure")).startswith("strangle")), None)
+    recommend = "keep_condor"
+    if best_strangle and float(best_strangle.get("calmar") or 0) >= 0.5 * max(base_calmar, 1e-9):
+        if float(best_strangle.get("calmar") or 0) >= base_calmar and float(best_strangle.get("sharpe") or 0) >= float(
+            baseline.get("sharpe") or 0
+        ):
+            recommend = "consider_strangle_pilot"
+        else:
+            recommend = "strangle_research_only"
+
+    out = {
+        "generated": datetime.now().isoformat(sep=" ", timespec="seconds"),
+        "engine": "gex-structure-compare",
+        "kind": KIND,
+        "universe": f"{UNIVERSE_LABEL}（铁鹰 vs 宽跨对照）",
+        "interval": INTERVAL,
+        "capital": CAPITAL,
+        "assumptions": {
+            "option_size": OPT_SIZE,
+            "futures_size": FUT_SIZE,
+            "condor": "5翼/权利金≥30%，风险单元=翼宽有界最大亏损",
+            "strangle": "GEX墙外短跨，风险单元=卖方保证金(max+0.5min)；IO保证金中位约5%净值，risk_cap≤3%无法开仓",
+            "static_exit": "收回75%权利金止盈；短腿Δ≥0.99止损；DTE≤21移仓",
+            "dynamic_exit": (
+                "DTE滑动止盈(远月买回≤50%权利金→近移仓≤25%)；"
+                "权利金止损 debit≥2×credit；温和Δ止损≥0.50（另测紧Δ0.35）；墙距≤1×步长"
+            ),
+            "opt_commission": OPT_COMM,
+            "pricetick": PRICETICK,
+            "source": SOURCE_NOTE,
+            "pricing": "Black-76；不含跳空滑点与保证金追保",
+            "gate": "上线门槛：宽跨 Calmar ≥ 铁鹰基线一半",
+        },
+        "sample": {
+            "start": bars[0]["datetime"],
+            "end": bars[-1]["datetime"],
+            "bars": len(bars),
+            "days": len({row["date"] for row in bars}),
+        },
+        "baseline": baseline["name"],
+        "recommend": recommend,
+        "ranking": verdict_rows,
+        "results": results,
+    }
+    out_path = ROOT.joinpath("backtest_strangle_vs_condor_if_daily_result.json")
+    if KIND != "IF" or INTERVAL != "1d":
+        out_path = ROOT.joinpath(f"backtest_strangle_vs_condor_{KIND.lower()}_{INTERVAL}_result.json")
+    out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"推荐={recommend}  结果写入 {out_path}")
+    return out
 
 
 def run_cagr_sweep() -> list[dict[str, Any]]:
@@ -818,7 +1115,12 @@ def main() -> None:
 if __name__ == "__main__":
     kind = "SA"
     interval = "5m"
-    args = [a for a in sys.argv[1:] if a != "sweep"]
+    mode = "backtest"
+    args = [a for a in sys.argv[1:] if a not in ("sweep", "structures", "compare")]
+    if "sweep" in sys.argv[1:]:
+        mode = "sweep"
+    elif "structures" in sys.argv[1:] or "compare" in sys.argv[1:]:
+        mode = "structures"
     for arg in args:
         token = arg.lower()
         if token in ("if", "sa"):
@@ -836,7 +1138,9 @@ if __name__ == "__main__":
             kind = token[:2]
             interval = "1d"
     configure(kind, interval)
-    if "sweep" in sys.argv[1:]:
+    if mode == "sweep":
         run_cagr_sweep()
+    elif mode == "structures":
+        run_structure_compare(kind, interval)
     else:
         main()

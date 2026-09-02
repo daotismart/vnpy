@@ -824,11 +824,20 @@ class GexTvStrangle:
         tick = float(getattr(contract, "pricetick", 0) or 0) if contract else 0.0
         return tick if tick > 0 else 0.2
 
+    def align_price(self, price: float, vt_symbol: str = "") -> float:
+        """Force CTP-legal prices: multiples of contract pricetick (IO/HO/MO = 0.2)."""
+        step = self.pricetick(vt_symbol) if vt_symbol else 0.2
+        step = max(float(step), 1e-6)
+        aligned = round(float(price) / step) * step
+        # Avoid float dust like 22.40000000001; IO ticks are 1 decimal.
+        decimals = max(0, min(6, len(f"{step:.10f}".rstrip("0").split(".")[-1])))
+        return float(round(aligned, decimals))
+
     def aggressive_price(self, tick: TickData | None, buy: bool, fallback: float, vt_symbol: str = "") -> float:
         symbol = vt_symbol or (getattr(tick, "vt_symbol", "") if tick else "")
         step = self.pricetick(symbol) if symbol else 0.2
         if not tick:
-            return fallback
+            return self.align_price(fallback, symbol)
         bid = float(getattr(tick, "bid_price_1", 0) or 0)
         ask = float(getattr(tick, "ask_price_1", 0) or 0)
         last = float(getattr(tick, "last_price", 0) or 0)
@@ -837,10 +846,8 @@ class GexTvStrangle:
         else:
             raw = bid if bid > 0 else (last - step if last > 0 else fallback)
         if raw <= 0:
-            return fallback
-        step = max(float(step), 1e-6)
-        aligned = round(float(raw) / step) * step
-        return float(round(aligned, 10))
+            return self.align_price(fallback, symbol)
+        return self.align_price(raw, symbol)
 
     def cancel_symbol(self, vt_symbol: str) -> None:
         try:
@@ -1026,6 +1033,7 @@ class GexTvStrangle:
     def send_short(self, vt_symbol: str, price: float, volume: int) -> None:
         if volume <= 0 or price <= 0:
             return
+        price = self.align_price(price, vt_symbol)
         if self.cfg.dry_run:
             self.write(f"模拟卖开 {vt_symbol} x{volume} @{price:.2f}")
             return
@@ -1034,6 +1042,7 @@ class GexTvStrangle:
     def send_cover(self, vt_symbol: str, price: float, volume: int) -> None:
         if volume <= 0 or price <= 0:
             return
+        price = self.align_price(price, vt_symbol)
         if self.cfg.dry_run:
             self.write(f"模拟买平 {vt_symbol} x{volume} @{price:.2f}")
             return
@@ -1042,6 +1051,7 @@ class GexTvStrangle:
     def send_long(self, vt_symbol: str, price: float, volume: int) -> None:
         if volume <= 0 or price <= 0:
             return
+        price = self.align_price(price, vt_symbol)
         if self.cfg.dry_run:
             self.write(f"模拟买开 {vt_symbol} x{volume} @{price:.2f}")
             return
@@ -1050,6 +1060,7 @@ class GexTvStrangle:
     def send_sell(self, vt_symbol: str, price: float, volume: int) -> None:
         if volume <= 0 or price <= 0:
             return
+        price = self.align_price(price, vt_symbol)
         if self.cfg.dry_run:
             self.write(f"模拟卖平 {vt_symbol} x{volume} @{price:.2f}")
             return

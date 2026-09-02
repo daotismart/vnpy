@@ -829,8 +829,20 @@ def _print_row(row: dict[str, Any]) -> None:
 
 
 def structure_compare_presets() -> list[Params]:
-    """铁鹰 vs 宽跨 × 静态/动态出场 对照网格（IF 日线）。"""
-    dyn = dict(
+    """铁鹰 vs 宽跨 × 静态/动态出场 对照网格（IF 日线）。
+
+    宽跨按卖方保证金计量风险：IO 单组保证金中位数约 5% 净值，
+    risk_cap≤3% 会得到 0 手，故宽跨网格从 6% 起。
+    """
+    mild = dict(
+        dynamic_tp=True,
+        tp_far=0.50,
+        tp_near=0.25,
+        stop_credit_mult=2.0,
+        delta_stop=0.50,
+        wall_stop_steps=1.0,
+    )
+    tight = dict(
         dynamic_tp=True,
         tp_far=0.50,
         tp_near=0.25,
@@ -850,14 +862,24 @@ def structure_compare_presets() -> list[Params]:
             delta_stop=0.99,
         ),
         Params(
-            "铁鹰+动态出场",
+            "铁鹰+动态出场(温和Δ0.50)",
             structure="condor",
             wing_steps=5,
             min_credit_frac=0.30,
             risk_cap=0.06,
             max_lots=80,
             take_profit=0.25,
-            **dyn,
+            **mild,
+        ),
+        Params(
+            "铁鹰+动态出场(紧Δ0.35)",
+            structure="condor",
+            wing_steps=5,
+            min_credit_frac=0.30,
+            risk_cap=0.06,
+            max_lots=80,
+            take_profit=0.25,
+            **tight,
         ),
         Params(
             "宽跨-静态出场-风险6%",
@@ -870,34 +892,44 @@ def structure_compare_presets() -> list[Params]:
             delta_stop=0.99,
         ),
         Params(
-            "宽跨+动态出场-风险6%",
+            "宽跨+动态-风险6%(温和)",
             structure="strangle",
             min_delta=0.14,
             max_delta=0.25,
             risk_cap=0.06,
             max_lots=80,
             take_profit=0.25,
-            **dyn,
+            **mild,
         ),
         Params(
-            "宽跨+动态出场-风险3%",
+            "宽跨+动态-风险10%(温和)",
             structure="strangle",
             min_delta=0.14,
             max_delta=0.25,
-            risk_cap=0.03,
-            max_lots=40,
+            risk_cap=0.10,
+            max_lots=80,
             take_profit=0.25,
-            **dyn,
+            **mild,
         ),
         Params(
-            "宽跨宽Δ+动态-风险3%",
+            "宽跨+动态-风险12%(温和)",
+            structure="strangle",
+            min_delta=0.14,
+            max_delta=0.25,
+            risk_cap=0.12,
+            max_lots=80,
+            take_profit=0.25,
+            **mild,
+        ),
+        Params(
+            "宽跨宽Δ+动态-风险10%",
             structure="strangle",
             min_delta=0.08,
             max_delta=0.28,
-            risk_cap=0.03,
-            max_lots=40,
+            risk_cap=0.10,
+            max_lots=80,
             take_profit=0.25,
-            **dyn,
+            **mild,
         ),
     ]
 
@@ -955,11 +987,11 @@ def run_structure_compare(kind: str = "IF", interval: str = "1d") -> dict[str, A
             "option_size": OPT_SIZE,
             "futures_size": FUT_SIZE,
             "condor": "5翼/权利金≥30%，风险单元=翼宽有界最大亏损",
-            "strangle": "GEX墙外短跨，风险单元=卖方保证金(max+0.5min)",
+            "strangle": "GEX墙外短跨，风险单元=卖方保证金(max+0.5min)；IO保证金中位约5%净值，risk_cap≤3%无法开仓",
             "static_exit": "收回75%权利金止盈；短腿Δ≥0.99止损；DTE≤21移仓",
             "dynamic_exit": (
                 "DTE滑动止盈(远月买回≤50%权利金→近移仓≤25%)；"
-                "权利金止损 debit≥2×credit；Δ止损≥0.35；墙距≤1×步长"
+                "权利金止损 debit≥2×credit；温和Δ止损≥0.50（另测紧Δ0.35）；墙距≤1×步长"
             ),
             "opt_commission": OPT_COMM,
             "pricetick": PRICETICK,

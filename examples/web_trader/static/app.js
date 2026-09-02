@@ -21,6 +21,7 @@ const state = {
 
 const SCRIPT_FILE_FALLBACK = [
     { value: "gex_tv_strangle.py", label: "gex_tv_strangle.py  ·  GEX 铁鹰" },
+    { value: "if_hf_mr.py", label: "if_hf_mr.py  ·  IF 高频MR" },
     { value: "as_option_mm.py", label: "as_option_mm.py  ·  AS 做市" },
     { value: "sa_cta_trend.py", label: "sa_cta_trend.py  ·  SA 趋势" },
 ];
@@ -28,6 +29,11 @@ const GEX_FALLBACK_PRESETS = [
     { name: "原优化6%", risk_cap: 0.06, roll_dte: 21, max_lots: 80, iv_rank_min: 40 },
     { name: "进取20%", risk_cap: 0.20, roll_dte: 21, max_lots: 250, iv_rank_min: 40 },
     { name: "容量80手", risk_cap: 0.46, roll_dte: 21, max_lots: 80, iv_rank_min: 40 },
+];
+const HF_FALLBACK_PRESETS = [
+    { name: "推荐-上午MR", look: 16, z_entry: 2.4, risk: 0.006, max_lots: 4 },
+    { name: "稳健低仓", look: 16, z_entry: 2.4, risk: 0.004, max_lots: 3 },
+    { name: "稍积极", look: 16, z_entry: 2.4, risk: 0.008, max_lots: 5 },
 ];
 const AS_FALLBACK_PRESETS = [
     {
@@ -2359,26 +2365,35 @@ function formatScriptBtNum(value, digits = 2) {
     });
 }
 
+function scriptBtEngine() {
+    return $("script-bt-engine") ? $("script-bt-engine").value : "gex";
+}
+
 function isGexEngine() {
-    return !$("script-bt-engine") || $("script-bt-engine").value !== "as_mm";
+    return scriptBtEngine() === "gex";
+}
+
+function isHfEngine() {
+    return scriptBtEngine() === "hf_mr";
 }
 
 function syncScriptBtEngineUi() {
     const gex = isGexEngine();
+    const hf = isHfEngine();
     if ($("script-bt-gex-fields")) {
         $("script-bt-gex-fields").classList.toggle("hidden", !gex);
     }
     if ($("script-bt-as-fields")) {
-        $("script-bt-as-fields").classList.toggle("hidden", gex);
+        $("script-bt-as-fields").classList.toggle("hidden", gex || hf);
     }
     if ($("script-bt-opt-card")) {
-        $("script-bt-opt-card").classList.toggle("hidden", gex);
+        $("script-bt-opt-card").classList.toggle("hidden", gex || hf);
     }
     if ($("script-bt-as-panes")) {
-        $("script-bt-as-panes").classList.toggle("hidden", gex);
+        $("script-bt-as-panes").classList.toggle("hidden", gex || hf);
     }
     if ($("script-bt-trades-wrap")) {
-        $("script-bt-trades-wrap").classList.toggle("hidden", !gex);
+        $("script-bt-trades-wrap").classList.toggle("hidden", !(gex || hf));
     }
 }
 
@@ -2387,6 +2402,9 @@ function scriptBtQuery() {
         const kind = $("script-bt-kind") ? $("script-bt-kind").value : "SA";
         const interval = $("script-bt-interval") ? $("script-bt-interval").value : "1d";
         return `?engine=gex&kind=${encodeURIComponent(kind)}&interval=${encodeURIComponent(interval)}`;
+    }
+    if (isHfEngine()) {
+        return "?engine=hf_mr&kind=IF&interval=5m";
     }
     return "?engine=as_mm";
 }
@@ -2405,6 +2423,14 @@ function scriptBtPayload() {
             iv_rank_min: Number($("script-bt-ivrank").value),
             compare: $("script-bt-compare").checked,
             hedge: false,
+        };
+    }
+    if (isHfEngine()) {
+        return {
+            engine: "hf_mr",
+            kind: "IF",
+            interval: "5m",
+            compare: true,
         };
     }
     const preset = $("script-bt-as-preset") ? $("script-bt-as-preset").value : "自定义参数";
@@ -2522,14 +2548,15 @@ function applyScriptBtPreset(name) {
 }
 
 function fillScriptBtPresets(presets) {
-    const select = isGexEngine() ? $("script-bt-preset") : $("script-bt-as-preset");
+    const select = isGexEngine() ? $("script-bt-preset") : (isHfEngine() ? null : $("script-bt-as-preset"));
     if (!select) {
+        state.scriptBtPresets = presets || (isHfEngine() ? HF_FALLBACK_PRESETS : AS_FALLBACK_PRESETS);
         return;
     }
     const key = isGexEngine()
         ? `gex|${$("script-bt-kind") ? $("script-bt-kind").value : "SA"}|${$("script-bt-interval") ? $("script-bt-interval").value : "1d"}`
-        : "as_mm";
-    const fallback = isGexEngine() ? GEX_FALLBACK_PRESETS : AS_FALLBACK_PRESETS;
+        : (isHfEngine() ? "hf_mr" : "as_mm");
+    const fallback = isGexEngine() ? GEX_FALLBACK_PRESETS : (isHfEngine() ? HF_FALLBACK_PRESETS : AS_FALLBACK_PRESETS);
     state.scriptBtPresets = (presets && presets.length) ? presets : fallback;
     if (state.scriptBtPresetKey === key && select.options.length > 1) {
         return;

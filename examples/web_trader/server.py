@@ -16,6 +16,7 @@ import threading
 import time
 import traceback
 from collections import deque
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -879,6 +880,8 @@ def _norm_script_engine(value: str | None) -> str:
     token = str(value or "gex").lower()
     if token in ("as", "as_mm", "mm", "option_mm"):
         return "as_mm"
+    if token in ("hf", "hf_mr", "if_hf", "if_hf_mr", "mr"):
+        return "hf_mr"
     return "gex"
 
 
@@ -923,6 +926,34 @@ def script_backtest_snapshot(
             cache = module.cache_meta()
             presets = module.preset_payloads()
             saved = module.load_saved_result()
+        elif engine == "hf_mr":
+            module = load_web_script("backtest_if_hf_mr")
+            cache = {
+                "exists": module.CACHE.exists() and module.CACHE.stat().st_size > 100,
+                "path": str(module.CACHE),
+                "kind": "IF",
+                "interval": "5m",
+            }
+            if cache["exists"]:
+                try:
+                    bars = module.load_bars()
+                    cache.update(
+                        {
+                            "bars": len(bars),
+                            "days": len({row["date"] for row in bars}),
+                            "start": bars[0]["datetime"],
+                            "end": bars[-1]["datetime"],
+                        }
+                    )
+                except Exception as exc:
+                    cache["error"] = str(exc)
+            presets = [asdict(item) for item in module.PRESETS]
+            saved = None
+            if module.RESULT_PATH.exists() and module.RESULT_PATH.stat().st_size > 20:
+                try:
+                    saved = json.loads(module.RESULT_PATH.read_text(encoding="utf-8"))
+                except Exception:
+                    saved = None
         else:
             module = load_web_script("backtest_as_option_mm")
             cache = module.cache_meta()
@@ -940,6 +971,9 @@ def script_backtest_snapshot(
             live_kind = _norm_script_kind(live.get("kind") or state_kind)
             live_interval = _norm_script_interval(live.get("interval") or state_interval)
             if live_engine == "gex" and live_kind == kind and live_interval == interval:
+                result = live
+        elif engine == "hf_mr":
+            if live_engine == "hf_mr":
                 result = live
         elif live_engine == "as_mm":
             result = live
@@ -987,6 +1021,13 @@ def run_script_backtest_job(payload: dict[str, Any]) -> None:
                 payload["hedge"] = False
                 params = module.params_from_dict(payload)
             result = module.run_backtest(params=params, compare=compare, kind=kind, interval=interval)
+        elif engine == "hf_mr":
+            module = load_web_script("backtest_if_hf_mr")
+            if not module.CACHE.exists() or module.CACHE.stat().st_size < 100:
+                raise RuntimeError("缺少 IF 5 分钟缓存，请先点击「刷新行情缓存」")
+            result = module.run_backtest(compare=True)
+            if isinstance(result, dict):
+                result["engine"] = "hf_mr"
         else:
             module = load_web_script("backtest_as_option_mm")
             seed = int(payload.get("seed") or 42)
@@ -1027,6 +1068,13 @@ def run_script_cache_job(payload: dict[str, Any] | None = None) -> None:
                 load_web_script(name).main()
             with script_bt_lock:
                 script_bt_state["message"] = f"{kind} {labels.get(interval, interval)} 缓存已更新"
+                script_bt_state["error"] = ""
+        elif engine == "hf_mr":
+            with script_bt_lock:
+                script_bt_state["message"] = "正在拉取 IF 5 分钟行情…"
+            load_web_script("fetch_if_5min").main()
+            with script_bt_lock:
+                script_bt_state["message"] = "IF 5 分钟缓存已更新"
                 script_bt_state["error"] = ""
         else:
             with script_bt_lock:
@@ -2944,7 +2992,12 @@ def stop_script(_: bool = Depends(get_access)) -> dict[str, str]:
 @app.get("/script/monitor")
 def get_script_monitor(_: bool = Depends(get_access)) -> dict[str, Any]:
     engine = require_script()
-    data = load_json("gex_tv_strangle_status.json") or load_json("as_option_mm_status.json") or {}
+    data = (
+        load_json("gex_tv_strangle_status.json")
+        or load_json("if_hf_mr_status.json")
+        or load_json("as_option_mm_status.json")
+        or {}
+    )
     data["engine_active"] = bool(engine.strategy_active)
     data["live_supervisor"] = _live_supervisor is not None
     if _live_supervisor is not None:

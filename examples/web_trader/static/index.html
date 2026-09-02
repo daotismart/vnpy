@@ -173,8 +173,9 @@
                     <label>链映射<textarea id="opt-map" rows="6" placeholder="IO2603.CFFEX=IF2603.CFFEX"></textarea></label>
                     <button id="opt-save-btn" type="button">保存配置</button>
                     <button id="opt-init-btn" class="ok" type="button">初始化组合</button>
-                    <button id="opt-record-btn" class="ghost" type="button">记录本链 Tick+K线</button>
-                    <p id="opt-record-status" class="hint">写入 SQLite，可在数据页查看录制列表</p>
+                    <button id="opt-record-btn" class="ghost" type="button">记录本链 Tick</button>
+                    <button id="opt-record-universe-btn" class="ok" type="button">录制近月 IF+IO Tick</button>
+                    <p id="opt-record-status" class="hint">写入 QuestDB（dbtickdata），可在数据页查看录制列表与 Tick 库存</p>
                 </section>
                 <section class="card">
                     <h2>Delta 对冲</h2>
@@ -641,12 +642,13 @@
                     <h2>原数据记录</h2>
                     <label>本地代码<input id="rec-symbol" placeholder="IF2609.CFFEX"></label>
                     <label class="check-row"><input id="rec-tick" type="checkbox" checked>Tick</label>
-                    <label class="check-row"><input id="rec-bar" type="checkbox" checked>1 分钟 K 线</label>
+                    <label class="check-row"><input id="rec-bar" type="checkbox">1 分钟 K 线</label>
                     <div class="btn-row">
                         <button id="rec-add-btn" class="ok" type="button">添加记录</button>
                         <button id="rec-remove-btn" class="ghost" type="button">移除</button>
+                        <button id="rec-universe-btn" class="ghost" type="button">录制近月 IF+IO</button>
                     </div>
-                    <p id="rec-status" class="hint">连接接口并完成合约查询后添加；约每 10 秒批量写入数据库</p>
+                    <p id="rec-status" class="hint">连接接口并完成合约查询后添加；Tick 约每 10 秒批量写入 QuestDB，供高频回测</p>
                 </section>
                 <section class="card">
                     <h2>下载 K 线</h2>
@@ -688,7 +690,7 @@
                     </article>
                 </div>
                 <article class="card table-card">
-                    <h2>本地数据</h2>
+                    <h2>本地 K 线</h2>
                     <div class="table-wrap">
                         <table>
                             <thead>
@@ -697,6 +699,19 @@
                                 </tr>
                             </thead>
                             <tbody id="data-body"></tbody>
+                        </table>
+                    </div>
+                </article>
+                <article class="card table-card">
+                    <h2>本地 Tick</h2>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>代码</th><th>交易所</th><th>数量</th><th>开始</th><th>结束</th><th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tick-data-body"></tbody>
                         </table>
                     </div>
                 </article>

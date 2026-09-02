@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import importlib.util
 import inspect
 import json
@@ -59,6 +60,7 @@ from vnpy.trader.object import (
     OrderRequest,
     SubscribeRequest,
 )
+from vnpy.trader.database import get_database
 from vnpy.trader.utility import get_file_path, get_folder_path, load_json, save_json
 from vnpy_ctabacktester.engine import (
     EVENT_BACKTESTER_BACKTESTING_FINISHED,
@@ -2250,6 +2252,205 @@ def export_bars(
     return FileResponse(tmp_path, filename=filename, media_type="text/csv")
 
 
+@app.get("/data/tick/overview")
+def get_tick_overview(_: bool = Depends(get_access)) -> list[Any]:
+    return to_plain(get_database().get_tick_overview())
+
+
+@app.get("/data/tick")
+def query_ticks(
+    symbol: str,
+    exchange: Exchange,
+    start: str,
+    end: str,
+    limit: int = Query(2000, ge=1, le=20000),
+    _: bool = Depends(get_access),
+) -> list[Any]:
+    ticks = get_database().load_tick_data(
+        symbol,
+        exchange,
+        parse_datetime(start),
+        parse_datetime(end),
+    )
+    if len(ticks) > limit:
+        ticks = ticks[-limit:]
+    return to_plain(ticks)
+
+
+@app.delete("/data/tick")
+def delete_ticks(
+    symbol: str,
+    exchange: Exchange,
+    _: bool = Depends(get_access),
+) -> dict[str, Any]:
+    count = get_database().delete_tick_data(symbol, exchange)
+    return {"count": count}
+
+
+@app.get("/data/tick/export")
+def export_ticks(
+    symbol: str,
+    exchange: Exchange,
+    start: str,
+    end: str,
+    _: bool = Depends(get_access),
+) -> FileResponse:
+    ticks = get_database().load_tick_data(
+        symbol,
+        exchange,
+        parse_datetime(start),
+        parse_datetime(end),
+    )
+    if not ticks:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="没有可导出的 Tick")
+    fields = [
+        "datetime",
+        "symbol",
+        "exchange",
+        "name",
+        "last_price",
+        "last_volume",
+        "volume",
+        "turnover",
+        "open_interest",
+        "open_price",
+        "high_price",
+        "low_price",
+        "pre_close",
+        "limit_up",
+        "limit_down",
+        "bid_price_1",
+        "bid_volume_1",
+        "ask_price_1",
+        "ask_volume_1",
+        "bid_price_2",
+        "bid_volume_2",
+        "ask_price_2",
+        "ask_volume_2",
+        "bid_price_3",
+        "bid_volume_3",
+        "ask_price_3",
+        "ask_volume_3",
+        "bid_price_4",
+        "bid_volume_4",
+        "ask_price_4",
+        "ask_volume_4",
+        "bid_price_5",
+        "bid_volume_5",
+        "ask_price_5",
+        "ask_volume_5",
+        "localtime",
+    ]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", encoding="utf-8", newline="") as tmp:
+        tmp_path = tmp.name
+        writer = csv.DictWriter(tmp, fieldnames=fields)
+        writer.writeheader()
+        for tick in ticks:
+            row = {key: to_plain(getattr(tick, key, None)) for key in fields}
+            row["exchange"] = exchange.value
+            writer.writerow(row)
+    filename = f"{symbol}_{exchange.value}_tick.csv"
+    return FileResponse(tmp_path, filename=filename, media_type="text/csv")
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return default
+
+
+def should_auto_record_ticks() -> bool:
+    """Explicit LIVE_RECORD_TICKS wins; otherwise default on with live iron condor."""
+    raw = os.getenv("LIVE_RECORD_TICKS")
+    if raw is not None and str(raw).strip() != "":
+        return env_flag("LIVE_RECORD_TICKS")
+    return env_flag("LIVE_IRON_CONDOR")
+
+
+def live_portfolios_from_env() -> list[str]:
+    return [
+        item.strip()
+        for item in (os.getenv("LIVE_PORTFOLIOS") or "IO.CFFEX").split(",")
+        if item.strip()
+    ]
+
+
+def chain_record_sort_key(chain_symbol: str, chain: Any = None) -> tuple[int, str]:
+    dte = getattr(chain, "days_to_expiry", None) if chain is not None else None
+    if dte is not None:
+        try:
+            return (int(dte), chain_symbol)
+        except (TypeError, ValueError):
+            pass
+    code = chain_symbol.split(".")[0]
+    match = re.search(r"(\d{4})$", code)
+    return (int(match.group(1)) if match else 999999, chain_symbol)
+
+
+def portfolio_tick_universe(portfolio_name: str, max_chains: int | None = None) -> list[str]:
+    """IF 标的 + 近月 IO 期权链，供高频回测 Tick 录制。"""
+    engine = require_option()
+    portfolio = engine.portfolios.get(portfolio_name)
+    if not portfolio:
+        return []
+    ranked = sorted(
+        (
+            (chain_record_sort_key(chain_symbol, get_portfolio_chain(portfolio, chain_symbol)), chain_symbol)
+            for chain_symbol in portfolio_chain_symbols(portfolio)
+        ),
+        key=lambda item: item[0],
+    )
+    if max_chains is not None and max_chains > 0:
+        ranked = ranked[:max_chains]
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for _, chain_symbol in ranked:
+        for vt_symbol in option_chain_record_symbols(portfolio_name, chain_symbol):
+            if vt_symbol in seen:
+                continue
+            seen.add(vt_symbol)
+            symbols.append(vt_symbol)
+    return symbols
+
+
+def ensure_tick_recording_universe(
+    portfolios: list[str] | None = None,
+    max_chains: int | None = None,
+    tick: bool = True,
+    bar: bool = False,
+) -> dict[str, Any]:
+    names = portfolios or live_portfolios_from_env()
+    chain_limit = env_int("LIVE_RECORD_MAX_CHAINS", 2) if max_chains is None else max_chains
+    symbols: list[str] = []
+    by_portfolio: dict[str, int] = {}
+    for name in names:
+        items = portfolio_tick_universe(name, chain_limit)
+        by_portfolio[name] = len(items)
+        symbols.extend(items)
+    result = add_recordings(symbols, tick=tick, bar=bar)
+    result["portfolios"] = names
+    result["max_chains"] = chain_limit
+    result["universe_size"] = len(symbols)
+    result["by_portfolio"] = by_portfolio
+    result["message"] = (
+        f"已订阅录制 Tick 合约池：目标 {len(symbols)}，"
+        f"新增 {len(result['added'])}，已在列表 {len(result['skipped'])}，"
+        f"未找到 {len(result['missing'])}（近 {chain_limit} 个月）"
+    )
+    return result
+
+
 def recorder_status() -> dict[str, Any]:
     engine = require_recorder()
     return {
@@ -2258,6 +2459,10 @@ def recorder_status() -> dict[str, Any]:
         "interval_sec": engine.timer_interval,
         "active": engine.active,
         "pending": engine.queue.qsize(),
+        "record_ticks": should_auto_record_ticks(),
+        "record_bar": env_flag("LIVE_RECORD_BAR", False),
+        "max_chains": env_int("LIVE_RECORD_MAX_CHAINS", 2),
+        "portfolios": live_portfolios_from_env(),
     }
 
 
@@ -2376,6 +2581,33 @@ def add_recorder_chain(model: RecorderChainModel, _: bool = Depends(get_access))
     return result
 
 
+class RecorderUniverseModel(BaseModel):
+    portfolios: list[str] = Field(default_factory=list)
+    max_chains: int | None = None
+    tick: bool = True
+    bar: bool = False
+    init_portfolio: bool = True
+
+
+@app.post("/recorder/universe")
+def add_recorder_universe(model: RecorderUniverseModel, _: bool = Depends(get_access)) -> dict[str, Any]:
+    names = [item.strip() for item in model.portfolios if item.strip()] or live_portfolios_from_env()
+    if model.init_portfolio:
+        for name in names:
+            ok, message = ensure_option_portfolio(name)
+            if not ok:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    detail=f"{name}: {message}。请先连接交易接口并等待合约查询完成",
+                )
+    return ensure_tick_recording_universe(
+        portfolios=names,
+        max_chains=model.max_chains,
+        tick=model.tick,
+        bar=model.bar,
+    )
+
+
 @app.get("/option/portfolio")
 def get_option_portfolios(_: bool = Depends(get_access)) -> dict[str, Any]:
     engine = require_option()
@@ -2461,13 +2693,6 @@ def save_option_setting(model: OptionSettingModel, _: bool = Depends(get_access)
     return {"message": message}
 
 
-def env_flag(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def ensure_option_portfolio(portfolio_name: str) -> tuple[bool, str]:
     engine = option_engine
     if engine is None:
@@ -2507,21 +2732,22 @@ def ensure_option_portfolio(portfolio_name: str) -> tuple[bool, str]:
 
 
 class LiveSupervisor:
-    """Keep CTP, IO portfolio, and the iron-condor script alive across sessions."""
+    """Keep CTP, IO portfolio, tick recorder, and optional iron-condor script alive."""
 
     def __init__(self) -> None:
-        self.portfolios = [
-            item.strip()
-            for item in (os.getenv("LIVE_PORTFOLIOS") or "IO.CFFEX").split(",")
-            if item.strip()
-        ]
+        self.portfolios = live_portfolios_from_env()
         self.gateway = os.getenv("LIVE_GATEWAY") or "CTP"
         self.script_name = os.getenv("LIVE_SCRIPT") or "gex_tv_strangle.py"
+        self.run_script = env_flag("LIVE_IRON_CONDOR")
+        self.record_ticks = should_auto_record_ticks()
+        self.record_bar = env_flag("LIVE_RECORD_BAR", False)
+        self.max_chains = env_int("LIVE_RECORD_MAX_CHAINS", 2)
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.loop, name="live-supervisor", daemon=True)
         self.next_connect = 0.0
         self.connect_failures = 0
         self.inited: set[str] = set()
+        self.recorded: set[str] = set()
         self.last_log = ""
         self.ctp_ok = False
         self.connecting = False
@@ -2530,7 +2756,12 @@ class LiveSupervisor:
         os.environ.setdefault("LIVE_PORTFOLIOS", ",".join(self.portfolios))
         os.environ.setdefault("LIVE_DRY_RUN", "0")
         self.thread.start()
-        self.log(f"实盘守护已启动 组合={','.join(self.portfolios)} 脚本={self.script_name}")
+        parts = [f"组合={','.join(self.portfolios)}"]
+        if self.record_ticks:
+            parts.append(f"Tick录制近{self.max_chains}月")
+        if self.run_script:
+            parts.append(f"脚本={self.script_name}")
+        self.log("实盘守护已启动 " + " ".join(parts))
 
     def log(self, msg: str) -> None:
         if msg == self.last_log:
@@ -2551,7 +2782,9 @@ class LiveSupervisor:
             self.stop.wait(8.0)
 
     def tick(self) -> None:
-        if main_engine is None or option_engine is None or script_engine is None:
+        if main_engine is None or option_engine is None:
+            return
+        if self.run_script and script_engine is None:
             return
         if not self.ensure_ctp():
             return
@@ -2559,16 +2792,25 @@ class LiveSupervisor:
             self.log("等待 IO 期权合约查询完成")
             return
         for name in self.portfolios:
-            if name in self.inited:
-                continue
-            ok, message = ensure_option_portfolio(name)
-            if ok:
-                self.log(message)
-                self.inited.add(name)
-            else:
-                self.log(message)
-                return
-        self.ensure_script()
+            if name not in self.inited:
+                ok, message = ensure_option_portfolio(name)
+                if ok:
+                    self.log(message)
+                    self.inited.add(name)
+                else:
+                    self.log(message)
+                    return
+            if self.record_ticks and name not in self.recorded:
+                result = ensure_tick_recording_universe(
+                    portfolios=[name],
+                    max_chains=self.max_chains,
+                    tick=True,
+                    bar=self.record_bar,
+                )
+                self.recorded.add(name)
+                self.log(result["message"])
+        if self.run_script:
+            self.ensure_script()
 
     @staticmethod
     def cffex_session_open(now: datetime | None = None) -> bool:
@@ -2614,6 +2856,7 @@ class LiveSupervisor:
         self.connecting = True
         if was_ok:
             self.inited.clear()
+            self.recorded.clear()
         self.connect_failures += 1
         self.next_connect = now + self.connect_backoff_sec()
         return False
@@ -2649,7 +2892,7 @@ class LiveSupervisor:
 
 def start_live_supervisor() -> None:
     global _live_supervisor
-    if not env_flag("LIVE_IRON_CONDOR"):
+    if not (env_flag("LIVE_IRON_CONDOR") or env_flag("LIVE_RECORD_TICKS")):
         return
     if _live_supervisor is not None:
         return
@@ -2667,7 +2910,23 @@ def init_option_portfolio(portfolio_name: str, _: bool = Depends(get_access)) ->
         )
     engine = require_option()
     live_map = build_live_chain_map(engine, portfolio_name)
-    return {"message": message, "chains": list(live_map.keys())}
+    payload: dict[str, Any] = {"message": message, "chains": list(live_map.keys())}
+    if should_auto_record_ticks():
+        record = ensure_tick_recording_universe(
+            portfolios=[portfolio_name],
+            max_chains=env_int("LIVE_RECORD_MAX_CHAINS", 2),
+            tick=True,
+            bar=env_flag("LIVE_RECORD_BAR", False),
+        )
+        payload["recorder"] = {
+            "added": record.get("added"),
+            "skipped": record.get("skipped"),
+            "missing": record.get("missing"),
+            "universe_size": record.get("universe_size"),
+            "message": record.get("message"),
+        }
+        payload["message"] = f"{message}；{record['message']}"
+    return payload
 
 
 @app.get("/option/underlying/{portfolio_name}")

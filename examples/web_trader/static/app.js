@@ -21,6 +21,7 @@ const state = {
 
 const SCRIPT_FILE_FALLBACK = [
     { value: "gex_tv_strangle.py", label: "gex_tv_strangle.py  ·  GEX 铁鹰" },
+    { value: "io_covered_call.py", label: "io_covered_call.py  ·  备兑看涨" },
     { value: "as_option_mm.py", label: "as_option_mm.py  ·  AS 做市" },
     { value: "sa_cta_trend.py", label: "sa_cta_trend.py  ·  SA 趋势" },
 ];

@@ -7,6 +7,8 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from ohlc_sanitize import filter_price_jumps, merge_sane_rows, sanitize_bar
+
 CACHE = Path(__file__).with_name("sa_5min_cache.json")
 
 
@@ -55,28 +57,23 @@ def frame_to_rows(df) -> list[list]:
     rows = []
     for rec in df.itertuples(index=False):
         mapping = rec._asdict()
-        close = float(mapping[close_col] or 0)
-        if close <= 0:
-            continue
-        volume = float(mapping[vol_col] or 0) if vol_col else 0.0
-        rows.append(
+        cleaned = sanitize_bar(
             [
                 _stamp(mapping[date_col]),
-                float(mapping[open_col]),
-                float(mapping[high_col]),
-                float(mapping[low_col]),
-                close,
-                volume,
+                float(mapping[open_col] or 0),
+                float(mapping[high_col] or 0),
+                float(mapping[low_col] or 0),
+                float(mapping[close_col] or 0),
+                float(mapping[vol_col] or 0) if vol_col else 0.0,
             ]
         )
+        if cleaned is not None:
+            rows.append(cleaned)
     return rows
 
 
 def merge_rows(bag: dict[str, list], rows: list[list]) -> None:
-    for row in rows:
-        old = bag.get(row[0])
-        if old is None or float(row[5]) >= float(old[5]):
-            bag[row[0]] = row
+    merge_sane_rows(bag, rows)
 
 
 def fetch_eastmoney_page(sec_id: str, end: str, limit: int = 2000) -> list[list]:
@@ -106,19 +103,18 @@ def fetch_eastmoney_page(sec_id: str, end: str, limit: int = 2000) -> list[list]
                 parts = str(item).split(",")
                 if len(parts) < 5:
                     continue
-                close = float(parts[2] or 0)
-                if close <= 0:
-                    continue
-                rows.append(
+                cleaned = sanitize_bar(
                     [
                         _stamp(parts[0]),
-                        float(parts[1]),
-                        float(parts[3]),
-                        float(parts[4]),
-                        close,
+                        float(parts[1] or 0),
+                        float(parts[3] or 0),
+                        float(parts[4] or 0),
+                        float(parts[2] or 0),
                         float(parts[5] or 0) if len(parts) > 5 else 0.0,
                     ]
                 )
+                if cleaned is not None:
+                    rows.append(cleaned)
             return rows
         except Exception as exc:
             last_exc = exc
@@ -198,7 +194,7 @@ def main() -> None:
     merge_rows(bag, sina)
     sources.append(f"sina SA months 5min x{len(sina)}")
     print(f"sina {len(sina)}")
-    rows = [bag[key] for key in sorted(bag)]
+    rows = filter_price_jumps([bag[key] for key in sorted(bag)])
     if len(rows) < 80:
         raise RuntimeError("未拿到足够的 SA 5 分钟线")
     CACHE.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")

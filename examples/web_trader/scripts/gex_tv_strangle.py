@@ -378,8 +378,12 @@ def pick_strangle(
     max_delta: float = 0.28,
     margin_rate: float = 0.12,
     min_margin_rate: float = 0.07,
+    price_floor: float = 0.2,
 ) -> StrikePick | None:
-    """在 GEX 墙外、Delta 带宽内，选 theta/保证金最大的宽跨。"""
+    """在 GEX 墙外、Delta 带宽内，选 theta/保证金最大的宽跨。
+
+    max_loss 用交易所风格卖方保证金作风险单元（裸卖无有界最大亏损）。
+    """
     atm = round_strike(spot, step)
     sigma = max(sigma, 0.05)
     t = max(t, 1.0 / 365.0)
@@ -393,7 +397,7 @@ def pick_strangle(
                 delta = abs(calculate_delta(spot, k, RATE, t, sigma, cp))
                 if not (min_delta <= delta <= max_delta):
                     continue
-                price = max(calculate_price(spot, k, RATE, t, sigma, cp), step * 0.5)
+                price = max(calculate_price(spot, k, RATE, t, sigma, cp), price_floor)
                 theta = -calculate_theta(spot, k, RATE, t, sigma, cp)
                 bucket.append((k, price, theta, delta if cp > 0 else -delta))
         k += step
@@ -406,11 +410,15 @@ def pick_strangle(
             margin = strangle_margin(spot, k_c, k_p, p_c, p_p, size, margin_rate, min_margin_rate)
             if margin <= 0:
                 continue
+            credit = p_c + p_p
+            if credit <= price_floor:
+                continue
             theta = th_c + th_p
             efficiency = theta / margin
             p_call = seller_win_prob(spot, k_c, t, sigma, 1)
             p_put = seller_win_prob(spot, k_p, t, sigma, -1)
-            p_win = 0.5 * (p_call + p_put)
+            p_range = range_hold_prob(spot, k_p, k_c, t, sigma)
+            credit_cash = credit * size
             cand = StrikePick(
                 k_call=k_c,
                 k_put=k_p,
@@ -419,12 +427,19 @@ def pick_strangle(
                 theta=theta,
                 margin=margin,
                 efficiency=efficiency,
-                win_prob=p_win,
+                win_prob=p_range,
                 p_call_win=p_call,
                 p_put_win=p_put,
                 delta=d_c + d_p,
                 call_wall=call_wall,
                 put_wall=put_wall,
+                credit=credit,
+                width=0.0,
+                max_loss=margin,
+                payoff_ratio=credit_cash / max(margin, 1e-6),
+                range_prob=p_range,
+                d_call=d_c,
+                d_put=d_p,
             )
             if best is None or cand.efficiency > best.efficiency:
                 best = cand

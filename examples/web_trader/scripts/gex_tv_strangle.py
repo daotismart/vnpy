@@ -581,8 +581,30 @@ def condor_lots(pick: StrikePick, nav: float, scale: float, cap: float, risk_cap
 CFG = Config()
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return float(default)
+    return float(raw)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return int(default)
+    return int(raw)
+
+
 def live_config(portfolio_name: str, dry_run: bool, capital_share: float) -> Config:
+    """Build live Config.
+
+    CFFEX IO 默认：翼宽 5 + 权利金/翼宽≥30%（IF 日线全样本与 2024+ 样本外
+    Calmar/Sharpe 优于原 3 翼 / 25% 门槛）。不叠加过严 Delta，以免开仓过少。
+    risk_cap 仍默认 6%；提高收益可设 LIVE_RISK_CAP=0.10~0.12。
+    """
     cffex = is_cffex_index_option(portfolio_name)
+    wing_default = 5 if cffex else CFG.wing_steps
+    credit_default = 0.30 if cffex else CFG.min_credit_frac
     cfg = Config(
         portfolio_name=portfolio_name,
         dry_run=dry_run,
@@ -594,9 +616,17 @@ def live_config(portfolio_name: str, dry_run: bool, capital_share: float) -> Con
         capital_share=capital_share,
         hedge=False,
         price_floor=0.2 if cffex else CFG.price_floor,
-        max_lots=int(os.getenv("LIVE_MAX_LOTS") or CFG.max_lots),
-        risk_cap=float(os.getenv("LIVE_RISK_CAP") or CFG.risk_cap),
+        wing_steps=_env_int("LIVE_WING_STEPS", wing_default),
+        min_credit_frac=_env_float("LIVE_MIN_CREDIT_FRAC", credit_default),
+        min_delta=_env_float("LIVE_MIN_DELTA", CFG.min_delta),
+        max_delta=_env_float("LIVE_MAX_DELTA", CFG.max_delta),
+        iv_rank_min=_env_float("LIVE_IV_RANK_MIN", CFG.iv_rank_min),
+        take_profit=_env_float("LIVE_TAKE_PROFIT", CFG.take_profit),
+        max_lots=_env_int("LIVE_MAX_LOTS", CFG.max_lots),
+        risk_cap=_env_float("LIVE_RISK_CAP", CFG.risk_cap),
     )
+    if cfg.min_delta >= cfg.max_delta:
+        cfg.min_delta, cfg.max_delta = CFG.min_delta, CFG.max_delta
     return cfg
 
 

@@ -15,7 +15,7 @@ SERVER = ROOT.joinpath("server.py")
 def _load_helpers():
     source = SERVER.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(SERVER))
-    wanted = {"env_flag", "env_int", "should_auto_record_ticks", "chain_record_sort_key", "live_portfolios_from_env"}
+    wanted = {"env_flag", "env_int", "should_auto_record_ticks", "chain_record_sort_key", "live_portfolios_from_env", "record_max_chains_from_env", "record_scope_label"}
     body = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
     module = ast.Module(body=body, type_ignores=[])
     code = compile(module, str(SERVER), "exec")
@@ -42,6 +42,11 @@ def main() -> int:
     os.environ["LIVE_RECORD_TICKS"] = "1"
     os.environ["LIVE_IRON_CONDOR"] = "0"
     assert should_auto_record_ticks() is True
+
+    os.environ["LIVE_RECORD_MAX_CHAINS"] = "0"
+    assert helpers["record_max_chains_from_env"]() == 0
+    assert helpers["record_scope_label"](0) == "全部到期月"
+    assert "近2" in helpers["record_scope_label"](2)
 
     # syntax check full server module without importing heavy deps
     ast.parse(SERVER.read_text(encoding="utf-8"))

@@ -203,6 +203,8 @@ def configure(kind: str = "SA", interval: str = "5m") -> None:
         }[INTERVAL]
         PRESETS = [
             Params("稳健6%"),
+            Params("IO实盘推荐", wing_steps=5, min_credit_frac=0.30, risk_cap=0.06, max_lots=80),
+            Params("IO实盘+风险10%", wing_steps=5, min_credit_frac=0.30, risk_cap=0.10, max_lots=120),
             Params("进取20%", risk_cap=0.20, max_lots=80),
             Params("年化50%杠杆", risk_cap=0.46, max_lots=280),
         ]

@@ -1,0 +1,14 @@
+data
+.env
+.git
+**/.git
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.bak
+scripts/*_cache.json
+scripts/*_result.json
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml
+.env.example

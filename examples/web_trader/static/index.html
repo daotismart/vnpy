@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VeighNa Web Trader</title>
+    <link rel="stylesheet" href="/static/style.css?v=20260902a">
+</head>
+<body>
+    <section id="login-page" class="login-page">
+        <form id="login-form" class="login-card">
+            <h1>VeighNa Web Trader</h1>
+            <p class="hint">默认账号 vnpy / vnpy，可在 web_trader_setting.json 中修改</p>
+            <label>用户名<input id="login-username" type="text" value="vnpy" autocomplete="username"></label>
+            <label>密码<input id="login-password" type="password" value="vnpy" autocomplete="current-password"></label>
+            <button type="submit">登录</button>
+            <p id="login-error" class="error"></p>
+        </form>
+    </section>
+
+    <section id="app-page" class="app-page hidden">
+        <header class="topbar">
+            <div class="brand">VeighNa Web Trader</div>
+            <nav class="tabs">
+                <button class="tab active" data-tab="trade">交易</button>
+                <button class="tab" data-tab="cta">CTA</button>
+                <button class="tab" data-tab="option">期权</button>
+                <button class="tab" data-tab="futures">期货</button>
+                <button class="tab" data-tab="spread">价差</button>
+                <button class="tab" data-tab="script">脚本</button>
+                <button class="tab" data-tab="backtest">回测</button>
+                <button class="tab" data-tab="data">数据</button>
+            </nav>
+            <div class="topbar-right">
+                <span id="ws-status" class="status off">推送断开</span>
+                <button id="logout-btn" type="button">退出</button>
+            </div>
+        </header>
+
+        <main id="tab-trade" class="tab-panel active">
+            <aside class="side">
+                <section class="card">
+                    <h2>连接接口</h2>
+                    <div id="gateway-form"></div>
+                    <button id="connect-btn" type="button">连接</button>
+                </section>
+                <section class="card">
+                    <h2>订阅行情</h2>
+                    <label>本地代码<input id="subscribe-symbol" placeholder="rb2501.SHFE"></label>
+                    <button id="subscribe-btn" type="button">订阅</button>
+                </section>
+                <section class="card">
+                    <h2>委托下单</h2>
+                    <label>代码<input id="order-symbol" placeholder="rb2501"></label>
+                    <label>交易所<select id="order-exchange"></select></label>
+                    <label>方向<select id="order-direction"></select></label>
+                    <label>开平<select id="order-offset"></select></label>
+                    <label>类型<select id="order-type"></select></label>
+                    <label>价格<input id="order-price" type="number" step="0.01" value="0"></label>
+                    <label>数量<input id="order-volume" type="number" step="1" value="1"></label>
+                    <div class="btn-row">
+                        <button id="send-order-btn" type="button">下单</button>
+                    </div>
+                </section>
+            </aside>
+            <section class="workspace">
+                <div class="grid-2">
+                    <article class="card table-card">
+                        <h2>行情</h2>
+                        <div class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>代码</th><th>最新</th><th>买一</th><th>卖一</th><th>成交量</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="tick-body"></tbody>
+                            </table>
+                        </div>
+                    </article>
+                    <article class="card table-card">
+                        <h2>资金</h2>
+                        <div class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>账户</th><th>余额</th><th>冻结</th><th>可用</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="account-body"></tbody>
+                            </table>
+                        </div>
+                    </article>
+                </div>
+                <article class="card table-card">
+                    <h2>持仓</h2>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>代码</th><th>方向</th><th>数量</th><th>均价</th><th>盈亏</th>
+                                </tr>
+                            </thead>
+                            <tbody id="position-body"></tbody>
+                        </table>
+                    </div>
+                </article>
+                <article class="card table-card">
+                    <h2>委托</h2>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>编号</th><th>代码</th><th>方向</th><th>开平</th><th>价格</th><th>数量</th><th>状态</th><th></th>
+                                </tr>
+                            </thead>
+                            <tbody id="order-body"></tbody>
+                        </table>
+                    </div>
+                </article>
+                <article class="card table-card">
+                    <h2>成交</h2>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>编号</th><th>代码</th><th>方向</th><th>价格</th><th>数量</th><th>时间</th>
+                                </tr>
+                            </thead>
+                            <tbody id="trade-body"></tbody>
+                        </table>
+                    </div>
+                </article>
+            </section>
+        </main>
+
+        <main id="tab-cta" class="tab-panel">
+            <aside class="side">
+                <section class="card">
+                    <h2>添加策略</h2>
+                    <label>策略类<select id="cta-class"></select></label>
+                    <label>实例名<input id="cta-name" placeholder="demo"></label>
+                    <label>本地代码<input id="cta-symbol" placeholder="rb2501.SHFE"></label>
+                    <div id="cta-params"></div>
+                    <button id="cta-add-btn" type="button">添加</button>
+                </section>
+            </aside>
+            <section class="workspace">
+                <article class="card table-card">
+                    <h2>策略列表</h2>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>名称</th><th>类</th><th>合约</th><th>初始化</th><th>交易</th><th>变量</th><th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="cta-body"></tbody>
+                        </table>
+                    </div>
+                </article>
+            </section>
+        </main>
+
+        <main id="tab-option" class="tab-panel">
+            <aside class="side">
+                <section class="card">
+                    <h2>期权组合</h2>
+                    <label>组合<select id="opt-portfolio"></select></label>
+                    <label>定价模型<select id="opt-model"></select></label>
+                    <label>利率<input id="opt-rate" type="number" step="0.01" value="0.02"></label>
+                    <label>精度<input id="opt-precision" type="number" value="2"></label>
+                    <label>链映射<textarea id="opt-map" rows="6" placeholder="IO2603.CFFEX=IF2603.CFFEX"></textarea></label>
+                    <button id="opt-save-btn" type="button">保存配置</button>
+                    <button id="opt-init-btn" class="ok" type="button">初始化组合</button>
+                    <button id="opt-record-btn" class="ghost" type="button">记录本链 Tick+K线</button>
+                    <p id="opt-record-status" class="hint">写入 SQLite，可在数据页查看录制列表</p>
+                </section>
+                <section class="card">
+                    <h2>Delta 对冲</h2>
+                    <label>对冲合约<input id="opt-hedge-symbol" placeholder="IF2603.CFFEX"></label>
+                    <label>目标 Delta<input id="opt-delta-target" type="number" value="0"></label>
+                    <label>波动区间<input id="opt-delta-range" type="number" value="10"></label>
+                    <div class="btn-row">
+                        <button id="opt-hedge-start" class="ok" type="button">启动</button>
+                        <button id="opt-hedge-stop" class="ghost" type="button">停止</button>
+                    </div>
+                    <p id="opt-hedge-status" class="hint"></p>
+                </section>
+            </aside>
+            <section class="workspace">
+                <div class="grid-2">
+                    <article class="card">
+                        <h2>组合希腊值</h2>
+                        <div id="opt-greeks" class="metric-grid">
+                            <p class="hint">连接交易接口后，期权合约会自动归入组合</p>
+                        </div>
+                    </article>
+                    <article class="card">
+                        <h2>GEX 摘要</h2>
+                        <div id="opt-gex-summary" class="metric-grid">
+                            <p class="hint">初始化组合并收到行情后计算</p>
+                        </div>
+                        <p class="hint">做市商惯例：Call 为正、Put 为负；数值为标的变动 1% 时的 Delta 敞口</p>
+                    </article>
+                </div>
+                <article class="card">
+                    <h2>GEX 分布
+                        <select id="opt-gex-mode">
+                            <option value="market">市场 GEX（用全市场 OI）</option>
+                            <option value="pos">账户 GEX（用净持仓）</option>
+                        </select>
+                    </h2>
+                    <canvas id="opt-gex-chart"></canvas>
+                    <p id="opt-gex-legend" class="hint"></p>
+                    <p class="hint">各到期月净 GEX 按行权价堆积；零轴上方为正、下方为负。颜色区分月份，当前选中链更亮。Pin 按全市场 OI。</p>
+                </article>
+                <article class="card">
+                    <h2>时间价值年化收益率</h2>
+                    <canvas id="opt-tv-chart"></canvas>
+                    <p id="opt-tv-legend" class="hint"></p>
+                    <p class="hint">时间价值 / 保证金 × 240 / 剩余交易日；同一到期日 Call 实线、Put 虚线分别连线</p>
+                </article>
+                <article class="card">
+                    <h2>IV Smile</h2>
+                    <canvas id="opt-iv-chart"></canvas>
+                    <p id="opt-iv-legend" class="hint"></p>
+                    <p class="hint">中间价隐含波动率；横轴行权价，同一到期日 Call 实线、Put 虚线</p>
+                </article>
+                <article class="card table-card">
+                    <h2>期权链 <select id="opt-chain"></select></h2>
+                    <div class="table-wrap tall">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Call</th><th>买/卖</th><th>IV</th><th>Δ</th><th>OI</th><th>GEX</th>
+                                    <th>行权价</th>
+                                    <th>GEX</th><th>OI</th><th>Δ</th><th>IV</th><th>买/卖</th><th>Put</th>
+                                </tr>
+                            </thead>
+                            <tbody id="opt-chain-body"></tbody>
+                        </table>
+                    </div>
+                </article>
+            </section>
+        </main>
+
+        <main id="tab-futures" class="tab-panel">
+            <aside class="side">
+                <section class="card">
+                    <h2>品种</h2>
+                    <label>搜索<input id="fut-search" placeholder="rb / 螺纹 / CFFEX"></label>
+                    <label>合约<select id="fut-product" size="16"></select></label>
+                    <button id="fut-sub-btn" class="ok" type="button">订阅各月行情</button>
+                    <label class="check-row"><input id="fut-sub-opt" type="checkbox" checked>同时订阅期权全链</label>
+                    <p id="fut-status" class="hint">连接交易接口后，合约查询完成即可选择品种</p>
+                </section>
+            </aside>
+            <section class="workspace">
+                <article class="card">
+                    <h2>期限结构</h2>
+                    <div id="fut-summary" class="metric-grid">
+                        <p class="hint">选择品种并订阅后，显示各月持仓与升贴水</p>
+                    </div>
+                    <p class="hint">相对近月为正为升水（远期更高），为负为贴水；主力按持仓量最大确定</p>
+                </article>
+                <div class="grid-2">
+                    <article class="card">
+                        <h2>升贴水曲线</h2>
+                        <canvas id="fut-price-chart"></canvas>
+                    </article>
+                    <article class="card">
+                        <h2>各月持仓</h2>
+                        <canvas id="fut-oi-chart"></canvas>
+                    </article>
+                </div>
+                <article class="card">
+                    <h2>各月资金沉淀
+                        <select id="fut-capital-mode">
+                            <option value="notional">名义本金</option>
+                            <option value="premium">权利金</option>
+                        </select>
+                    </h2>
+                    <canvas id="fut-capital-chart"></canvas>
+                    <p id="fut-capital-legend" class="hint">期货持仓×价格×乘数；期权全链按 Call/Put 分别累计</p>
+                </article>
+                <article class="card">
+                    <h2>全链沉淀 <select id="fut-capital-month"></select></h2>
+                    <canvas id="fut-chain-chart"></canvas>
+                    <p class="hint">所选月份全部行权价的 Call / Put 资金沉淀</p>
+                </article>
+                <article class="card table-card">
+                    <h2>各月合约</h2>
+                    <div class="table-wrap tall">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>合约</th><th>名称</th><th>最新</th><th>涨跌</th>
+                                    <th>持仓量</th><th>占比</th><th>成交量</th>
+                                    <th>相对主力</th><th>相对近月</th><th>月差</th>
+                                    <th>期货沉淀</th><th>Call</th><th>Put</th><th>账户</th>
+                                </tr>
+                            </thead>
+                            <tbody id="fut-body"></tbody>
+                        </table>
+                    </div>
+                </article>
+            </section>
+        </main>
+
+        <main id="tab-spread" class="tab-panel">
+            <aside class="side">
+                <section class="card">
+                    <h2>创建价差</h2>
+                    <label>名称<input id="sp-name" placeholder="RB_Spread"></label>
+                    <label>主动腿<input id="sp-active" placeholder="rb2501.SHFE"></label>
+                    <label>公式<input id="sp-formula" placeholder="A-B" value="A-B"></label>
+                    <label>最小手数<input id="sp-minvol" type="number" value="1"></label>
+                    <label>腿A<input id="sp-leg-a" placeholder="rb2501.SHFE"></label>
+                    <label>腿B<input id="sp-leg-b" placeholder="rb2505.SHFE"></label>
+                    <button id="sp-add-btn" type="button">添加价差</button>
+                </section>
+                <section class="card">
+                    <h2>价差算法</h2>
+                    <label>价差<select id="sp-algo-name"></select></label>
+                    <label>方向<select id="sp-algo-dir"></select></label>
+                    <label>价格<input id="sp-algo-price" type="number" step="0.01" value="0"></label>
+                    <label>数量<input id="sp-algo-volume" type="number" value="1"></label>
+                    <label>超价<input id="sp-algo-payup" type="number" value="0"></label>
+                    <div class="btn-row">
+                        <button id="sp-algo-start" type="button">启动算法</button>
+                    </div>
+                </section>
+                <section class="card">
+                    <h2>价差策略</h2>
+                    <label>策略类<select id="sp-class"></select></label>
+                    <label>实例名<input id="sp-stg-name" placeholder="spread_demo"></label>
+                    <label>价差<select id="sp-stg-spread"></select></label>
+                    <div id="sp-params"></div>
+                    <button id="sp-stg-add" type="button">添加策略</button>
+                </section>
+            </aside>
+            <section class="workspace">
+                <article class="card table-card">
+                    <h2>价差行情</h2>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>名称</th><th>买量</th><th>买价</th><th>卖价</th><th>卖量</th><th>净仓</th><th></th>
+                                </tr>
+                            </thead>
+                            <tbody id="sp-body"></tbody>
+                        </table>
+                    </div>
+                </article>
+                <article class="card table-card">
+                    <h2>价差策略</h2>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>名称</th><th>类</th><th>价差</th><th>初始化</th><th>交易</th><th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="sp-stg-body"></tbody>
+                        </table>
+                    </div>
+                </article>
+            </section>
+        </main>
+
+        <main id="tab-script" class="tab-panel">
+            <aside class="side">
+                <section class="card">
+                    <h2>脚本策略</h2>
+                    <p id="script-status" class="hint">未运行</p>
+                    <label>已有脚本
+                        <div id="script-file-list" class="script-file-list" role="listbox">
+                            <button type="button" class="script-file-item active" data-path="gex_tv_strangle.py">gex_tv_strangle.py · GEX 铁鹰</button>
+                            <button type="button" class="script-file-item" data-path="as_option_mm.py">as_option_mm.py · AS 做市</button>
+                            <button type="button" class="script-file-item" data-path="sa_cta_trend.py">sa_cta_trend.py · SA 趋势</button>
+                        </div>
+                    </label>
+                    <input id="script-file" type="hidden" value="gex_tv_strangle.py">
+                    <label>或指定路径<input id="script-path" placeholder="C:\\strategies\\demo.py"></label>
+                    <input id="script-upload" type="file" accept=".py">
+                    <button id="script-upload-btn" class="ghost" type="button">上传脚本</button>
+                    <div class="btn-row">
+                        <button id="script-start" class="ok" type="button">启动</button>
+                        <button id="script-stop" class="ghost" type="button">停止</button>
+                    </div>
+                </section>
+                <section class="card">
+                    <h2>脚本回测</h2>
+                    <p id="script-bt-status" class="hint">在页面上跑 GEX 铁鹰或 AS 期权做市</p>
+                    <label>策略
+                        <select id="script-bt-engine">
+                            <option value="gex" selected>GEX 铁鹰</option>
+                            <option value="as_mm">AS 期权做市</option>
+                        </select>
+                    </label>
+                    <div id="script-bt-gex-fields">
+                        <label>标的
+                            <select id="script-bt-kind">
+                                <option value="SA" selected>SA 纯碱</option>
+                                <option value="IF">IF / IO</option>
+                            </select>
+                        </label>
+                        <label>周期
+                            <select id="script-bt-interval">
+                                <option value="1d" selected>日线</option>
+                                <option value="30m">30 分钟</option>
+                                <option value="5m">5 分钟</option>
+                            </select>
+                        </label>
+                        <label>预设
+                            <select id="script-bt-preset">
+                                <option value="自定义参数">自定义参数</option>
+                                <option value="原优化6%" selected>原优化6%</option>
+                                <option value="进取20%">进取20%</option>
+                                <option value="容量80手">容量80手</option>
+                            </select>
+                        </label>
+                        <label>风险比例<input id="script-bt-risk" type="number" step="0.01" value="0.06"></label>
+                        <label>移仓 DTE<input id="script-bt-roll" type="number" step="1" value="21"></label>
+                        <label>手数上限<input id="script-bt-maxlots" type="number" step="1" value="80"></label>
+                        <label>IV Rank≥<input id="script-bt-ivrank" type="number" step="1" value="40"></label>
+                    </div>
+                    <div id="script-bt-as-fields" class="hidden">
+                        <label>预设
+                            <select id="script-bt-as-preset">
+                                <option value="自定义参数">自定义参数</option>
+                                <option value="实盘默认参数" selected>实盘默认参数</option>
+                            </select>
+                        </label>
+                        <label>γ 风险厌恶<input id="script-bt-gamma" type="number" step="0.001" value="0.08"></label>
+                        <label>κ 到达强度<input id="script-bt-kappa" type="number" step="0.1" value="1.4"></label>
+                        <label>价差乘数<input id="script-bt-spread" type="number" step="0.001" value="0.02"></label>
+                        <label>σ 下限<input id="script-bt-sigma" type="number" step="0.01" value="0.18"></label>
+                        <label>视野(日)<input id="script-bt-tau" type="number" step="0.01" value="0.15"></label>
+                        <label>单合约上限<input id="script-bt-maxpos" type="number" step="1" value="10"></label>
+                        <label class="check-row"><input id="script-bt-hedge" type="checkbox" checked>IF 对冲</label>
+                    </div>
+                    <label class="check-row"><input id="script-bt-compare" type="checkbox">跑全部预设对比</label>
+                    <div class="btn-row">
+                        <button id="script-bt-start" class="ok" type="button">开始回测</button>
+                        <button id="script-bt-cache" class="ghost" type="button">刷新行情缓存</button>
+                    </div>
+                </section>
+                <section id="script-bt-opt-card" class="card hidden">
+                    <h2>参数寻优</h2>
+                    <p id="script-bt-opt-status" class="hint">网格搜索 γ / κ / 价差 / 视野，上限 120 组</p>
+                    <label>目标
+                        <select id="script-bt-opt-objective">
+                            <option value="sharpe" selected>夏普</option>
+                            <option value="pnl">盈亏</option>
+                            <option value="calmar">卡玛（盈亏/回撤）</option>
+                        </select>
+                    </label>
+                    <label>对冲
+                        <select id="script-bt-opt-hedge">
+                            <option value="on" selected>仅对冲</option>
+                            <option value="off">仅不对冲</option>
+                            <option value="both">两种都跑</option>
+                        </select>
+                    </label>
+                    <div class="range-head"><span>参数</span><span>起</span><span>止</span><span>步长</span></div>
+                    <div class="range-row">
+                        <span>γ</span>
+                        <input id="script-bt-opt-gamma-start" type="number" step="0.01" value="0.04">
+                        <input id="script-bt-opt-gamma-end" type="number" step="0.01" value="0.16">
+                        <input id="script-bt-opt-gamma-step" type="number" step="0.01" value="0.04">
+                    </div>
+                    <div class="range-row">
+                        <span>κ</span>
+                        <input id="script-bt-opt-kappa-start" type="number" step="0.1" value="0.8">
+                        <input id="script-bt-opt-kappa-end" type="number" step="0.1" value="2.2">
+                        <input id="script-bt-opt-kappa-step" type="number" step="0.1" value="0.7">
+                    </div>
+                    <div class="range-row">
+                        <span>价差</span>
+                        <input id="script-bt-opt-spread-start" type="number" step="0.001" value="0.003">
+                        <input id="script-bt-opt-spread-end" type="number" step="0.001" value="0.021">
+                        <input id="script-bt-opt-spread-step" type="number" step="0.001" value="0.009">
+                    </div>
+                    <div class="range-row">
+                        <span>视野</span>
+                        <input id="script-bt-opt-tau-start" type="number" step="0.01" value="0.10">
+                        <input id="script-bt-opt-tau-end" type="number" step="0.01" value="0.25">
+                        <input id="script-bt-opt-tau-step" type="number" step="0.01" value="0.075">
+                    </div>
+                    <button id="script-bt-opt-start" class="ok" type="button">开始寻优</button>
+                </section>
+            </aside>
+            <section class="workspace">
+                <article class="card">
+                    <h2>运行状态</h2>
+                    <div id="script-run-metrics" class="metric-grid">
+                        <p class="hint">实盘铁鹰（IF/IO）由守护进程自动拉起，这里显示开仓与 IV Rank</p>
+                    </div>
+                    <p id="script-run-hint" class="hint">脚本需提供 <code>run(engine)</code>。AS 做市监控来自策略快照。</p>
+                </article>
+                <article class="card">
+                    <h2>策略参数</h2>
+                    <div id="script-params" class="metric-grid">
+                        <p class="hint">运行后展示 gamma / kappa / sigma 等输入</p>
+                    </div>
+                </article>
+                <article class="card table-card">
+                    <h2>报价决策</h2>
+                    <div class="table-wrap tall">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>合约</th><th>类型</th><th>仓</th><th>Δ</th>
+                                    <th>市买/卖</th><th>公允</th><th>保留价</th>
+                                    <th>目标买/卖</th><th>价差</th><th>驱动</th>
+                                    <th>动作</th><th>原因</th>
+                                </tr>
+                            </thead>
+                            <tbody id="script-quote-body"></tbody>
+                        </table>
+                    </div>
+                </article>
+                <article class="card">
+                    <h2>决策过程</h2>
+                    <pre id="script-decision-log" class="stats">等待策略输出</pre>
+                </article>
+                <article class="card">
+                    <h2>回测绩效</h2>
+                    <div class="card-head">
+                        <p id="script-bt-hint" class="hint">尚未回测。可加载上次结果或直接开始。</p>
+                        <select id="script-bt-pick"></select>
+                    </div>
+                    <div id="script-bt-metrics" class="metric-grid">
+                        <p class="hint">等待回测完成</p>
+                    </div>
+                    <div id="script-bt-as-panes" class="script-bt-panes hidden">
+                        <div class="script-bt-pane">
+                            <span class="pane-label">主图 标的价格与成交</span>
+                            <canvas id="script-bt-price"></canvas>
+                        </div>
+                        <div class="script-bt-pane">
+                            <span class="pane-label">附图 库存 / 对冲 / Δ</span>
+                            <canvas id="script-bt-inv"></canvas>
+                        </div>
+                        <div class="script-bt-pane">
+                            <span class="pane-label">附图 σ / 价差 / 保留价偏离</span>
+                            <canvas id="script-bt-decision"></canvas>
+                        </div>
+                    </div>
+                    <p class="hint">净值</p>
+                    <canvas id="script-bt-chart"></canvas>
+                </article>
+                <article class="card table-card">
+                    <h2>回测对比</h2>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr id="script-bt-compare-head">
+                                    <th>方案</th><th>年化</th><th>盈亏</th><th>夏普</th><th>回撤</th>
+                                    <th>开仓</th><th>止盈</th><th>移仓</th><th>手数</th>
+                                </tr>
+                            </thead>
+                            <tbody id="script-bt-body"></tbody>
+                        </table>
+                    </div>
+                    <div id="script-bt-trades-wrap" class="table-wrap">
+                        <p class="hint">最近成交</p>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>时间</th><th>动作</th><th>Put</th><th>Call</th>
+                                    <th>手数</th><th>权利金</th><th>DTE</th>
+                                </tr>
+                            </thead>
+                            <tbody id="script-bt-trades"></tbody>
+                        </table>
+                    </div>
+                </article>
+            </section>
+        </main>
+
+        <main id="tab-backtest" class="tab-panel">
+            <aside class="side">
+                <section class="card">
+                    <h2>回测参数</h2>
+                    <label>策略类<select id="bt-class"></select></label>
+                    <label>本地代码<input id="bt-symbol" placeholder="rb2501.SHFE"></label>
+                    <label>周期<select id="bt-interval"></select></label>
+                    <label>开始<input id="bt-start" type="date"></label>
+                    <label>结束<input id="bt-end" type="date"></label>
+                    <label>手续费率<input id="bt-rate" type="number" step="0.0001" value="0.0001"></label>
+                    <label>滑点<input id="bt-slippage" type="number" step="0.1" value="0"></label>
+                    <label>合约乘数<input id="bt-size" type="number" value="10"></label>
+                    <label>价格跳动<input id="bt-pricetick" type="number" step="0.01" value="1"></label>
+                    <label>起始资金<input id="bt-capital" type="number" value="1000000"></label>
+                    <div id="bt-params"></div>
+                    <button id="bt-start-btn" type="button">开始回测</button>
+                </section>
+            </aside>
+            <section class="workspace">
+                <article class="card">
+                    <h2>绩效统计</h2>
+                    <pre id="bt-stats" class="stats">等待回测完成</pre>
+                </article>
+                <article class="card table-card">
+                    <h2>回测成交</h2>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>时间</th><th>方向</th><th>价格</th><th>数量</th>
+                                </tr>
+                            </thead>
+                            <tbody id="bt-trade-body"></tbody>
+                        </table>
+                    </div>
+                </article>
+                <article class="card table-card">
+                    <h2>回测委托</h2>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>时间</th><th>方向</th><th>价格</th><th>数量</th><th>状态</th>
+                                </tr>
+                            </thead>
+                            <tbody id="bt-order-body"></tbody>
+                        </table>
+                    </div>
+                </article>
+            </section>
+        </main>
+
+        <main id="tab-data" class="tab-panel">
+            <aside class="side">
+                <section class="card">
+                    <h2>原数据记录</h2>
+                    <label>本地代码<input id="rec-symbol" placeholder="IF2609.CFFEX"></label>
+                    <label class="check-row"><input id="rec-tick" type="checkbox" checked>Tick</label>
+                    <label class="check-row"><input id="rec-bar" type="checkbox" checked>1 分钟 K 线</label>
+                    <div class="btn-row">
+                        <button id="rec-add-btn" class="ok" type="button">添加记录</button>
+                        <button id="rec-remove-btn" class="ghost" type="button">移除</button>
+                    </div>
+                    <p id="rec-status" class="hint">连接接口并完成合约查询后添加；约每 10 秒批量写入数据库</p>
+                </section>
+                <section class="card">
+                    <h2>下载 K 线</h2>
+                    <label>代码<input id="data-symbol" placeholder="rb2501"></label>
+                    <label>交易所<select id="data-exchange"></select></label>
+                    <label>周期<select id="data-interval"></select></label>
+                    <label>起始日期<input id="data-start" type="date"></label>
+                    <button id="data-download-btn" type="button">下载</button>
+                </section>
+                <section class="card">
+                    <h2>导入 CSV</h2>
+                    <input id="data-file" type="file" accept=".csv">
+                    <button id="data-import-btn" type="button">导入</button>
+                </section>
+            </aside>
+            <section class="workspace">
+                <div class="grid-2">
+                    <article class="card table-card">
+                        <h2>Tick 记录列表</h2>
+                        <div class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr><th>本地代码</th><th>操作</th></tr>
+                                </thead>
+                                <tbody id="rec-tick-body"></tbody>
+                            </table>
+                        </div>
+                    </article>
+                    <article class="card table-card">
+                        <h2>K 线记录列表</h2>
+                        <div class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr><th>本地代码</th><th>操作</th></tr>
+                                </thead>
+                                <tbody id="rec-bar-body"></tbody>
+                            </table>
+                        </div>
+                    </article>
+                </div>
+                <article class="card table-card">
+                    <h2>本地数据</h2>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>代码</th><th>交易所</th><th>周期</th><th>数量</th><th>开始</th><th>结束</th><th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="data-body"></tbody>
+                        </table>
+                    </div>
+                </article>
+            </section>
+        </main>
+
+        <footer class="log-panel">
+            <h2>日志</h2>
+            <pre id="log-box"></pre>
+        </footer>
+    </section>
+
+    <script src="/static/app.js?v=20260902a"></script>
+</body>
+</html>

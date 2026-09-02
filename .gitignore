@@ -34,6 +34,15 @@ _build
 _static
 _templates
 
+# Web Trader docker
+examples/web_trader/.env
+examples/web_trader/data/
+examples/web_trader/*.tgz
+examples/web_trader/scripts/*_cache.json
+examples/web_trader/scripts/*_result.json
+examples/web_trader/scripts/__pycache__/
+*.bak
+
 # Misc
 .DS_Store
 *.mo

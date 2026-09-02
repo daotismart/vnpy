@@ -1,0 +1,16 @@
+jupyterlab
+jupyter
+ipywidgets
+mplfinance
+mplcursors
+akshare
+tabulate
+QuantLib
+pyecharts
+plotly
+mibian
+scipy
+opstrat
+vnpy_ctastrategy
+questdb>=4.0
+psycopg[binary]>=3.2

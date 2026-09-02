@@ -494,7 +494,9 @@ function renderRecorder(data) {
         const interval = data && data.interval_sec ? data.interval_sec : 10;
         const maxChains = data && data.max_chains != null ? data.max_chains : "";
         const auto = data && data.record_ticks ? "自动录制开" : "自动录制关";
-        status.textContent = `Tick ${ticks.length} ｜ K线 ${bars.length} ｜ ${interval} 秒写入一次${pending === "" ? "" : ` ｜ 待写入 ${pending}`} ｜ ${auto}${maxChains === "" ? "" : ` 近${maxChains}月`}`;
+        const scope = (data && data.scope) || (maxChains === 0 || maxChains === "0" ? "全部到期月" : (maxChains === "" ? "" : `近${maxChains}月`));
+        const barOn = data && data.record_bar ? "Tick+K线" : "Tick";
+        status.textContent = `${barOn} ${ticks.length}/${bars.length} ｜ ${interval} 秒写入一次${pending === "" ? "" : ` ｜ 待写入 ${pending}`} ｜ ${auto}${scope ? ` ${scope}` : ""}`;
     }
 }
 
@@ -843,8 +845,9 @@ async function enrollTickUniverse() {
         method: "POST",
         json: {
             portfolios,
+            max_chains: 0,
             tick: true,
-            bar: false,
+            bar: true,
             init_portfolio: true,
         },
     });
@@ -3237,7 +3240,7 @@ $("opt-record-btn").addEventListener("click", async () => {
                 portfolio_name: currentPortfolio(),
                 chain_symbol: $("opt-chain").value,
                 tick: true,
-                bar: false,
+                bar: true,
             },
         });
         appendLog(result.message);

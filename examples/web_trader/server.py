@@ -2398,8 +2398,19 @@ def chain_record_sort_key(chain_symbol: str, chain: Any = None) -> tuple[int, st
     return (int(match.group(1)) if match else 999999, chain_symbol)
 
 
+def record_max_chains_from_env() -> int:
+    """0 / negative = all option chains; positive = nearest N months."""
+    return env_int("LIVE_RECORD_MAX_CHAINS", 0)
+
+
+def record_scope_label(max_chains: int) -> str:
+    if max_chains is None or max_chains <= 0:
+        return "全部到期月"
+    return f"近{max_chains}个到期月"
+
+
 def portfolio_tick_universe(portfolio_name: str, max_chains: int | None = None) -> list[str]:
-    """IF 标的 + 近月 IO 期权链，供高频回测 Tick 录制。"""
+    """IF 标的 + IO 期权链（可限制近月），供高频回测 Tick/Bar 录制。"""
     engine = require_option()
     portfolio = engine.portfolios.get(portfolio_name)
     if not portfolio:
@@ -2428,25 +2439,33 @@ def ensure_tick_recording_universe(
     portfolios: list[str] | None = None,
     max_chains: int | None = None,
     tick: bool = True,
-    bar: bool = False,
+    bar: bool | None = None,
 ) -> dict[str, Any]:
     names = portfolios or live_portfolios_from_env()
-    chain_limit = env_int("LIVE_RECORD_MAX_CHAINS", 2) if max_chains is None else max_chains
+    chain_limit = record_max_chains_from_env() if max_chains is None else max_chains
+    record_bar = env_flag("LIVE_RECORD_BAR", True) if bar is None else bar
     symbols: list[str] = []
     by_portfolio: dict[str, int] = {}
     for name in names:
         items = portfolio_tick_universe(name, chain_limit)
         by_portfolio[name] = len(items)
         symbols.extend(items)
-    result = add_recordings(symbols, tick=tick, bar=bar)
+    result = add_recordings(symbols, tick=tick, bar=record_bar)
     result["portfolios"] = names
     result["max_chains"] = chain_limit
+    result["record_bar"] = record_bar
     result["universe_size"] = len(symbols)
     result["by_portfolio"] = by_portfolio
+    kinds = []
+    if tick:
+        kinds.append("Tick")
+    if record_bar:
+        kinds.append("K线")
+    kind_text = "+".join(kinds) or "行情"
     result["message"] = (
-        f"已订阅录制 Tick 合约池：目标 {len(symbols)}，"
+        f"已订阅录制 {kind_text} 合约池：目标 {len(symbols)}，"
         f"新增 {len(result['added'])}，已在列表 {len(result['skipped'])}，"
-        f"未找到 {len(result['missing'])}（近 {chain_limit} 个月）"
+        f"未找到 {len(result['missing'])}（{record_scope_label(chain_limit)}）"
     )
     return result
 
@@ -2460,8 +2479,9 @@ def recorder_status() -> dict[str, Any]:
         "active": engine.active,
         "pending": engine.queue.qsize(),
         "record_ticks": should_auto_record_ticks(),
-        "record_bar": env_flag("LIVE_RECORD_BAR", False),
-        "max_chains": env_int("LIVE_RECORD_MAX_CHAINS", 2),
+        "record_bar": env_flag("LIVE_RECORD_BAR", True),
+        "max_chains": record_max_chains_from_env(),
+        "scope": record_scope_label(record_max_chains_from_env()),
         "portfolios": live_portfolios_from_env(),
     }
 
@@ -2585,7 +2605,7 @@ class RecorderUniverseModel(BaseModel):
     portfolios: list[str] = Field(default_factory=list)
     max_chains: int | None = None
     tick: bool = True
-    bar: bool = False
+    bar: bool = True
     init_portfolio: bool = True
 
 
@@ -2740,8 +2760,8 @@ class LiveSupervisor:
         self.script_name = os.getenv("LIVE_SCRIPT") or "gex_tv_strangle.py"
         self.run_script = env_flag("LIVE_IRON_CONDOR")
         self.record_ticks = should_auto_record_ticks()
-        self.record_bar = env_flag("LIVE_RECORD_BAR", False)
-        self.max_chains = env_int("LIVE_RECORD_MAX_CHAINS", 2)
+        self.record_bar = env_flag("LIVE_RECORD_BAR", True)
+        self.max_chains = record_max_chains_from_env()
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.loop, name="live-supervisor", daemon=True)
         self.next_connect = 0.0
@@ -2758,7 +2778,10 @@ class LiveSupervisor:
         self.thread.start()
         parts = [f"组合={','.join(self.portfolios)}"]
         if self.record_ticks:
-            parts.append(f"Tick录制近{self.max_chains}月")
+            kinds = ["Tick"]
+            if self.record_bar:
+                kinds.append("K线")
+            parts.append(f"{'+'.join(kinds)}录制{record_scope_label(self.max_chains)}")
         if self.run_script:
             parts.append(f"脚本={self.script_name}")
         self.log("实盘守护已启动 " + " ".join(parts))
@@ -2914,9 +2937,9 @@ def init_option_portfolio(portfolio_name: str, _: bool = Depends(get_access)) ->
     if should_auto_record_ticks():
         record = ensure_tick_recording_universe(
             portfolios=[portfolio_name],
-            max_chains=env_int("LIVE_RECORD_MAX_CHAINS", 2),
+            max_chains=record_max_chains_from_env(),
             tick=True,
-            bar=env_flag("LIVE_RECORD_BAR", False),
+            bar=env_flag("LIVE_RECORD_BAR", True),
         )
         payload["recorder"] = {
             "added": record.get("added"),

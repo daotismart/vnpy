@@ -62,6 +62,15 @@ from vnpy.trader.object import (
 )
 from vnpy.trader.database import get_database
 from vnpy.trader.utility import get_file_path, get_folder_path, load_json, save_json
+
+
+def safe_load_json(filename: str) -> dict[str, Any]:
+    """Load JSON status/config without crashing on empty or partial writes."""
+    try:
+        data = load_json(filename)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 from vnpy_ctabacktester.engine import (
     EVENT_BACKTESTER_BACKTESTING_FINISHED,
     EVENT_BACKTESTER_LOG,
@@ -2403,10 +2412,67 @@ def record_max_chains_from_env() -> int:
     return env_int("LIVE_RECORD_MAX_CHAINS", 0)
 
 
+def record_filter_window_from_env() -> int:
+    """Seconds of allowed |tick.datetime - now| before DataRecorder drops ticks.
+
+    Default 3600: CTP MD can lag under full-chain subscribe load; the stock
+    recorder default of 60s silently discards everything once lag exceeds 1m.
+    """
+    return max(60, env_int("LIVE_RECORD_FILTER_WINDOW", 3600))
+
+
+def md_max_lag_from_env() -> int:
+    """Force CTP reconnect when newest IF/IO tick lags wall clock by this many seconds."""
+    return max(60, env_int("LIVE_MD_MAX_LAG_SEC", 180))
+
+
 def record_scope_label(max_chains: int) -> str:
     if max_chains is None or max_chains <= 0:
         return "全部到期月"
     return f"近{max_chains}个到期月"
+
+
+def apply_recorder_filter_window(window: int | None = None) -> int:
+    """Keep DataRecorder filter aligned with LIVE_RECORD_FILTER_WINDOW."""
+    engine = require_recorder()
+    value = record_filter_window_from_env() if window is None else max(60, int(window))
+    engine.filter_window = value
+    engine.filter_delta = timedelta(seconds=value)
+    # Refresh baseline so a long lag after restart does not keep rejecting ticks
+    # until the next EVENT_TIMER arrives.
+    try:
+        from vnpy.trader.database import DB_TZ
+
+        engine.filter_dt = datetime.now(DB_TZ)
+    except Exception:
+        engine.filter_dt = datetime.now()
+    return value
+
+
+def newest_io_if_tick() -> Any | None:
+    """Newest in-memory tick among IF/IO symbols (for lag diagnostics)."""
+    if main_engine is None:
+        return None
+    newest = None
+    for tick in main_engine.get_all_ticks() or []:
+        symbol = (getattr(tick, "symbol", "") or "").upper()
+        if not (symbol.startswith("IF") or symbol.startswith("IO")):
+            continue
+        dt = getattr(tick, "datetime", None)
+        if dt is None:
+            continue
+        if newest is None or dt > getattr(newest, "datetime", dt):
+            newest = tick
+    return newest
+
+
+def market_data_lag_sec() -> float | None:
+    tick = newest_io_if_tick()
+    if tick is None or getattr(tick, "datetime", None) is None:
+        return None
+    dt = tick.datetime
+    now = datetime.now(dt.tzinfo) if getattr(dt, "tzinfo", None) else datetime.now()
+    return (now - dt).total_seconds()
 
 
 def portfolio_tick_universe(portfolio_name: str, max_chains: int | None = None) -> list[str]:
@@ -2444,6 +2510,7 @@ def ensure_tick_recording_universe(
     names = portfolios or live_portfolios_from_env()
     chain_limit = record_max_chains_from_env() if max_chains is None else max_chains
     record_bar = env_flag("LIVE_RECORD_BAR", True) if bar is None else bar
+    filter_window = apply_recorder_filter_window()
     symbols: list[str] = []
     by_portfolio: dict[str, int] = {}
     for name in names:
@@ -2454,6 +2521,7 @@ def ensure_tick_recording_universe(
     result["portfolios"] = names
     result["max_chains"] = chain_limit
     result["record_bar"] = record_bar
+    result["filter_window"] = filter_window
     result["universe_size"] = len(symbols)
     result["by_portfolio"] = by_portfolio
     kinds = []
@@ -2465,13 +2533,16 @@ def ensure_tick_recording_universe(
     result["message"] = (
         f"已订阅录制 {kind_text} 合约池：目标 {len(symbols)}，"
         f"新增 {len(result['added'])}，已在列表 {len(result['skipped'])}，"
-        f"未找到 {len(result['missing'])}（{record_scope_label(chain_limit)}）"
+        f"未找到 {len(result['missing'])}（{record_scope_label(chain_limit)}，"
+        f"过滤窗{filter_window}s）"
     )
     return result
 
 
 def recorder_status() -> dict[str, Any]:
     engine = require_recorder()
+    lag = market_data_lag_sec()
+    newest = newest_io_if_tick()
     return {
         "tick": sorted(engine.tick_recordings.keys()),
         "bar": sorted(engine.bar_recordings.keys()),
@@ -2483,6 +2554,16 @@ def recorder_status() -> dict[str, Any]:
         "max_chains": record_max_chains_from_env(),
         "scope": record_scope_label(record_max_chains_from_env()),
         "portfolios": live_portfolios_from_env(),
+        "filter_window": int(getattr(engine, "filter_window", record_filter_window_from_env())),
+        "md_lag_sec": None if lag is None else round(float(lag), 1),
+        "md_max_lag_sec": md_max_lag_from_env(),
+        "newest_tick": None
+        if newest is None
+        else {
+            "vt_symbol": getattr(newest, "vt_symbol", ""),
+            "datetime": str(getattr(newest, "datetime", "")),
+            "last_price": getattr(newest, "last_price", None),
+        },
     }
 
 
@@ -2773,6 +2854,8 @@ class LiveSupervisor:
         self.connecting = False
         self.paused = False
         self.auto_start_script = True
+        self.last_md_check = 0.0
+        self.last_record_refresh = 0.0
 
     def start(self) -> None:
         os.environ.setdefault("LIVE_PORTFOLIOS", ",".join(self.portfolios))
@@ -2784,10 +2867,17 @@ class LiveSupervisor:
             kinds = ["Tick"]
             if self.record_bar:
                 kinds.append("K线")
-            parts.append(f"{'+'.join(kinds)}录制{record_scope_label(self.max_chains)}")
+            parts.append(
+                f"{'+'.join(kinds)}录制{record_scope_label(self.max_chains)}"
+                f"/过滤{record_filter_window_from_env()}s"
+            )
         if self.run_script or self.auto_start_script:
             parts.append(f"脚本={self.script_name}")
         self.log("实盘守护已启动 " + " ".join(parts))
+        try:
+            apply_recorder_filter_window()
+        except Exception:
+            pass
 
     def pause(self, paused: bool = True) -> None:
         self.paused = bool(paused)
@@ -2832,6 +2922,7 @@ class LiveSupervisor:
         )
 
     def status(self) -> dict[str, Any]:
+        lag = market_data_lag_sec()
         return {
             "enabled": True,
             "paused": self.paused,
@@ -2845,6 +2936,9 @@ class LiveSupervisor:
             "connect_failures": self.connect_failures,
             "inited": sorted(self.inited),
             "next_connect_in": max(0.0, self.next_connect - time.time()),
+            "md_lag_sec": None if lag is None else round(float(lag), 1),
+            "md_max_lag_sec": md_max_lag_from_env(),
+            "record_filter_window": record_filter_window_from_env(),
         }
 
     def log(self, msg: str) -> None:
@@ -2874,6 +2968,8 @@ class LiveSupervisor:
             return
         if not self.ensure_ctp():
             return
+        if not self.ensure_market_data_fresh():
+            return
         if not self.contracts_ready():
             self.log("等待 IO 期权合约查询完成")
             return
@@ -2895,8 +2991,57 @@ class LiveSupervisor:
                 )
                 self.recorded.add(name)
                 self.log(result["message"])
+        # Periodic re-apply filter window + refresh universe (covers setting wipe / new strikes)
+        now = time.time()
+        if self.record_ticks and now - self.last_record_refresh > 300:
+            self.last_record_refresh = now
+            try:
+                apply_recorder_filter_window()
+                for name in self.portfolios:
+                    if name in self.inited:
+                        ensure_tick_recording_universe(
+                            portfolios=[name],
+                            max_chains=self.max_chains,
+                            tick=True,
+                            bar=self.record_bar,
+                        )
+            except Exception:
+                self.log("周期性刷新录制池失败\n" + traceback.format_exc())
         if self.auto_start_script and self.run_script:
             self.ensure_script()
+
+    def ensure_market_data_fresh(self) -> bool:
+        """Reconnect CTP when IF/IO tick timestamps fall far behind wall clock."""
+        assert main_engine is not None
+        if not self.cffex_session_open():
+            return True
+        now = time.time()
+        if now - self.last_md_check < 20:
+            return True
+        self.last_md_check = now
+        lag = market_data_lag_sec()
+        if lag is None:
+            # Connected but no ticks yet — wait for subscribe/init.
+            return True
+        max_lag = md_max_lag_from_env()
+        if lag <= max_lag:
+            return True
+        if now < self.next_connect:
+            return False
+        setting = load_saved_gateway_setting(self.gateway)
+        if not setting:
+            self.log(f"行情滞后 {int(lag)}s，但缺少 {self.gateway} 配置，无法重连")
+            self.next_connect = now + 60.0
+            return False
+        self.log(f"行情时间戳滞后 {int(lag)}s（阈值 {max_lag}s），强制重连 {self.gateway}")
+        main_engine.connect(setting, self.gateway)
+        self.connecting = True
+        self.ctp_ok = False
+        self.inited.clear()
+        self.recorded.clear()
+        self.connect_failures += 1
+        self.next_connect = now + self.connect_backoff_sec()
+        return False
 
     @staticmethod
     def cffex_session_open(now: datetime | None = None) -> bool:
@@ -3172,7 +3317,11 @@ def build_live_signals(monitor: dict[str, Any]) -> list[dict[str, Any]]:
 
 def live_monitor_payload() -> dict[str, Any]:
     engine = require_script()
-    data = load_json("gex_tv_strangle_status.json") or load_json("as_option_mm_status.json") or {}
+    data = (
+        safe_load_json("gex_tv_strangle_status.json")
+        or safe_load_json("as_option_mm_status.json")
+        or {}
+    )
     if not isinstance(data, dict):
         data = {}
     data = dict(data)
@@ -3583,9 +3732,9 @@ def stop_script(_: bool = Depends(get_access)) -> dict[str, str]:
 def get_script_monitor(_: bool = Depends(get_access)) -> dict[str, Any]:
     engine = require_script()
     data = (
-        load_json("gex_tv_strangle_status.json")
-        or load_json("io_covered_call_status.json")
-        or load_json("as_option_mm_status.json")
+        safe_load_json("gex_tv_strangle_status.json")
+        or safe_load_json("io_covered_call_status.json")
+        or safe_load_json("as_option_mm_status.json")
         or {}
     )
     data["engine_active"] = bool(engine.strategy_active)

@@ -25,11 +25,13 @@ if str(ROOT) not in sys.path:
 from gex_tv_strangle import (  # noqa: E402
     condor_lots,
     io_strike_step,
+    list_expiries,
     lsp_value,
     pick_iron_condor,
     pick_strangle,
     sa_strike_step,
     select_expiries,
+    stacked_synthetic_gex_walls,
     synthetic_gex_walls,
 )
 from vnpy_optionmaster.pricing.black_76 import (  # noqa: E402
@@ -161,6 +163,8 @@ class Params:
     tp_near: float = 0.25
     # 现价距短行权价 ≤ wall_stop_steps×步长 → 墙距止损；<=0 关闭
     wall_stop_steps: float = 0.0
+    # chain=次月单链合成墙；stack=各月合成 GEX 加总墙（选腿仍在次月链）
+    wall_mode: str = "chain"
     margin_rate: float = 0.12
     min_margin_rate: float = 0.06
 
@@ -325,6 +329,7 @@ def params_from_dict(data: dict[str, Any] | None) -> Params:
         tp_far=float(data.get("tp_far") if data.get("tp_far") is not None else 0.50),
         tp_near=float(data.get("tp_near") if data.get("tp_near") is not None else 0.25),
         wall_stop_steps=float(data.get("wall_stop_steps") if data.get("wall_stop_steps") is not None else 0.0),
+        wall_mode=str(data.get("wall_mode") or "chain"),
         margin_rate=float(data.get("margin_rate") if data.get("margin_rate") is not None else 0.12),
         min_margin_rate=float(data.get("min_margin_rate") if data.get("min_margin_rate") is not None else 0.06),
     )
@@ -512,7 +517,13 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
         for exp in exps:
             t = max((exp - today).days, 1) / 365.0
             step = STRIKE_FN(spot)
-            call_wall, put_wall = synthetic_gex_walls(spot, iv, t, step, OPT_SIZE)
+            mode = str(getattr(params, "wall_mode", "chain") or "chain").lower()
+            if mode.startswith("stack"):
+                # 全挂牌月合成剖面加总取墙；短腿仍在本月(exp)链上选
+                month_ts = [max((item - today).days, 1) / 365.0 for item in list_expiries(today, CALENDAR, 8)]
+                call_wall, put_wall = stacked_synthetic_gex_walls(spot, iv, month_ts, step, OPT_SIZE)
+            else:
+                call_wall, put_wall = synthetic_gex_walls(spot, iv, t, step, OPT_SIZE)
             if is_strangle(params):
                 pick = pick_strangle(
                     spot,
@@ -570,6 +581,9 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
                     "date": row.get("datetime") or row["date"],
                     "action": "开仓",
                     "structure": "strangle" if is_strangle(params) else "condor",
+                    "wall_mode": mode,
+                    "call_wall": call_wall,
+                    "put_wall": put_wall,
                     "k_put": pick.k_put,
                     "k_call": pick.k_call,
                     "k_put_long": pick.k_put_long,
@@ -759,6 +773,19 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
     avg_open_lots = float(np.mean(open_lots)) if open_lots else 0.0
     min_open_lots = float(np.min(open_lots)) if open_lots else 0.0
     max_open_lots = float(np.max(open_lots)) if open_lots else 0.0
+    open_wall_legs = [
+        {
+            "date": t.get("date"),
+            "call_wall": t.get("call_wall"),
+            "put_wall": t.get("put_wall"),
+            "k_call": t.get("k_call"),
+            "k_put": t.get("k_put"),
+            "k_call_long": t.get("k_call_long"),
+            "k_put_long": t.get("k_put_long"),
+            "credit": t.get("credit"),
+        }
+        for t in opens
+    ]
     lots_series = [day_lots[k] for k in keys]
     pos_months = sum(1 for v in months.values() if v > 0)
     month_count = max(len(months), 1)
@@ -811,6 +838,7 @@ def run_one(bars: list[dict[str, Any]], params: Params) -> dict[str, Any]:
         "rank_y": [round(float(day_rank[keys[i]]), 1) for i in range(0, n, step)],
         "delta_y": [round(float(day_delta[keys[i]]) / 1e4, 2) for i in range(0, n, step)],
         "trades": trades[-40:],
+        "open_wall_legs": open_wall_legs,
         "daily_mean": round(float(np.mean(pnl)), 2),
         "daily_std": round(float(np.std(pnl)), 2),
         "best_day": round(float(np.max(pnl)), 2),
@@ -1041,6 +1069,161 @@ def run_cagr_sweep() -> list[dict[str, Any]]:
     return rows
 
 
+def run_wall_mode_compare(kind: str = "IF", interval: str = "1d") -> dict[str, Any]:
+    """次月单链墙 vs 各月加总墙（选腿仍在次月）对照。"""
+    configure(kind, interval)
+    bars = load_bars()
+    base = dict(
+        structure="condor",
+        wing_steps=5,
+        min_credit_frac=0.30,
+        risk_cap=0.06,
+        max_lots=80,
+        take_profit=0.25,
+        delta_stop=0.99,
+        iv_rank_min=40.0,
+        target_dte=45,
+        min_entry_dte=28,
+        max_entry_dte=65,
+        roll_dte=21,
+    )
+    presets = [
+        Params("次月单链墙(现行)", wall_mode="chain", **base),
+        Params("各月加总墙+次月选腿", wall_mode="stack", **base),
+    ]
+    results = []
+    for item in presets:
+        row = run_one(bars, item)
+        results.append(row)
+        _print_row(row)
+        sys.stdout.flush()
+
+    chain = results[0]
+    stack = results[1]
+    chain_opens = {row["date"]: row for row in (chain.get("open_wall_legs") or []) if row.get("date")}
+    stack_opens = {row["date"]: row for row in (stack.get("open_wall_legs") or []) if row.get("date")}
+    common_dates = sorted(set(chain_opens) & set(stack_opens))
+    wall_diff_dates = [
+        d
+        for d in common_dates
+        if (chain_opens[d].get("call_wall"), chain_opens[d].get("put_wall"))
+        != (stack_opens[d].get("call_wall"), stack_opens[d].get("put_wall"))
+    ]
+    leg_diff_dates = [
+        d
+        for d in common_dates
+        if (chain_opens[d].get("k_call"), chain_opens[d].get("k_put"), chain_opens[d].get("k_call_long"), chain_opens[d].get("k_put_long"))
+        != (stack_opens[d].get("k_call"), stack_opens[d].get("k_put"), stack_opens[d].get("k_call_long"), stack_opens[d].get("k_put_long"))
+    ]
+    wall_samples = []
+    for d in wall_diff_dates[:8]:
+        wall_samples.append(
+            {
+                "date": d,
+                "chain_walls": [chain_opens[d].get("call_wall"), chain_opens[d].get("put_wall")],
+                "stack_walls": [stack_opens[d].get("call_wall"), stack_opens[d].get("put_wall")],
+                "chain_shorts": [chain_opens[d].get("k_call"), chain_opens[d].get("k_put")],
+                "stack_shorts": [stack_opens[d].get("k_call"), stack_opens[d].get("k_put")],
+            }
+        )
+    metrics = ["cagr", "final_pnl", "sharpe", "calmar", "max_dd_peak_pct", "opens", "take_profits", "stops", "rolls"]
+    delta = {key: (stack.get(key) - chain.get(key)) if isinstance(chain.get(key), (int, float)) else None for key in metrics}
+    better = "stack" if float(stack.get("calmar") or 0) > float(chain.get("calmar") or 0) else "chain"
+    if abs(float(stack.get("calmar") or 0) - float(chain.get("calmar") or 0)) < 1e-9:
+        better = "tie"
+    recommend = (
+        "keep_chain"
+        if better in ("chain", "tie")
+        else ("consider_stack" if float(stack.get("sharpe") or 0) >= float(chain.get("sharpe") or 0) else "stack_research_only")
+    )
+    out = {
+        "generated": datetime.now().isoformat(sep=" ", timespec="seconds"),
+        "engine": "gex-wall-mode-compare",
+        "kind": KIND,
+        "universe": f"{UNIVERSE_LABEL}（选墙口径对照）",
+        "interval": INTERVAL,
+        "capital": CAPITAL,
+        "assumptions": {
+            "chain": "synthetic_gex_walls(T=次月DTE)；短腿在次月链",
+            "stack": (
+                "stacked_synthetic_gex_walls：各挂牌月合成剖面等权按行权价加总；"
+                "远月 OI 中心外移；短腿仍在次月链"
+            ),
+            "proxy": (
+                "无历史期权OI；墙为对数正态OI代理+Black-76 Γ。"
+                "Call墙在现价上方取 CallGEX 最大，Put墙在现价下方取 PutGEX 最小。"
+            ),
+            "params": "IO实盘推荐：翼宽5、权利金≥30%、风险6%、80手、IV Rank≥40、目标45DTE",
+            "option_size": OPT_SIZE,
+            "pricetick": PRICETICK,
+            "source": SOURCE_NOTE,
+            "pricing": "Black-76；不含跳空滑点与保证金追保",
+        },
+        "sample": {
+            "start": bars[0]["datetime"],
+            "end": bars[-1]["datetime"],
+            "bars": len(bars),
+            "days": len({row["date"] for row in bars}),
+        },
+        "better_by_calmar": better,
+        "recommend": recommend,
+        "delta_stack_minus_chain": delta,
+        "open_compare": {
+            "common_opens": len(common_dates),
+            "wall_diff": len(wall_diff_dates),
+            "leg_diff": len(leg_diff_dates),
+            "wall_diff_pct": round(100.0 * len(wall_diff_dates) / max(len(common_dates), 1), 1),
+            "leg_diff_pct": round(100.0 * len(leg_diff_dates) / max(len(common_dates), 1), 1),
+            "samples": wall_samples,
+            "note": (
+                "墙位可不同，但短腿由 14–25Δ + 翼宽/权利金约束主导；"
+                "墙仅作下界时，1 档墙差常不足以改变入选行权价。"
+            ),
+        },
+        "results": results,
+    }
+    out_path = ROOT.joinpath("backtest_gex_wall_mode_if_daily_result.json")
+    if KIND != "IF" or INTERVAL != "1d":
+        out_path = ROOT.joinpath(f"backtest_gex_wall_mode_{KIND.lower()}_{INTERVAL}_result.json")
+    out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    report = {
+        "generated": out["generated"],
+        "sample": out["sample"],
+        "recommend": recommend,
+        "better_by_calmar": better,
+        "delta_stack_minus_chain": delta,
+        "open_compare": out["open_compare"],
+        "rows": [
+            {
+                "name": r["name"],
+                "wall_mode": r.get("wall_mode"),
+                "cagr": r["cagr"],
+                "final_pnl": r["final_pnl"],
+                "sharpe": r["sharpe"],
+                "calmar": r.get("calmar"),
+                "max_dd_peak_pct": r["max_dd_peak_pct"],
+                "opens": r["opens"],
+                "take_profits": r["take_profits"],
+                "stops": r["stops"],
+                "rolls": r["rolls"],
+            }
+            for r in results
+        ],
+    }
+    report_path = ROOT.joinpath("gex_wall_mode_if_daily_report.json")
+    if KIND != "IF" or INTERVAL != "1d":
+        report_path = ROOT.joinpath(f"gex_wall_mode_{KIND.lower()}_{INTERVAL}_report.json")
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"推荐={recommend}  Calmar更优={better}")
+    print(
+        f"同日开仓={len(common_dates)} 墙不同={len(wall_diff_dates)} "
+        f"腿不同={len(leg_diff_dates)}"
+    )
+    print(f"结果写入 {out_path}")
+    print(f"摘要写入 {report_path}")
+    return out
+
+
 def run_backtest(
     params: Params | None = None,
     compare: bool = True,
@@ -1116,11 +1299,13 @@ if __name__ == "__main__":
     kind = "SA"
     interval = "5m"
     mode = "backtest"
-    args = [a for a in sys.argv[1:] if a not in ("sweep", "structures", "compare")]
+    args = [a for a in sys.argv[1:] if a not in ("sweep", "structures", "compare", "walls", "wall")]
     if "sweep" in sys.argv[1:]:
         mode = "sweep"
     elif "structures" in sys.argv[1:] or "compare" in sys.argv[1:]:
         mode = "structures"
+    elif "walls" in sys.argv[1:] or "wall" in sys.argv[1:]:
+        mode = "walls"
     for arg in args:
         token = arg.lower()
         if token in ("if", "sa"):
@@ -1142,5 +1327,7 @@ if __name__ == "__main__":
         run_cagr_sweep()
     elif mode == "structures":
         run_structure_compare(kind, interval)
+    elif mode == "walls":
+        run_wall_mode_compare(kind, interval)
     else:
         main()

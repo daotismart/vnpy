@@ -1,8 +1,7 @@
-"""Standalone IF/IO tick+bar recorder: CTP → Redis MD bus → QuestDB.
+"""Recorder: Redis Stream → QuestDB.
 
-Owns CTP market data. Publishes ticks/contracts to Redis for the web/live
-process, and writes QuestDB via DataRecorder. Optionally releases the TD
-session so the live process can trade on the same investor id.
+No CTP. Consumes durable tick stream with a consumer group and ACK only after
+successful QuestDB write (at-least-once; restart resumes pending messages).
 """
 
 from __future__ import annotations
@@ -27,18 +26,8 @@ def _env(name: str, default: str) -> str:
     return value if value not in (None, "") else default
 
 
-os.environ["LIVE_IRON_CONDOR"] = "0"
-os.environ.setdefault("LIVE_RECORD_TICKS", "1")
-os.environ.setdefault("LIVE_RECORD_BAR", "1")
-os.environ.setdefault("LIVE_RECORD_MAX_CHAINS", "2")
-os.environ.setdefault("LIVE_RECORD_FILTER_WINDOW", "3600")
-os.environ.setdefault("LIVE_MD_MAX_LAG_SEC", "90")
-os.environ["STANDALONE_RECORDER"] = "1"
 os.environ.setdefault("LIVE_MD_SOURCE", "redis")
 os.environ.setdefault("MD_BUS_ENABLE", "1")
-os.environ.setdefault("LIVE_CTP_SKIP_MD", "0")
-os.environ.setdefault("LIVE_CTP_SKIP_TD", "0")
-os.environ.setdefault("LIVE_RECORDER_RELEASE_TD", "1")
 
 SETTINGS["database.name"] = _env("DATABASE_DRIVER", "questdb")
 SETTINGS["database.host"] = _env("DATABASE_HOST", "127.0.0.1")
@@ -55,73 +44,60 @@ import vnpy.trader.database as database_module
 
 database_module.database = None
 
-from vnpy.event import EventEngine
-from vnpy.event.engine import Event
-from vnpy.trader.engine import MainEngine
-from vnpy_ctp import CtpGateway
-from vnpy_datarecorder import DataRecorderApp
-from vnpy_optionmaster import OptionMasterApp
-from vnpy_optionmaster.base import OptionData
+from vnpy.trader.database import get_database
+from vnpy.trader.object import TickData
 
-from ctp_session import patch_ctp_connect_modes
-from md_bus import md_bus_status, start_md_bus_publisher, stop_md_bus
-from server import attach_runtime, recorder_status
+from md_bus import (
+    md_bus_status,
+    start_md_stream_consumer,
+    stop_md_bus,
+    tick_stream,
+)
 
 
 HEARTBEAT_PATH = Path(_env("RECORDER_HEARTBEAT_FILE", "/tmp/recorder_heartbeat"))
 _stop = threading.Event()
+_write_count = 0
+_write_err = 0
+_last_err = ""
+_last_vt = ""
+_last_dt = ""
+_lock = threading.Lock()
 
 
-def _patch_event_engine() -> None:
-    if getattr(EventEngine._process, "_web_trader_safe", False):
+def _on_ticks(batch: list[tuple[str, TickData]]) -> None:
+    """Persist batch to QuestDB. Raise on failure so consumer does not ACK."""
+    global _write_count, _write_err, _last_err, _last_vt, _last_dt
+    ticks = [tick for _msg_id, tick in batch]
+    if not ticks:
         return
-
-    def _process(self, event: Event) -> None:
-        if event.type in self._handlers:
-            for handler in list(self._handlers[event.type]):
-                try:
-                    handler(event)
-                except Exception:
-                    traceback.print_exc()
-        if self._general_handlers:
-            for handler in list(self._general_handlers):
-                try:
-                    handler(event)
-                except Exception:
-                    traceback.print_exc()
-
-    _process._web_trader_safe = True  # type: ignore[attr-defined]
-    EventEngine._process = _process  # type: ignore[method-assign]
-
-
-def _patch_option_greeks() -> None:
-    if getattr(OptionData.calculate_theo_greeks, "_web_trader_safe", False):
-        return
-    original = OptionData.calculate_theo_greeks
-
-    def calculate_theo_greeks(self) -> None:
-        if not getattr(self, "underlying", None):
-            return
-        original(self)
-
-    calculate_theo_greeks._web_trader_safe = True  # type: ignore[attr-defined]
-    OptionData.calculate_theo_greeks = calculate_theo_greeks  # type: ignore[method-assign]
+    db = get_database()
+    ok = db.save_tick_data(ticks, stream=True)
+    if not ok:
+        raise RuntimeError("QuestDB save_tick_data returned False")
+    with _lock:
+        _write_count += len(ticks)
+        _last_vt = ticks[-1].vt_symbol
+        _last_dt = str(ticks[-1].datetime)
 
 
 def _write_heartbeat() -> None:
     try:
-        status = recorder_status()
         bus = md_bus_status()
-        payload = (
-            f"ts={time.time():.3f}\n"
-            f"active={status.get('active')}\n"
-            f"pending={status.get('pending')}\n"
-            f"ticks={len(status.get('tick') or [])}\n"
-            f"md_lag_sec={status.get('md_lag_sec')}\n"
-            f"newest={status.get('newest_tick')}\n"
-            f"bus_pub={bus.get('pub_count')}\n"
-            f"bus_err={bus.get('err_count')}\n"
-        )
+        with _lock:
+            payload = (
+                f"ts={time.time():.3f}\n"
+                f"write_count={_write_count}\n"
+                f"write_err={_write_err}\n"
+                f"last_vt={_last_vt}\n"
+                f"last_dt={_last_dt}\n"
+                f"stream={tick_stream()}\n"
+                f"read_count={bus.get('read_count')}\n"
+                f"ack_count={bus.get('ack_count')}\n"
+                f"pending={bus.get('pending')}\n"
+                f"bus_err={bus.get('err_count')}\n"
+                f"last_err={bus.get('last_err') or _last_err}\n"
+            )
         HEARTBEAT_PATH.write_text(payload, encoding="utf-8")
     except Exception as exc:
         try:
@@ -130,67 +106,54 @@ def _write_heartbeat() -> None:
             pass
 
 
-def _heartbeat_loop() -> None:
-    while not _stop.wait(5.0):
-        _write_heartbeat()
-
-
 def main() -> None:
-    patch_ctp_connect_modes()
-    _patch_event_engine()
-    _patch_option_greeks()
+    global _write_err, _last_err
 
-    event_engine = EventEngine()
-    main_engine = MainEngine(event_engine)
-    main_engine.add_gateway(CtpGateway)
-    recorder_engine = main_engine.add_app(DataRecorderApp)
-    option_engine = main_engine.add_app(OptionMasterApp)
+    def _safe_on_ticks(batch: list[tuple[str, TickData]]) -> None:
+        global _write_err, _last_err
+        try:
+            _on_ticks(batch)
+        except Exception as exc:
+            _write_err += 1
+            _last_err = str(exc)
+            raise
 
-    start_md_bus_publisher(event_engine, log=lambda m: main_engine.write_log(f"[MD_BUS] {m}"))
-
-    attach_runtime(
-        main_engine,
-        event_engine,
-        None,  # type: ignore[arg-type]
-        None,  # type: ignore[arg-type]
-        None,  # type: ignore[arg-type]
-        recorder_engine,
-        option_engine,
-        None,  # type: ignore[arg-type]
-        None,  # type: ignore[arg-type]
+    consumer = start_md_stream_consumer(
+        _safe_on_ticks,
+        log=lambda m: print(f"[RECORDER] {m}", flush=True),
     )
-
     print(
-        "Standalone recorder started: "
+        "QuestDB recorder started: "
         f"db={SETTINGS['database.host']}:{SETTINGS['database.port']} "
-        f"redis={_env('REDIS_URL', 'redis://redis:6379/0')} "
-        f"portfolios={os.getenv('LIVE_PORTFOLIOS', 'IO.CFFEX')} "
-        f"filter_window={os.getenv('LIVE_RECORD_FILTER_WINDOW', '3600')}s",
+        f"stream={tick_stream()} group={consumer.group}",
         flush=True,
     )
 
-    hb = threading.Thread(target=_heartbeat_loop, name="recorder-heartbeat", daemon=True)
-    hb.start()
-    _write_heartbeat()
-
-    def _handle_stop(signum: int, _frame: object) -> None:
-        print(f"Standalone recorder received signal {signum}, shutting down", flush=True)
+    def _on_signal(signum: int, _frame: object) -> None:
+        print(f"recorder signal {signum}, shutting down", flush=True)
         _stop.set()
 
-    signal.signal(signal.SIGINT, _handle_stop)
-    signal.signal(signal.SIGTERM, _handle_stop)
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
 
     try:
-        while not _stop.wait(1.0):
-            pass
+        while not _stop.wait(5.0):
+            _write_heartbeat()
+            # Reconnect consumer thread if it died.
+            if consumer._thread is not None and not consumer._thread.is_alive() and not _stop.is_set():
+                print("[RECORDER] consumer thread dead — restarting", flush=True)
+                try:
+                    consumer.stop()
+                except Exception:
+                    traceback.print_exc()
+                consumer = start_md_stream_consumer(
+                    _safe_on_ticks,
+                    log=lambda m: print(f"[RECORDER] {m}", flush=True),
+                )
     finally:
         _stop.set()
         try:
             stop_md_bus()
-        except Exception:
-            traceback.print_exc()
-        try:
-            main_engine.close()
         except Exception:
             traceback.print_exc()
         try:

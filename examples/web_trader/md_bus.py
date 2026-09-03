@@ -54,6 +54,28 @@ def contracts_key() -> str:
     return _env("MD_BUS_CONTRACTS_KEY", "vnpy:md:contracts")
 
 
+def tick_stream() -> str:
+    """Durable Redis Stream for ticks (recorder ACK; survives restarts)."""
+    return _env("MD_BUS_TICK_STREAM", "vnpy:md:tick_stream")
+
+
+def tick_stream_maxlen() -> int:
+    """Approximate MAXLEN for the tick stream (0 = unlimited)."""
+    raw = _env("MD_BUS_TICK_STREAM_MAXLEN", "200000")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 200000
+
+
+def recorder_group() -> str:
+    return _env("MD_BUS_RECORDER_GROUP", "questdb-writer")
+
+
+def recorder_consumer() -> str:
+    return _env("MD_BUS_RECORDER_CONSUMER", "recorder-1")
+
+
 def _dt_to_str(value: datetime | None) -> str | None:
     if value is None:
         return None
@@ -267,6 +289,7 @@ class MdBusPublisher:
             "role": "publisher",
             "redis": redis_url(),
             "tick_channel": tick_channel(),
+            "tick_stream": tick_stream(),
             "pub_count": self._pub_count,
             "err_count": self._err_count,
             "last_err": self._last_err,
@@ -290,6 +313,13 @@ class MdBusPublisher:
         try:
             payload = json.dumps(tick_to_dict(tick), ensure_ascii=False, separators=(",", ":"))
             pipe = self._client.pipeline(transaction=False)
+            # Durable path for QuestDB recorder (consumer group + ACK).
+            maxlen = tick_stream_maxlen()
+            if maxlen > 0:
+                pipe.xadd(tick_stream(), {"payload": payload}, maxlen=maxlen, approximate=True)
+            else:
+                pipe.xadd(tick_stream(), {"payload": payload})
+            # Realtime fanout for web/strategies.
             pipe.publish(tick_channel(), payload)
             pipe.hset(latest_key(), tick.vt_symbol, payload)
             pipe.execute()
@@ -446,6 +476,185 @@ class MdBusSubscriber:
 
 _publisher: MdBusPublisher | None = None
 _subscriber: MdBusSubscriber | None = None
+_stream_consumer: "MdStreamConsumer | None" = None
+
+
+class MdStreamConsumer:
+    """Redis Stream consumer-group reader for durable QuestDB writes.
+
+    - On start: ensure group exists, reclaim idle pending, then XREADGROUP block.
+    - Caller ACK only after successful persistence (no data loss across restarts).
+    """
+
+    def __init__(
+        self,
+        on_ticks: Callable[[list[tuple[str, TickData]]], None],
+        *,
+        group: str | None = None,
+        consumer: str | None = None,
+        batch_size: int = 200,
+        block_ms: int = 2000,
+        pending_idle_ms: int = 30_000,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
+        self.on_ticks = on_ticks
+        self.group = group or recorder_group()
+        self.consumer = consumer or recorder_consumer()
+        self.batch_size = max(1, batch_size)
+        self.block_ms = max(100, block_ms)
+        self.pending_idle_ms = max(1000, pending_idle_ms)
+        self.log = log or (lambda msg: print(f"[MD_STREAM] {msg}", flush=True))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._client = None
+        self._read_count = 0
+        self._ack_count = 0
+        self._err_count = 0
+        self._last_err = ""
+        self._last_id = ""
+
+    def start(self) -> None:
+        self._client = create_redis_client()
+        self._client.ping()
+        self._ensure_group()
+        self._thread = threading.Thread(target=self._loop, name="md-stream-consumer", daemon=True)
+        self._thread.start()
+        self.log(
+            f"stream consumer started stream={tick_stream()} group={self.group} "
+            f"consumer={self.consumer}"
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
+
+    def status(self) -> dict[str, Any]:
+        pending = None
+        try:
+            if self._client is not None:
+                pending = int(self._client.xpending(tick_stream(), self.group)["pending"])
+        except Exception:
+            pending = None
+        return {
+            "enabled": True,
+            "role": "stream_consumer",
+            "redis": redis_url(),
+            "tick_stream": tick_stream(),
+            "group": self.group,
+            "consumer": self.consumer,
+            "read_count": self._read_count,
+            "ack_count": self._ack_count,
+            "pending": pending,
+            "err_count": self._err_count,
+            "last_err": self._last_err,
+            "last_id": self._last_id,
+            "thread_alive": bool(self._thread and self._thread.is_alive()),
+        }
+
+    def _ensure_group(self) -> None:
+        assert self._client is not None
+        try:
+            self._client.xgroup_create(tick_stream(), self.group, id="0-0", mkstream=True)
+            self.log(f"created consumer group {self.group}")
+        except Exception as exc:
+            # BUSYGROUP = already exists
+            if "BUSYGROUP" not in str(exc).upper():
+                raise
+
+    def _loop(self) -> None:
+        assert self._client is not None
+        while not self._stop.is_set():
+            try:
+                self._reclaim_pending()
+                rows = self._client.xreadgroup(
+                    groupname=self.group,
+                    consumername=self.consumer,
+                    streams={tick_stream(): ">"},
+                    count=self.batch_size,
+                    block=self.block_ms,
+                )
+                if not rows:
+                    continue
+                batch: list[tuple[str, TickData]] = []
+                for _stream_name, messages in rows:
+                    for msg_id, fields in messages:
+                        payload = fields.get("payload") if isinstance(fields, dict) else None
+                        if not payload:
+                            # Poison / empty — ACK to avoid infinite retry.
+                            self._client.xack(tick_stream(), self.group, msg_id)
+                            continue
+                        try:
+                            tick = tick_from_dict(json.loads(payload))
+                        except Exception as exc:
+                            self._err_count += 1
+                            self._last_err = f"decode {msg_id}: {exc}"
+                            self._client.xack(tick_stream(), self.group, msg_id)
+                            continue
+                        batch.append((msg_id, tick))
+                        self._read_count += 1
+                        self._last_id = msg_id
+                if not batch:
+                    continue
+                # Persist first; ACK only on success (at-least-once delivery).
+                self.on_ticks(batch)
+                ids = [msg_id for msg_id, _ in batch]
+                self._client.xack(tick_stream(), self.group, *ids)
+                self._ack_count += len(ids)
+            except Exception as exc:
+                self._err_count += 1
+                self._last_err = str(exc)
+                traceback.print_exc()
+                self._stop.wait(1.5)
+
+    def _reclaim_pending(self) -> None:
+        """Claim idle pending messages left by a crashed consumer."""
+        assert self._client is not None
+        try:
+            # redis-py auto_claim: (next_id, messages, deleted)
+            result = self._client.xautoclaim(
+                name=tick_stream(),
+                groupname=self.group,
+                consumername=self.consumer,
+                min_idle_time=self.pending_idle_ms,
+                start_id="0-0",
+                count=self.batch_size,
+            )
+            if not result:
+                return
+            messages = result[1] if len(result) > 1 else []
+            if not messages:
+                return
+            batch: list[tuple[str, TickData]] = []
+            for msg_id, fields in messages:
+                payload = fields.get("payload") if isinstance(fields, dict) else None
+                if not payload:
+                    self._client.xack(tick_stream(), self.group, msg_id)
+                    continue
+                try:
+                    tick = tick_from_dict(json.loads(payload))
+                except Exception:
+                    self._client.xack(tick_stream(), self.group, msg_id)
+                    continue
+                batch.append((msg_id, tick))
+            if not batch:
+                return
+            self.log(f"reclaimed {len(batch)} pending stream messages")
+            self.on_ticks(batch)
+            self._client.xack(tick_stream(), self.group, *[msg_id for msg_id, _ in batch])
+            self._ack_count += len(batch)
+        except Exception as exc:
+            # Older Redis without XAUTOCLAIM — ignore; pending still retried via XREADGROUP 0
+            if "unknown command" in str(exc).lower() or "XAUTOCLAIM" in str(exc).upper():
+                return
+            self._err_count += 1
+            self._last_err = f"reclaim: {exc}"
 
 
 def start_md_bus_publisher(event_engine: EventEngine, log: Callable[[str], None] | None = None) -> MdBusPublisher:
@@ -468,7 +677,29 @@ def start_md_bus_subscriber(event_engine: EventEngine, log: Callable[[str], None
     return sub
 
 
+def start_md_stream_consumer(
+    on_ticks: Callable[[list[tuple[str, TickData]]], None],
+    log: Callable[[str], None] | None = None,
+) -> MdStreamConsumer:
+    global _stream_consumer
+    if _stream_consumer is not None:
+        thread = _stream_consumer._thread
+        if thread is not None and thread.is_alive():
+            return _stream_consumer
+        try:
+            _stream_consumer.stop()
+        except Exception:
+            pass
+        _stream_consumer = None
+    consumer = MdStreamConsumer(on_ticks, log=log)
+    consumer.start()
+    _stream_consumer = consumer
+    return consumer
+
+
 def md_bus_status() -> dict[str, Any]:
+    if _stream_consumer is not None:
+        return _stream_consumer.status()
     if _publisher is not None:
         return _publisher.status()
     if _subscriber is not None:
@@ -477,10 +708,13 @@ def md_bus_status() -> dict[str, Any]:
 
 
 def stop_md_bus() -> None:
-    global _publisher, _subscriber
+    global _publisher, _subscriber, _stream_consumer
     if _publisher is not None:
         _publisher.stop()
         _publisher = None
     if _subscriber is not None:
         _subscriber.stop()
         _subscriber = None
+    if _stream_consumer is not None:
+        _stream_consumer.stop()
+        _stream_consumer = None

@@ -34,8 +34,62 @@ services:
       retries: 10
       start_period: 5s
 
-  # CTP MD owner: publish ticks to Redis + write QuestDB.
-  # After subscribe, releases TD so web can trade on the same investor id.
+  # 1) MD receiver: CTP → Redis Stream (+ pub/sub). Minimal & restart-safe.
+  md_receiver:
+    image: vnpy-web-trader:4.4.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-}
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      LANG: zh_CN.UTF-8
+      LC_ALL: zh_CN.UTF-8
+      LC_CTYPE: zh_CN.UTF-8
+      LIVE_GATEWAY: ${LIVE_GATEWAY:-CTP}
+      LIVE_MD_SOURCE: redis
+      MD_BUS_ENABLE: "1"
+      LIVE_RECORD_MAX_CHAINS: ${LIVE_RECORD_MAX_CHAINS:-2}
+      LIVE_MD_MAX_LAG_SEC: ${LIVE_MD_MAX_LAG_SEC:-90}
+      LIVE_MD_PREFIXES: ${LIVE_MD_PREFIXES:-IF,IO}
+      LIVE_MD_RELEASE_TD: ${LIVE_MD_RELEASE_TD:-1}
+      LIVE_CTP_SKIP_MD: "0"
+      LIVE_CTP_SKIP_TD: "0"
+      CTP_CONNECT_FILE: ${MD_CTP_CONNECT_FILE:-}
+      MD_RECEIVER_HEARTBEAT_FILE: /tmp/md_receiver_heartbeat
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      MD_BUS_TICK_STREAM: ${MD_BUS_TICK_STREAM:-vnpy:md:tick_stream}
+      MD_BUS_TICK_STREAM_MAXLEN: ${MD_BUS_TICK_STREAM_MAXLEN:-200000}
+    volumes:
+      - ./data/vntrader:/root/.vntrader
+      - ./run_md_receiver.py:/app/run_md_receiver.py
+      - ./md_bus.py:/app/md_bus.py
+      - ./ctp_session.py:/app/ctp_session.py
+    entrypoint:
+      [
+        "bash",
+        "-lc",
+        "pip install -q redis >/tmp/pip-redis.log 2>&1 || true; exec python run_md_receiver.py",
+      ]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import time; from pathlib import Path; p=Path('/tmp/md_receiver_heartbeat'); assert p.exists() and time.time()-p.stat().st_mtime<30",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 90s
+
+  # 2) Recorder: Redis Stream → QuestDB. ACK only after successful write.
   recorder:
     image: vnpy-web-trader:4.4.0
     build:
@@ -54,24 +108,13 @@ services:
       LANG: zh_CN.UTF-8
       LC_ALL: zh_CN.UTF-8
       LC_CTYPE: zh_CN.UTF-8
-      LIVE_IRON_CONDOR: "0"
-      LIVE_AUTO_CONNECT_CTP: "1"
-      LIVE_RECORD_TICKS: "1"
-      LIVE_RECORD_MAX_CHAINS: ${LIVE_RECORD_MAX_CHAINS:-2}
-      LIVE_RECORD_BAR: ${LIVE_RECORD_BAR:-1}
-      LIVE_RECORD_FILTER_WINDOW: ${LIVE_RECORD_FILTER_WINDOW:-3600}
-      LIVE_MD_MAX_LAG_SEC: ${LIVE_MD_MAX_LAG_SEC:-90}
-      LIVE_PORTFOLIOS: ${LIVE_PORTFOLIOS:-IO.CFFEX}
-      LIVE_GATEWAY: ${LIVE_GATEWAY:-CTP}
-      STANDALONE_RECORDER: "1"
       LIVE_MD_SOURCE: redis
       MD_BUS_ENABLE: "1"
-      LIVE_RECORDER_RELEASE_TD: ${LIVE_RECORDER_RELEASE_TD:-1}
-      LIVE_CTP_SKIP_MD: "0"
-      LIVE_CTP_SKIP_TD: "0"
-      CTP_CONNECT_FILE: ${RECORDER_CTP_CONNECT_FILE:-}
       RECORDER_HEARTBEAT_FILE: /tmp/recorder_heartbeat
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      MD_BUS_TICK_STREAM: ${MD_BUS_TICK_STREAM:-vnpy:md:tick_stream}
+      MD_BUS_RECORDER_GROUP: ${MD_BUS_RECORDER_GROUP:-questdb-writer}
+      MD_BUS_RECORDER_CONSUMER: ${MD_BUS_RECORDER_CONSUMER:-recorder-1}
       DATABASE_DRIVER: questdb
       DATABASE_HOST: questdb
       DATABASE_PORT: "8812"
@@ -82,9 +125,7 @@ services:
     volumes:
       - ./data/vntrader:/root/.vntrader
       - ./run_recorder.py:/app/run_recorder.py
-      - ./server.py:/app/server.py
       - ./md_bus.py:/app/md_bus.py
-      - ./ctp_session.py:/app/ctp_session.py
       - ./vnpy_questdb:/app/vnpy_questdb
     entrypoint:
       [
@@ -103,22 +144,24 @@ services:
       interval: 15s
       timeout: 5s
       retries: 8
-      start_period: 90s
+      start_period: 60s
 
-  # Live/UI process: ticks from Redis; CTP TD only (no second MD login).
+  # 3) Web / strategy: Redis MD + CTP TD + QuestDB.
   web:
+    image: vnpy-web-trader:4.4.0
     build:
       context: .
       dockerfile: Dockerfile
       args:
         DEBIAN_MIRROR: ${DEBIAN_MIRROR:-}
-    image: vnpy-web-trader:4.4.0
     restart: unless-stopped
     depends_on:
       questdb:
         condition: service_healthy
       redis:
         condition: service_healthy
+      md_receiver:
+        condition: service_started
       recorder:
         condition: service_started
     environment:
@@ -141,7 +184,7 @@ services:
       MD_BUS_ENABLE: "1"
       LIVE_CTP_SKIP_MD: "1"
       LIVE_CTP_SKIP_TD: "0"
-      LIVE_RECORD_TICKS: ${WEB_LIVE_RECORD_TICKS:-0}
+      LIVE_RECORD_TICKS: "0"
       LIVE_RECORD_MAX_CHAINS: ${LIVE_RECORD_MAX_CHAINS:-2}
       LIVE_RECORD_BAR: ${LIVE_RECORD_BAR:-1}
       LIVE_RECORD_FILTER_WINDOW: ${LIVE_RECORD_FILTER_WINDOW:-3600}

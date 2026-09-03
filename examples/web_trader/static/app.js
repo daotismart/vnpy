@@ -2548,6 +2548,8 @@ function openLiveExplainModal(key) {
             hint.textContent = "链上 GEX 剖面暂不可用（需期权组合已初始化并收到行情）";
         } else if (chart.type === "gex_walls") {
             hint.textContent = "柱状为各行权价 CallGEX（橙）/ PutGEX（蓝）；竖线为策略墙与现价";
+        } else if (chart.type === "dual_bar") {
+            hint.textContent = "蓝色为交易日 DTE，绿色为自然日 DTE";
         } else {
             hint.textContent = "";
         }
@@ -2586,6 +2588,10 @@ function drawLiveExplainChart(chart) {
     }
     if (type === "bar_single") {
         drawExplainBar(ctx, cssWidth, cssHeight, chart);
+        return;
+    }
+    if (type === "dual_bar") {
+        drawExplainDualBar(ctx, cssWidth, cssHeight, chart);
         return;
     }
     if (type === "legs") {
@@ -2707,6 +2713,32 @@ function drawExplainBar(ctx, width, height, chart) {
     ctx.fillStyle = "#e8edf2";
     ctx.font = "14px Microsoft YaHei, sans-serif";
     ctx.fillText(`${chart.label || ""} = ${value}`, pad, y - 12);
+}
+
+function drawExplainDualBar(ctx, width, height, chart) {
+    const items = Array.isArray(chart.items) ? chart.items : [];
+    const padX = 48;
+    const padTop = 36;
+    const max = Math.max(Number(chart.max || 1), ...items.map((item) => Number(item.value || 0)), 1e-9);
+    const barH = 30;
+    const gap = 28;
+    items.forEach((item, index) => {
+        const y = padTop + index * (barH + gap);
+        const value = Number(item.value || 0);
+        const barW = width - padX * 2;
+        ctx.fillStyle = "rgba(255,255,255,0.08)";
+        ctx.fillRect(padX, y, barW, barH);
+        ctx.fillStyle = item.color || "#54a0ff";
+        ctx.fillRect(padX, y, barW * Math.min(1, Math.max(0, value / max)), barH);
+        ctx.fillStyle = "#e8edf2";
+        ctx.font = "13px Microsoft YaHei, sans-serif";
+        ctx.fillText(`${item.label || ""} = ${value} 天`, padX, y - 8);
+    });
+    if (chart.note) {
+        ctx.fillStyle = "#8b98a8";
+        ctx.font = "12px Microsoft YaHei, sans-serif";
+        ctx.fillText(String(chart.note), padX, height - 16);
+    }
 }
 
 function drawExplainLegs(ctx, width, height, chart) {

@@ -3170,6 +3170,53 @@ def build_live_signals(monitor: dict[str, Any]) -> list[dict[str, Any]]:
     return signals
 
 
+def resolve_chain_expiry_info(portfolio_name: str, chain_symbol: str = "") -> dict[str, Any]:
+    """Return option expiry plus trading-day and calendar-day DTE."""
+    trading = None
+    calendar = None
+    expiry_text = ""
+    symbol = chain_symbol or ""
+    if option_engine is not None and portfolio_name:
+        portfolio = option_engine.portfolios.get(portfolio_name)
+        if portfolio:
+            chains = portfolio_chain_symbols(portfolio)
+            symbol = symbol or (chains[0] if chains else "")
+            chain = get_portfolio_chain(portfolio, symbol) if symbol else None
+            if chain:
+                trading = int(getattr(chain, "days_to_expiry", 0) or 0) or None
+                option = None
+                for bucket in (getattr(chain, "calls", None), getattr(chain, "puts", None)):
+                    if not bucket:
+                        continue
+                    option = next(iter(bucket.values()), None)
+                    if option:
+                        break
+                expiry = getattr(option, "option_expiry", None) if option else None
+                if expiry is not None:
+                    try:
+                        if hasattr(expiry, "date"):
+                            expiry_date = expiry.date()
+                            expiry_text = expiry.strftime("%Y-%m-%d")
+                        else:
+                            expiry_date = expiry
+                            expiry_text = str(expiry)[:10]
+                        today = datetime.now().date()
+                        calendar = max((expiry_date - today).days, 0)
+                    except Exception:
+                        pass
+                if trading is None and option is not None:
+                    try:
+                        trading = int(getattr(option, "days_to_expiry", 0) or 0) or None
+                    except (TypeError, ValueError):
+                        pass
+    return {
+        "chain_symbol": symbol,
+        "expiry": expiry_text,
+        "trading_dte": trading,
+        "calendar_dte": calendar,
+    }
+
+
 def live_chain_gex_profile(portfolio_name: str, chain_symbol: str = "") -> dict[str, Any]:
     """Build strike-level GEX profile for live indicator explain charts."""
     if option_engine is None or not portfolio_name:
@@ -3230,6 +3277,11 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
     portfolio = str(data.get("portfolio") or params.get("portfolio_name") or "IO.CFFEX")
     chain = str(data.get("chain") or indicators.get("chain") or "")
     profile = live_chain_gex_profile(portfolio, chain)
+    dte_info = resolve_chain_expiry_info(portfolio, chain)
+    trading_dte = indicators.get("dte") if indicators.get("dte") is not None else data.get("dte")
+    if trading_dte is None:
+        trading_dte = dte_info.get("trading_dte")
+    calendar_dte = dte_info.get("calendar_dte")
     spot = indicators.get("spot") if indicators.get("spot") is not None else data.get("spot")
     call_wall = indicators.get("call_wall") if indicators.get("call_wall") is not None else data.get("call_wall")
     put_wall = indicators.get("put_wall") if indicators.get("put_wall") is not None else data.get("put_wall")
@@ -3318,18 +3370,39 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
         },
         "dte": {
             "title": "DTE（剩余到期日）",
-            "value": indicators.get("dte") if indicators.get("dte") is not None else data.get("dte"),
-            "formula": "DTE = 合约到期日 − 今日（交易日近似用自然日）",
+            "value": (
+                f"交易日 {_num(trading_dte, 0)} ｜ 自然日 {_num(calendar_dte, 0)}"
+                if trading_dte is not None or calendar_dte is not None
+                else "—"
+            ),
+            "formula": (
+                f"交易日 DTE = 剔除周末与上交所节假日后的剩余交易日（年化基数 {ANNUAL_DAYS}）；"
+                "自然日 DTE = 到期日 − 今日"
+            ),
             "steps": [
-                f"当前链 DTE：{_num(indicators.get('dte') if indicators.get('dte') is not None else data.get('dte'), 0)} 天",
-                f"链：{chain or '—'}",
-                "开仓要求落在配置的 min/max entry DTE；持仓接近 roll_dte 触发移仓",
+                f"链：{dte_info.get('chain_symbol') or chain or '—'}",
+                f"期权到期日：{dte_info.get('expiry') or '—'}",
+                f"交易日 DTE：{_num(trading_dte, 0)} 天（vnpy_optionmaster / 策略开仓窗使用）",
+                f"自然日 DTE：{_num(calendar_dte, 0)} 天（日历剩余天数）",
+                "二者差值为期间周末与节假日；例如国庆长假会拉大差距",
+                "开仓窗 / 移仓阈值均按交易日 DTE 判断",
             ],
             "chart": {
-                "type": "bar_single",
-                "value": float(indicators.get("dte") or data.get("dte") or 0),
-                "max": 90,
-                "label": "DTE(天)",
+                "type": "dual_bar",
+                "items": [
+                    {
+                        "label": "交易日 DTE",
+                        "value": float(trading_dte or 0),
+                        "color": "#54a0ff",
+                    },
+                    {
+                        "label": "自然日 DTE",
+                        "value": float(calendar_dte or 0),
+                        "color": "#1dd1a1",
+                    },
+                ],
+                "max": max(90.0, float(trading_dte or 0), float(calendar_dte or 0)) * 1.15 or 90.0,
+                "note": f"到期 {dte_info.get('expiry') or '—'}",
             },
         },
         "call_wall": {

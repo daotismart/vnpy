@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VeighNa Web Trader</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260902b">
+    <link rel="stylesheet" href="/static/style.css?v=20260903b">
 </head>
 <body>
     <section id="login-page" class="login-page">
@@ -422,7 +422,7 @@
                 </article>
                 <div class="grid-2">
                     <article class="card">
-                        <h2>指标</h2>
+                        <h2>指标 <span class="hint">点击查看计算过程</span></h2>
                         <div id="live-indicators" class="metric-grid"></div>
                     </article>
                     <article class="card">
@@ -826,6 +826,23 @@
         </footer>
     </section>
 
-    <script src="/static/app.js?v=20260902b"></script>
+    <div id="live-explain-modal" class="explain-modal hidden" aria-hidden="true">
+        <div class="explain-backdrop" data-explain-close="1"></div>
+        <div class="explain-card" role="dialog" aria-modal="true">
+            <header class="explain-head">
+                <div>
+                    <h3 id="live-explain-title">指标说明</h3>
+                    <p id="live-explain-value" class="hint"></p>
+                </div>
+                <button id="live-explain-close" class="ghost" type="button">关闭</button>
+            </header>
+            <p id="live-explain-formula" class="explain-formula"></p>
+            <ol id="live-explain-steps" class="explain-steps"></ol>
+            <canvas id="live-explain-chart" width="640" height="280"></canvas>
+            <p id="live-explain-chart-hint" class="hint"></p>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=20260903b"></script>
 </body>
 </html>

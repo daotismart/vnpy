@@ -1,7 +1,8 @@
-"""Standalone IF/IO tick+bar recorder process (no Web UI / no live strategies).
+"""Standalone IF/IO tick+bar recorder: CTP → Redis MD bus → QuestDB.
 
-Runs CTP + OptionMaster + DataRecorder in an isolated process so Web API load,
-script strategies, or a wedged uvicorn worker cannot stop QuestDB writes.
+Owns CTP market data. Publishes ticks/contracts to Redis for the web/live
+process, and writes QuestDB via DataRecorder. Optionally releases the TD
+session so the live process can trade on the same investor id.
 """
 
 from __future__ import annotations
@@ -26,14 +27,18 @@ def _env(name: str, default: str) -> str:
     return value if value not in (None, "") else default
 
 
-# Force recorder-only behaviour before importing server helpers.
 os.environ["LIVE_IRON_CONDOR"] = "0"
 os.environ.setdefault("LIVE_RECORD_TICKS", "1")
 os.environ.setdefault("LIVE_RECORD_BAR", "1")
-os.environ.setdefault("LIVE_RECORD_MAX_CHAINS", "0")
+os.environ.setdefault("LIVE_RECORD_MAX_CHAINS", "2")
 os.environ.setdefault("LIVE_RECORD_FILTER_WINDOW", "3600")
-os.environ.setdefault("LIVE_MD_MAX_LAG_SEC", "180")
+os.environ.setdefault("LIVE_MD_MAX_LAG_SEC", "90")
 os.environ["STANDALONE_RECORDER"] = "1"
+os.environ.setdefault("LIVE_MD_SOURCE", "redis")
+os.environ.setdefault("MD_BUS_ENABLE", "1")
+os.environ.setdefault("LIVE_CTP_SKIP_MD", "0")
+os.environ.setdefault("LIVE_CTP_SKIP_TD", "0")
+os.environ.setdefault("LIVE_RECORDER_RELEASE_TD", "1")
 
 SETTINGS["database.name"] = _env("DATABASE_DRIVER", "questdb")
 SETTINGS["database.host"] = _env("DATABASE_HOST", "127.0.0.1")
@@ -58,6 +63,8 @@ from vnpy_datarecorder import DataRecorderApp
 from vnpy_optionmaster import OptionMasterApp
 from vnpy_optionmaster.base import OptionData
 
+from ctp_session import patch_ctp_connect_modes
+from md_bus import md_bus_status, start_md_bus_publisher, stop_md_bus
 from server import attach_runtime, recorder_status
 
 
@@ -104,6 +111,7 @@ def _patch_option_greeks() -> None:
 def _write_heartbeat() -> None:
     try:
         status = recorder_status()
+        bus = md_bus_status()
         payload = (
             f"ts={time.time():.3f}\n"
             f"active={status.get('active')}\n"
@@ -111,6 +119,8 @@ def _write_heartbeat() -> None:
             f"ticks={len(status.get('tick') or [])}\n"
             f"md_lag_sec={status.get('md_lag_sec')}\n"
             f"newest={status.get('newest_tick')}\n"
+            f"bus_pub={bus.get('pub_count')}\n"
+            f"bus_err={bus.get('err_count')}\n"
         )
         HEARTBEAT_PATH.write_text(payload, encoding="utf-8")
     except Exception as exc:
@@ -126,6 +136,7 @@ def _heartbeat_loop() -> None:
 
 
 def main() -> None:
+    patch_ctp_connect_modes()
     _patch_event_engine()
     _patch_option_greeks()
 
@@ -135,7 +146,8 @@ def main() -> None:
     recorder_engine = main_engine.add_app(DataRecorderApp)
     option_engine = main_engine.add_app(OptionMasterApp)
 
-    # attach_runtime expects the full web stack; pass None for unused engines.
+    start_md_bus_publisher(event_engine, log=lambda m: main_engine.write_log(f"[MD_BUS] {m}"))
+
     attach_runtime(
         main_engine,
         event_engine,
@@ -151,6 +163,7 @@ def main() -> None:
     print(
         "Standalone recorder started: "
         f"db={SETTINGS['database.host']}:{SETTINGS['database.port']} "
+        f"redis={_env('REDIS_URL', 'redis://redis:6379/0')} "
         f"portfolios={os.getenv('LIVE_PORTFOLIOS', 'IO.CFFEX')} "
         f"filter_window={os.getenv('LIVE_RECORD_FILTER_WINDOW', '3600')}s",
         flush=True,
@@ -172,6 +185,10 @@ def main() -> None:
             pass
     finally:
         _stop.set()
+        try:
+            stop_md_bus()
+        except Exception:
+            traceback.print_exc()
         try:
             main_engine.close()
         except Exception:

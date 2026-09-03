@@ -2557,6 +2557,13 @@ def recorder_status() -> dict[str, Any]:
     engine = require_recorder()
     lag = market_data_lag_sec()
     newest = newest_io_if_tick()
+    bus: dict[str, Any] = {}
+    try:
+        from md_bus import md_bus_status
+
+        bus = md_bus_status()
+    except Exception:
+        bus = {"enabled": False}
     return {
         "tick": sorted(engine.tick_recordings.keys()),
         "bar": sorted(engine.bar_recordings.keys()),
@@ -2571,6 +2578,8 @@ def recorder_status() -> dict[str, Any]:
         "filter_window": int(getattr(engine, "filter_window", record_filter_window_from_env())),
         "md_lag_sec": None if lag is None else round(float(lag), 1),
         "md_max_lag_sec": md_max_lag_from_env(),
+        "md_source": (os.getenv("LIVE_MD_SOURCE") or "ctp").strip().lower(),
+        "md_bus": bus,
         "newest_tick": None
         if newest is None
         else {
@@ -2631,6 +2640,16 @@ def option_chain_record_symbols(portfolio_name: str, chain_symbol: str) -> list[
 @app.get("/recorder")
 def get_recorder(_: bool = Depends(get_access)) -> dict[str, Any]:
     return recorder_status()
+
+
+@app.get("/md_bus")
+def get_md_bus(_: bool = Depends(get_access)) -> dict[str, Any]:
+    try:
+        from md_bus import md_bus_status
+
+        return md_bus_status()
+    except Exception as exc:
+        return {"enabled": False, "error": str(exc)}
 
 
 class RecorderAddModel(BaseModel):
@@ -2841,20 +2860,28 @@ def ensure_option_portfolio(portfolio_name: str) -> tuple[bool, str]:
     except AttributeError:
         pass
     portfolio = engine.get_portfolio(portfolio_name)
+    # When MD comes from Redis bus, do not subscribe again via CTP MD.
+    subscribe_md = not (
+        env_flag("LIVE_CTP_SKIP_MD")
+        or (os.getenv("LIVE_MD_SOURCE") or "").strip().lower() in {"redis", "bus", "md_bus"}
+    )
     for underlying in (portfolio.underlyings or {}).values():
         engine.instruments[underlying.vt_symbol] = underlying
-        if getattr(underlying.exchange, "value", "") != "LOCAL":
+        if subscribe_md and getattr(underlying.exchange, "value", "") != "LOCAL":
             engine.subscribe_data(underlying.vt_symbol)
     for option in (portfolio.options or {}).values():
         if not getattr(option, "underlying", None):
             continue
         engine.instruments[option.vt_symbol] = option
-        engine.subscribe_data(option.vt_symbol)
+        if subscribe_md:
+            engine.subscribe_data(option.vt_symbol)
     try:
         portfolio.calculate_pos_greeks()
     except Exception:
         pass
-    return True, f"已初始化组合 {portfolio_name}，期权链 {len(live_map)} 条"
+    suffix = "（行情=Redis）" if not subscribe_md else ""
+    return True, f"已初始化组合 {portfolio_name}，期权链 {len(live_map)} 条{suffix}"
+
 
 
 def sync_recorder_universe(vt_symbols: list[str], tick: bool, bar: bool) -> dict[str, Any]:
@@ -2897,6 +2924,7 @@ class LiveSupervisor:
         self.last_md_check = 0.0
         self.last_md_reconnect = 0.0
         self.last_record_refresh = 0.0
+        self.td_released = False
 
     def start(self) -> None:
         os.environ.setdefault("LIVE_PORTFOLIOS", ",".join(self.portfolios))
@@ -3034,6 +3062,7 @@ class LiveSupervisor:
                 )
                 self.recorded.add(name)
                 self.log(result["message"])
+        self.maybe_release_td()
         # Periodic re-apply filter window + refresh universe (covers setting wipe / new strikes)
         now = time.time()
         if self.record_ticks and now - self.last_record_refresh > 300:
@@ -3152,13 +3181,57 @@ class LiveSupervisor:
             return min(900.0, 120.0 * max(1, self.connect_failures))
         return min(300.0, 30.0 * (2 ** min(self.connect_failures, 3)))
 
+    def maybe_release_td(self) -> None:
+        """Recorder yields CTP TD seat to the live process after MD subscribe is ready."""
+        if self.td_released:
+            return
+        if not env_flag("STANDALONE_RECORDER"):
+            return
+        if not env_flag("LIVE_RECORDER_RELEASE_TD", True):
+            return
+        if self.record_ticks and not self.recorded:
+            return
+        if not self.inited:
+            return
+        assert main_engine is not None
+        gateway = main_engine.gateways.get(self.gateway)
+        if gateway is None:
+            return
+        try:
+            from ctp_session import release_ctp_td
+
+            if release_ctp_td(gateway):
+                self.td_released = True
+                os.environ["LIVE_CTP_SKIP_TD"] = "1"
+                self.log("录制进程已释放 CTP 交易通道（保留行情）；实盘进程可登录交易前置")
+        except Exception:
+            self.log("释放 CTP 交易通道失败\n" + traceback.format_exc())
+
     def ensure_ctp(self) -> bool:
         assert main_engine is not None
         if not env_flag("LIVE_AUTO_CONNECT_CTP", True):
+            # Redis-MD live process may still run strategies once ticks arrive.
+            if (os.getenv("LIVE_MD_SOURCE") or "").strip().lower() in {"redis", "bus", "md_bus"}:
+                lag = market_data_lag_sec()
+                if lag is not None and lag < md_max_lag_from_env() * 2:
+                    if not self.ctp_ok:
+                        self.ctp_ok = True
+                        self.log("行情已由 Redis MD bus 提供（未自动连接 CTP）")
+                    return True
             if not getattr(self, "_logged_ctp_disabled", False):
-                self.log("已禁用自动连接 CTP（LIVE_AUTO_CONNECT_CTP=0），本进程不登录行情/交易）")
+                self.log("已禁用自动连接 CTP（LIVE_AUTO_CONNECT_CTP=0），本进程不登录行情/交易")
                 self._logged_ctp_disabled = True
             return False
+        # MD-only recorder after TD release: stay connected without TD account.
+        if self.td_released or env_flag("LIVE_CTP_SKIP_TD"):
+            lag = market_data_lag_sec()
+            if lag is not None:
+                self.ctp_ok = True
+                self.connecting = False
+                return True
+            if self.contracts_ready():
+                self.ctp_ok = True
+                return True
         accounts = main_engine.get_all_accounts() or []
         if accounts:
             if not self.ctp_ok:
@@ -3167,6 +3240,10 @@ class LiveSupervisor:
                 self.connecting = False
                 self.log("CTP 账户已就绪")
             return True
+        # TD-only live process (SKIP_MD): also treat gateway connected via positions/contracts wait.
+        if env_flag("LIVE_CTP_SKIP_MD") and not self.connecting:
+            # Fall through to connect TD.
+            pass
         was_ok = self.ctp_ok
         self.ctp_ok = False
         now = time.time()
@@ -3186,6 +3263,7 @@ class LiveSupervisor:
         if was_ok:
             self.inited.clear()
             self.recorded.clear()
+            self.td_released = False
         self.connect_failures += 1
         self.next_connect = now + self.connect_backoff_sec()
         return False

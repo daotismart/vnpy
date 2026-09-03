@@ -65,8 +65,17 @@ def patch_ctp_connect_modes() -> None:
     CtpGateway.connect = connect  # type: ignore[method-assign]
 
 
-def release_ctp_td(gateway: Any) -> bool:
-    """Close TD API only, keep MD alive (recorder yields trading seat to web)."""
+def release_ctp_td(gateway: Any, hard: bool | None = None) -> bool:
+    """Yield TD seat to the live process.
+
+    Default is soft release (mark only): hard td_api.close() can segfault the
+    native CTP API and restart the whole MD process. Set LIVE_MD_HARD_RELEASE_TD=1
+    to force a hard close.
+    """
+    if hard is None:
+        hard = env_flag("LIVE_MD_HARD_RELEASE_TD", False)
+    if not hard:
+        return True
     td_api = getattr(gateway, "td_api", None)
     if td_api is None:
         return False

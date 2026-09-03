@@ -52,7 +52,7 @@ def _env_int(name: str, default: int) -> int:
 os.environ.setdefault("LIVE_MD_SOURCE", "redis")
 os.environ.setdefault("MD_BUS_ENABLE", "1")
 os.environ.setdefault("LIVE_MD_MAX_LAG_SEC", "90")
-os.environ.setdefault("LIVE_RECORD_MAX_CHAINS", "2")
+os.environ.setdefault("LIVE_RECORD_MAX_CHAINS", "0")
 os.environ.setdefault("LIVE_MD_RELEASE_TD", "1")
 os.environ.setdefault("LIVE_CTP_SKIP_MD", "0")
 os.environ.setdefault("LIVE_CTP_SKIP_TD", "0")
@@ -122,7 +122,7 @@ class MdReceiver:
     def __init__(self, main_engine: MainEngine, event_engine: EventEngine) -> None:
         self.main_engine = main_engine
         self.event_engine = event_engine
-        self.max_chains = _env_int("LIVE_RECORD_MAX_CHAINS", 2)
+        self.max_chains = _env_int("LIVE_RECORD_MAX_CHAINS", 0)
         self.md_max_lag = max(60, _env_int("LIVE_MD_MAX_LAG_SEC", 90))
         self.prefixes = tuple(
             p.strip().upper()
@@ -320,18 +320,27 @@ class MdReceiver:
             return
         if not self.subscribed:
             return
-        if self.tick_count < 10 and _cffex_session_open():
-            # Wait until ticks are flowing in-session before yielding TD.
+        # Only yield TD after MD is alive in-session — overnight hard-close
+        # of td_api has been observed to restart the whole process.
+        if not _cffex_session_open():
             return
-        if not _cffex_session_open() and not self.subscribed:
+        if self.tick_count < 10:
             return
         gateway = self.main_engine.gateways.get(GATEWAY)
         if gateway is None:
             return
-        if release_ctp_td(gateway):
-            self.td_released = True
-            os.environ["LIVE_CTP_SKIP_TD"] = "1"
-            self.log("released CTP TD seat (MD kept) — web may login trading front")
+        try:
+            if release_ctp_td(gateway):
+                self.td_released = True
+                os.environ["LIVE_CTP_SKIP_TD"] = "1"
+                hard = _env_flag("LIVE_MD_HARD_RELEASE_TD", False)
+                self.log(
+                    "released CTP TD seat (MD kept"
+                    + (", hard-close)" if hard else ", soft — web TD login may kick)")
+                    + " — web may login trading front"
+                )
+        except Exception:
+            self.log("TD release failed\n" + traceback.format_exc())
 
 
 def _write_heartbeat(receiver: MdReceiver) -> None:

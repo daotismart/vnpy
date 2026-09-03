@@ -69,7 +69,7 @@ COPY . /app
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=15s --timeout=5s --start-period=40s --retries=8 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=5)"
+HEALTHCHECK --interval=20s --timeout=15s --start-period=60s --retries=8 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=12)"
 
 CMD ["python", "run_server.py"]

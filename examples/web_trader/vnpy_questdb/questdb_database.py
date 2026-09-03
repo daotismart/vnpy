@@ -290,7 +290,8 @@ class QuestdbDatabase(BaseDatabase):
                 )
             sender.flush()
 
-        self._wait_wal_apply(BAR_TABLE)
+        if not stream:
+            self._wait_wal_apply(BAR_TABLE)
         return True
 
     def save_tick_data(self, ticks: list[TickData], stream: bool = False) -> bool:
@@ -348,7 +349,8 @@ class QuestdbDatabase(BaseDatabase):
                 )
             sender.flush()
 
-        self._wait_wal_apply(TICK_TABLE)
+        if not stream:
+            self._wait_wal_apply(TICK_TABLE)
         return True
 
     def load_bar_data(

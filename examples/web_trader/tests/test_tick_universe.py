@@ -15,7 +15,17 @@ SERVER = ROOT.joinpath("server.py")
 def _load_helpers():
     source = SERVER.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(SERVER))
-    wanted = {"env_flag", "env_int", "should_auto_record_ticks", "chain_record_sort_key", "live_portfolios_from_env", "record_max_chains_from_env", "record_scope_label"}
+    wanted = {
+        "env_flag",
+        "env_int",
+        "should_auto_record_ticks",
+        "chain_record_sort_key",
+        "live_portfolios_from_env",
+        "record_max_chains_from_env",
+        "record_scope_label",
+        "record_filter_window_from_env",
+        "md_max_lag_from_env",
+    }
     body = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
     module = ast.Module(body=body, type_ignores=[])
     code = compile(module, str(SERVER), "exec")
@@ -48,8 +58,21 @@ def main() -> int:
     assert helpers["record_scope_label"](0) == "全部到期月"
     assert "近2" in helpers["record_scope_label"](2)
 
+    os.environ.pop("LIVE_RECORD_FILTER_WINDOW", None)
+    assert helpers["record_filter_window_from_env"]() == 3600
+    os.environ["LIVE_RECORD_FILTER_WINDOW"] = "90"
+    assert helpers["record_filter_window_from_env"]() == 90
+    os.environ["LIVE_RECORD_FILTER_WINDOW"] = "10"
+    assert helpers["record_filter_window_from_env"]() == 60
+    os.environ.pop("LIVE_MD_MAX_LAG_SEC", None)
+    assert helpers["md_max_lag_from_env"]() == 180
+
     # syntax check full server module without importing heavy deps
     ast.parse(SERVER.read_text(encoding="utf-8"))
+    # safe_load_json helper must exist
+    assert "def safe_load_json" in SERVER.read_text(encoding="utf-8")
+    assert "def apply_recorder_filter_window" in SERVER.read_text(encoding="utf-8")
+    assert "def ensure_market_data_fresh" in SERVER.read_text(encoding="utf-8")
     print("ok: tick universe helpers")
     return 0
 

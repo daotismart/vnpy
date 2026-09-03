@@ -1411,6 +1411,16 @@ class GexTvStrangle:
                 "max_loss": round(pick.max_loss, 0),
                 "lots": lots_est,
             }
+        signals = {
+            "session_ok": bool(session_ok),
+            "iv_high": bool(iv_high),
+            "range_ok": bool(range_ok),
+            "expand_ok": bool(expand_ok),
+            "dte_ok": self.cfg.min_entry_dte <= dte <= self.cfg.max_entry_dte,
+            "has_pick": pick is not None,
+            "flat": self.book.lots <= 0,
+            "reason": self.last_skip,
+        }
         self.publish(
             {
                 "spot": round(spot, 2),
@@ -1428,6 +1438,7 @@ class GexTvStrangle:
                 "session_ok": session_ok,
                 "reason": self.last_skip,
                 "kelly": kelly_info,
+                "signals": signals,
                 "pick": None
                 if pick is None
                 else {

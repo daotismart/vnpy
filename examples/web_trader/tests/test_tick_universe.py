@@ -65,7 +65,7 @@ def main() -> int:
     os.environ["LIVE_RECORD_FILTER_WINDOW"] = "10"
     assert helpers["record_filter_window_from_env"]() == 60
     os.environ.pop("LIVE_MD_MAX_LAG_SEC", None)
-    assert helpers["md_max_lag_from_env"]() == 180
+    assert helpers["md_max_lag_from_env"]() == 90
 
     # syntax check full server module without importing heavy deps
     ast.parse(SERVER.read_text(encoding="utf-8"))

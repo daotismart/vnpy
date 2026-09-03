@@ -2437,7 +2437,7 @@ def record_filter_window_from_env() -> int:
 
 def md_max_lag_from_env() -> int:
     """Force CTP reconnect when newest IF/IO tick lags wall clock by this many seconds."""
-    return max(60, env_int("LIVE_MD_MAX_LAG_SEC", 180))
+    return max(60, env_int("LIVE_MD_MAX_LAG_SEC", 90))
 
 
 def record_scope_label(max_chains: int) -> str:
@@ -3124,6 +3124,11 @@ class LiveSupervisor:
 
     def ensure_ctp(self) -> bool:
         assert main_engine is not None
+        if not env_flag("LIVE_AUTO_CONNECT_CTP", True):
+            if not getattr(self, "_logged_ctp_disabled", False):
+                self.log("已禁用自动连接 CTP（LIVE_AUTO_CONNECT_CTP=0），本进程不登录行情/交易）")
+                self._logged_ctp_disabled = True
+            return False
         accounts = main_engine.get_all_accounts() or []
         if accounts:
             if not self.ctp_ok:

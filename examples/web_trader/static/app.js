@@ -17,6 +17,7 @@ const state = {
     scriptBtPresets: [],
     scriptBtPresetKey: "",
     liveMonitor: null,
+    liveExplainChart: null,
     meta: { exchanges: [], intervals: [], directions: [], offsets: [], order_types: [], option_models: [] },
 };
 
@@ -2522,6 +2523,7 @@ function closeLiveExplainModal() {
     }
     modal.classList.add("hidden");
     modal.setAttribute("aria-hidden", "true");
+    state.liveExplainChart = null;
 }
 
 function openLiveExplainModal(key) {
@@ -2542,6 +2544,7 @@ function openLiveExplainModal(key) {
     const steps = Array.isArray(payload.steps) ? payload.steps : [];
     $("live-explain-steps").innerHTML = steps.map((item) => `<li>${item}</li>`).join("");
     const chart = payload.chart || {};
+    state.liveExplainChart = chart;
     const hint = $("live-explain-chart-hint");
     if (hint) {
         if (chart.type === "gex_walls" && !(chart.strikes || []).length) {
@@ -2554,9 +2557,23 @@ function openLiveExplainModal(key) {
             hint.textContent = "";
         }
     }
-    drawLiveExplainChart(chart);
     modal.classList.remove("hidden");
     modal.setAttribute("aria-hidden", "false");
+    // Layout must settle before measuring chart wrap size.
+    requestAnimationFrame(() => {
+        drawLiveExplainChart(chart);
+        requestAnimationFrame(() => drawLiveExplainChart(chart));
+    });
+}
+
+function explainChartSize(canvas) {
+    const wrap = canvas.closest(".explain-chart-wrap") || canvas.parentElement;
+    const hint = $("live-explain-chart-hint");
+    const hintH = hint && hint.offsetParent !== null ? hint.offsetHeight + 6 : 0;
+    const width = Math.max(280, Math.floor((wrap && wrap.clientWidth) || canvas.clientWidth || 640));
+    const available = wrap ? wrap.clientHeight - hintH : 0;
+    const height = Math.max(280, Math.floor(available > 40 ? available : Math.min(window.innerHeight * 0.55, 560)));
+    return { cssWidth: width, cssHeight: height };
 }
 
 function drawLiveExplainChart(chart) {
@@ -2564,9 +2581,7 @@ function drawLiveExplainChart(chart) {
     if (!canvas) {
         return;
     }
-    const parent = canvas.parentElement;
-    const cssWidth = Math.max(320, (parent ? parent.clientWidth : 640) - 8);
-    const cssHeight = 280;
+    const { cssWidth, cssHeight } = explainChartSize(canvas);
     const dpr = window.devicePixelRatio || 1;
     canvas.width = cssWidth * dpr;
     canvas.height = cssHeight * dpr;
@@ -4010,6 +4025,13 @@ document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
         closeLiveExplainModal();
     }
+});
+window.addEventListener("resize", () => {
+    const modal = $("live-explain-modal");
+    if (!modal || modal.classList.contains("hidden") || !state.liveExplainChart) {
+        return;
+    }
+    drawLiveExplainChart(state.liveExplainChart);
 });
 
 $("script-upload-btn").addEventListener("click", async () => {

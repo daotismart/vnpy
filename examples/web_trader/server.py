@@ -2531,7 +2531,7 @@ def ensure_tick_recording_universe(
         items = portfolio_tick_universe(name, chain_limit)
         by_portfolio[name] = len(items)
         symbols.extend(items)
-    result = add_recordings(symbols, tick=tick, bar=record_bar)
+    result = sync_recorder_universe(symbols, tick=tick, bar=record_bar)
     result["portfolios"] = names
     result["max_chains"] = chain_limit
     result["record_bar"] = record_bar
@@ -2815,6 +2815,17 @@ def ensure_option_portfolio(portfolio_name: str) -> tuple[bool, str]:
     live_map = build_live_chain_map(engine, portfolio_name)
     if not live_map:
         return False, "尚未加载到期权合约"
+    # Optionally keep only nearest N chains subscribed (MD load control).
+    # 0 / negative = all chains. Falls back to LIVE_RECORD_MAX_CHAINS when unset.
+    raw_sub = os.getenv("LIVE_SUBSCRIBE_MAX_CHAINS")
+    if raw_sub is None or str(raw_sub).strip() == "":
+        sub_limit = record_max_chains_from_env()
+    else:
+        sub_limit = env_int("LIVE_SUBSCRIBE_MAX_CHAINS", 0)
+    if sub_limit > 0:
+        ranked = sorted(live_map.keys(), key=lambda sym: chain_record_sort_key(sym))
+        keep = set(ranked[:sub_limit])
+        live_map = {k: v for k, v in live_map.items() if k in keep}
     saved = engine.get_portfolio_setting(portfolio_name)
     apply_option_portfolio_setting(
         engine,
@@ -2846,6 +2857,21 @@ def ensure_option_portfolio(portfolio_name: str) -> tuple[bool, str]:
     return True, f"已初始化组合 {portfolio_name}，期权链 {len(live_map)} 条"
 
 
+def sync_recorder_universe(vt_symbols: list[str], tick: bool, bar: bool) -> dict[str, Any]:
+    """Replace recorder lists with the target universe (drop stale symbols)."""
+    engine = require_recorder()
+    wanted = {s.strip() for s in vt_symbols if s and s.strip()}
+    if tick:
+        for symbol in list(engine.tick_recordings.keys()):
+            if symbol not in wanted:
+                engine.remove_tick_recording(symbol)
+    if bar:
+        for symbol in list(engine.bar_recordings.keys()):
+            if symbol not in wanted:
+                engine.remove_bar_recording(symbol)
+    return add_recordings(sorted(wanted), tick=tick, bar=bar)
+
+
 class LiveSupervisor:
     """Keep CTP, IO portfolio, tick recorder, and optional iron-condor script alive."""
 
@@ -2869,6 +2895,7 @@ class LiveSupervisor:
         self.paused = False
         self.auto_start_script = True
         self.last_md_check = 0.0
+        self.last_md_reconnect = 0.0
         self.last_record_refresh = 0.0
 
     def start(self) -> None:
@@ -3099,8 +3126,11 @@ class LiveSupervisor:
         max_lag = md_max_lag_from_env()
         if lag <= max_lag:
             return True
-        if now < self.next_connect:
+        # Use a dedicated MD reconnect cooldown (do not inherit login backoff).
+        last = float(getattr(self, "last_md_reconnect", 0.0) or 0.0)
+        if now - last < 45:
             return False
+        self.last_md_reconnect = now
         self.force_gateway_reconnect(
             f"行情时间戳滞后 {int(lag)}s（阈值 {max_lag}s），强制关闭并重连 {self.gateway}"
         )

@@ -275,36 +275,104 @@ def iv_rank(current: float, history: list[float]) -> float:
     return 100.0 * below / len(history)
 
 
-def synthetic_gex_walls(spot: float, sigma: float, t: float, step: float, size: float) -> tuple[float, float]:
-    """无持仓量时用对数正态 OI 代理，计算 Call/Put GEX 墙。"""
+def synthetic_gex_profile(
+    spot: float,
+    sigma: float,
+    t: float,
+    step: float,
+    size: float,
+    call_center: float | None = None,
+    put_center: float | None = None,
+    oi_scale: float = 1.0,
+) -> dict[float, dict[str, float]]:
+    """单到期合成 GEX 剖面：strike -> {call_gex, put_gex}（对数正态 OI 代理）。"""
     atm = round_strike(spot, step)
-    best_call_gex = -1e18
-    best_put_gex = 1e18
-    call_wall = atm + step
-    put_wall = atm - step
-    width = max(4 * step, round_strike(spot * sigma * math.sqrt(max(t, 1 / 365)) * 2.5, step))
+    call_mu = float(call_center if call_center is not None else spot)
+    put_mu = float(put_center if put_center is not None else spot)
+    width = max(
+        4 * step,
+        round_strike(spot * sigma * math.sqrt(max(t, 1 / 365)) * 2.5, step),
+        abs(call_mu - spot) + 3 * step,
+        abs(put_mu - spot) + 3 * step,
+    )
+    profile: dict[float, dict[str, float]] = {}
+    scale = max(float(oi_scale), 0.0)
     k = atm - width
     while k <= atm + width:
         if k <= 0:
             k += step
             continue
         gamma = max(calculate_gamma(spot, k, RATE, t, max(sigma, 0.05)), 0.0)
-        dist = (k - spot) / max(spot * 0.08, step)
-        oi_call = math.exp(-0.5 * dist * dist) * max(spot / k, 0.3)
-        oi_put = math.exp(-0.5 * ((k - spot) / max(spot * 0.10, step)) ** 2) * max(k / spot, 0.3)
-        call_gex = gamma * oi_call * spot * 0.01 * size
-        put_gex = -gamma * oi_put * spot * 0.01 * size
-        if call_gex > best_call_gex:
-            best_call_gex = call_gex
-            call_wall = k
-        if put_gex < best_put_gex:
-            best_put_gex = put_gex
-            put_wall = k
+        dist_c = (k - call_mu) / max(spot * 0.08, step)
+        dist_p = (k - put_mu) / max(spot * 0.10, step)
+        oi_call = math.exp(-0.5 * dist_c * dist_c) * max(spot / k, 0.3) * scale
+        oi_put = math.exp(-0.5 * dist_p * dist_p) * max(k / spot, 0.3) * scale
+        profile[float(k)] = {
+            "call_gex": gamma * oi_call * spot * 0.01 * size,
+            "put_gex": -gamma * oi_put * spot * 0.01 * size,
+        }
         k += step
+    return profile
+
+
+def walls_from_gex_profile(profile: dict[float, dict[str, float]], spot: float, step: float) -> tuple[float, float]:
+    """Call墙取现价上方 CallGEX 最大行权价；Put墙取现价下方 PutGEX 最小行权价。"""
+    atm = round_strike(spot, step)
+    call_wall = atm + step
+    put_wall = atm - step
+    if not profile:
+        return float(call_wall), float(put_wall)
+    call_side = {k: v for k, v in profile.items() if float(k) >= spot - 1e-9}
+    put_side = {k: v for k, v in profile.items() if float(k) <= spot + 1e-9}
+    if call_side:
+        call_wall = max(call_side.items(), key=lambda item: item[1].get("call_gex", 0.0))[0]
+    if put_side:
+        put_wall = min(put_side.items(), key=lambda item: item[1].get("put_gex", 0.0))[0]
     if put_wall >= call_wall:
         put_wall = atm - step
         call_wall = atm + step
     return float(call_wall), float(put_wall)
+
+
+def synthetic_gex_walls(spot: float, sigma: float, t: float, step: float, size: float) -> tuple[float, float]:
+    """无持仓量时用对数正态 OI 代理，计算单到期 Call/Put GEX 墙。"""
+    return walls_from_gex_profile(synthetic_gex_profile(spot, sigma, t, step, size), spot, step)
+
+
+def stacked_synthetic_gex_walls(
+    spot: float,
+    sigma: float,
+    ts: list[float],
+    step: float,
+    size: float,
+) -> tuple[float, float]:
+    """多到期合成 GEX 按行权价加总后取墙（近似全链加总）。
+
+    各挂牌月等权加总 call_gex/put_gex（近月仍因 Γ 更大而偏强）。
+    远月 OI 中心外移，使加总墙相对「仅次月」可出现差异。
+    选腿端应继续使用次月链。
+    """
+    ordered = sorted(float(t) for t in ts if t is not None and float(t) > 0)
+    agg: dict[float, dict[str, float]] = {}
+    for index, t in enumerate(ordered):
+        dte = max(t * 365.0, 1.0)
+        # 等权加总；Γ(t) 仍使近月贡献更大。远月中心外移拉开墙位。
+        shift = min(index, 6) * 1.0 * step
+        sigma_t = max(sigma, 0.05) * (0.92 + 0.12 * math.sqrt(dte / 45.0))
+        for strike, row in synthetic_gex_profile(
+            spot,
+            sigma_t,
+            t,
+            step,
+            size,
+            call_center=spot + shift,
+            put_center=spot - shift,
+            oi_scale=1.0,
+        ).items():
+            bucket = agg.setdefault(strike, {"call_gex": 0.0, "put_gex": 0.0})
+            bucket["call_gex"] += float(row["call_gex"])
+            bucket["put_gex"] += float(row["put_gex"])
+    return walls_from_gex_profile(agg, spot, step)
 
 
 def live_gex_walls(chain, spot: float, step: float) -> tuple[float, float] | None:

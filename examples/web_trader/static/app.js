@@ -2619,7 +2619,7 @@ function drawLiveExplainChart(chart) {
 }
 
 function drawExplainGexWalls(ctx, width, height, chart) {
-    const pad = { top: 28, right: 16, bottom: 28, left: 48 };
+    const pad = { top: 40, right: 20, bottom: 46, left: 68 };
     const innerW = width - pad.left - pad.right;
     const innerH = height - pad.top - pad.bottom;
     const rows = (chart.strikes || []).filter((row) => Number.isFinite(Number(row.strike)));
@@ -2632,29 +2632,107 @@ function drawExplainGexWalls(ctx, width, height, chart) {
     const values = rows.flatMap((row) => [Number(row.call_gex || 0), Number(row.put_gex || 0)]);
     const maxAbs = Math.max(1e-9, ...values.map((item) => Math.abs(item)));
     const zeroY = pad.top + innerH / 2;
-    const barW = Math.max(2, innerW / rows.length * 0.36);
-    rows.forEach((row, index) => {
-        const x = pad.left + ((index + 0.5) / rows.length) * innerW;
-        const call = Number(row.call_gex || 0);
-        const put = Number(row.put_gex || 0);
-        const callH = (Math.abs(call) / maxAbs) * (innerH * 0.45);
-        const putH = (Math.abs(put) / maxAbs) * (innerH * 0.45);
-        ctx.fillStyle = "rgba(255,159,67,0.85)";
-        ctx.fillRect(x - barW - 1, zeroY - callH, barW, callH);
-        ctx.fillStyle = "rgba(84,160,255,0.85)";
-        ctx.fillRect(x + 1, zeroY, barW, putH);
-    });
-    ctx.strokeStyle = "rgba(255,255,255,0.18)";
+    const yOf = (gex) => zeroY - (Number(gex) / maxAbs) * (innerH * 0.5);
+    const barW = Math.max(2, (innerW / rows.length) * 0.36);
+
+    // Plot frame + zero line
+    ctx.strokeStyle = "rgba(255,255,255,0.22)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(pad.left, pad.top, innerW, innerH);
     ctx.beginPath();
     ctx.moveTo(pad.left, zeroY);
     ctx.lineTo(pad.left + innerW, zeroY);
     ctx.stroke();
+
+    // Y-axis ticks / grid / labels (GEX)
+    const yTicks = [1, 0.5, 0, -0.5, -1];
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    yTicks.forEach((ratio) => {
+        const gex = maxAbs * ratio;
+        const y = yOf(gex);
+        ctx.strokeStyle = ratio === 0 ? "rgba(255,255,255,0.28)" : "rgba(255,255,255,0.08)";
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(pad.left + innerW, y);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(pad.left - 5, y);
+        ctx.lineTo(pad.left, y);
+        ctx.strokeStyle = "rgba(255,255,255,0.35)";
+        ctx.stroke();
+        ctx.fillStyle = "#9aa8b8";
+        ctx.textAlign = "right";
+        ctx.textBaseline = "middle";
+        ctx.fillText(formatGex(gex), pad.left - 8, y);
+    });
+
+    // Bars
+    rows.forEach((row, index) => {
+        const x = pad.left + ((index + 0.5) / rows.length) * innerW;
+        const call = Number(row.call_gex || 0);
+        const put = Number(row.put_gex || 0);
+        const callTop = yOf(Math.max(0, call));
+        const putBottom = yOf(Math.min(0, put));
+        ctx.fillStyle = "rgba(255,159,67,0.85)";
+        ctx.fillRect(x - barW - 1, callTop, barW, zeroY - callTop);
+        ctx.fillStyle = "rgba(84,160,255,0.85)";
+        ctx.fillRect(x + 1, zeroY, barW, putBottom - zeroY);
+    });
+
+    // X-axis ticks / strike labels
+    const maxLabels = Math.max(4, Math.min(14, Math.floor(innerW / 52)));
+    const step = Math.max(1, Math.ceil(rows.length / maxLabels));
+    ctx.fillStyle = "#9aa8b8";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    rows.forEach((row, index) => {
+        if (index % step !== 0 && index !== rows.length - 1) {
+            return;
+        }
+        const x = pad.left + ((index + 0.5) / rows.length) * innerW;
+        ctx.strokeStyle = "rgba(255,255,255,0.28)";
+        ctx.beginPath();
+        ctx.moveTo(x, pad.top + innerH);
+        ctx.lineTo(x, pad.top + innerH + 5);
+        ctx.stroke();
+        ctx.fillStyle = "#9aa8b8";
+        ctx.fillText(String(row.strike), x, pad.top + innerH + 8);
+    });
+
+    // Axis titles
+    ctx.fillStyle = "#c5d0dc";
+    ctx.font = "12px Microsoft YaHei, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText("行权价", pad.left + innerW / 2, height - 8);
+    ctx.save();
+    ctx.translate(14, pad.top + innerH / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText("GEX", 0, 0);
+    ctx.restore();
+
+    // Legend
+    const legendY = 14;
+    ctx.fillStyle = "rgba(255,159,67,0.9)";
+    ctx.fillRect(pad.left, legendY - 7, 12, 8);
+    ctx.fillStyle = "#d7dee8";
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText("CallGEX", pad.left + 16, legendY - 3);
+    ctx.fillStyle = "rgba(84,160,255,0.9)";
+    ctx.fillRect(pad.left + 78, legendY - 7, 12, 8);
+    ctx.fillStyle = "#d7dee8";
+    ctx.fillText("PutGEX", pad.left + 94, legendY - 3);
+
+    // Wall / spot markers (drawn last)
     const levels = [
-        { strike: chart.spot, color: "#e8edf2", label: `现价 ${chart.spot ?? "—"}`, width: 1.4 },
-        { strike: chart.call_wall, color: "#ff9f43", label: `Call墙 ${chart.call_wall ?? "—"}`, width: 1.6 },
-        { strike: chart.put_wall, color: "#54a0ff", label: `Put墙 ${chart.put_wall ?? "—"}`, width: 1.6 },
+        { strike: chart.spot, color: "#e8edf2", label: `现价 ${chart.spot ?? "—"}`, width: 1.4, dash: true },
+        { strike: chart.call_wall, color: "#ff9f43", label: `Call墙 ${chart.call_wall ?? "—"}`, width: 1.6, dash: false },
+        { strike: chart.put_wall, color: "#54a0ff", label: `Put墙 ${chart.put_wall ?? "—"}`, width: 1.6, dash: false },
     ];
-    levels.forEach((level) => {
+    levels.forEach((level, levelIndex) => {
         const strike = Number(level.strike);
         if (!Number.isFinite(strike)) {
             return;
@@ -2663,16 +2741,21 @@ function drawExplainGexWalls(ctx, width, height, chart) {
         ctx.save();
         ctx.strokeStyle = level.color;
         ctx.lineWidth = level.width;
-        ctx.setLineDash(level.strike === chart.spot ? [4, 4] : []);
+        ctx.setLineDash(level.dash ? [4, 4] : []);
         ctx.beginPath();
         ctx.moveTo(x, pad.top);
         ctx.lineTo(x, pad.top + innerH);
         ctx.stroke();
         ctx.fillStyle = level.color;
         ctx.font = "11px Microsoft YaHei, sans-serif";
-        ctx.fillText(level.label, Math.min(x + 4, width - 110), pad.top + 12);
+        ctx.textAlign = "left";
+        ctx.textBaseline = "alphabetic";
+        const labelY = pad.top + 12 + levelIndex * 14;
+        ctx.fillText(level.label, Math.min(x + 4, width - 120), labelY);
         ctx.restore();
     });
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
 }
 
 function drawExplainGauge(ctx, width, height, chart) {

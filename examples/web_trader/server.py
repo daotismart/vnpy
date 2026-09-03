@@ -169,13 +169,13 @@ def load_web_setting() -> None:
 def attach_runtime(
     attached_main: MainEngine,
     attached_event: EventEngine,
-    attached_cta: CtaEngine,
-    attached_backtester: BacktesterEngine,
-    attached_data: ManagerEngine,
+    attached_cta: CtaEngine | None,
+    attached_backtester: BacktesterEngine | None,
+    attached_data: ManagerEngine | None,
     attached_recorder: RecorderEngine,
     attached_option: OptionEngine,
-    attached_spread: SpreadEngine,
-    attached_script: ScriptEngine,
+    attached_spread: SpreadEngine | None,
+    attached_script: ScriptEngine | None,
 ) -> None:
     global main_engine, event_engine, cta_engine, backtester_engine, data_engine
     global recorder_engine, option_engine, spread_engine, script_engine
@@ -1172,12 +1172,26 @@ def mask_setting(setting: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_saved_gateway_setting(gateway_name: str) -> dict[str, Any]:
-    filename = CONNECT_FILE_MAP.get(gateway_name, f"connect_{gateway_name.lower()}.json")
-    filepath = get_file_path(filename)
-    if not filepath.exists():
-        return {}
-    data = load_json(filename)
-    return data if isinstance(data, dict) else {}
+    """Load CTP/gateway connect JSON.
+
+    STANDALONE_RECORDER may prefer connect_ctp_recorder.json (second MD account)
+    to avoid kicking the web trader session on the same investor id.
+    """
+    override = (os.getenv("CTP_CONNECT_FILE") or "").strip()
+    if override:
+        candidates = [override]
+    elif gateway_name.upper() == "CTP" and env_flag("STANDALONE_RECORDER"):
+        candidates = ["connect_ctp_recorder.json", "connect_ctp.json"]
+    else:
+        candidates = [CONNECT_FILE_MAP.get(gateway_name, f"connect_{gateway_name.lower()}.json")]
+    for filename in candidates:
+        filepath = get_file_path(filename)
+        if not filepath.exists():
+            continue
+        data = load_json(filename)
+        if isinstance(data, dict) and data:
+            return data
+    return {}
 
 
 def save_gateway_setting(gateway_name: str, setting: dict[str, Any]) -> None:
@@ -2970,6 +2984,8 @@ class LiveSupervisor:
             return
         if not self.ensure_market_data_fresh():
             return
+        if self.record_ticks:
+            self.ensure_recorder_alive()
         if not self.contracts_ready():
             self.log("等待 IO 期权合约查询完成")
             return
@@ -3010,6 +3026,63 @@ class LiveSupervisor:
         if self.auto_start_script and self.run_script:
             self.ensure_script()
 
+    def ensure_recorder_alive(self) -> None:
+        """Restart DataRecorder writer thread if it died after a DB/write exception."""
+        try:
+            engine = require_recorder()
+        except Exception:
+            return
+        thread = getattr(engine, "thread", None)
+        if engine.active and thread is not None and thread.is_alive():
+            return
+        self.log("录制线程已停止，正在重启 DataRecorder 写入线程")
+        try:
+            try:
+                while not engine.queue.empty():
+                    engine.queue.get_nowait()
+            except Exception:
+                pass
+            engine.active = False
+            if thread is not None and thread.is_alive():
+                try:
+                    thread.join(timeout=1.0)
+                except Exception:
+                    pass
+            engine.thread = threading.Thread(target=engine.run)
+            engine.start()
+            try:
+                apply_recorder_filter_window()
+            except Exception:
+                pass
+            self.log(
+                f"录制线程已重启 active={engine.active} pending={engine.queue.qsize()}"
+            )
+        except Exception:
+            self.log("重启录制线程失败\n" + traceback.format_exc())
+
+    def force_gateway_reconnect(self, reason: str) -> None:
+        """Close then reconnect gateway — soft connect() alone often leaves MD frozen."""
+        assert main_engine is not None
+        setting = load_saved_gateway_setting(self.gateway)
+        if not setting:
+            self.log(f"{reason}，但缺少 {self.gateway} 配置，无法重连")
+            self.next_connect = time.time() + 60.0
+            return
+        self.log(reason)
+        gateway = main_engine.gateways.get(self.gateway)
+        if gateway is not None:
+            try:
+                gateway.close()
+            except Exception:
+                self.log(f"关闭 {self.gateway} 失败\n" + traceback.format_exc())
+        main_engine.connect(setting, self.gateway)
+        self.connecting = True
+        self.ctp_ok = False
+        self.inited.clear()
+        self.recorded.clear()
+        self.connect_failures += 1
+        self.next_connect = time.time() + self.connect_backoff_sec()
+
     def ensure_market_data_fresh(self) -> bool:
         """Reconnect CTP when IF/IO tick timestamps fall far behind wall clock."""
         assert main_engine is not None
@@ -3028,19 +3101,9 @@ class LiveSupervisor:
             return True
         if now < self.next_connect:
             return False
-        setting = load_saved_gateway_setting(self.gateway)
-        if not setting:
-            self.log(f"行情滞后 {int(lag)}s，但缺少 {self.gateway} 配置，无法重连")
-            self.next_connect = now + 60.0
-            return False
-        self.log(f"行情时间戳滞后 {int(lag)}s（阈值 {max_lag}s），强制重连 {self.gateway}")
-        main_engine.connect(setting, self.gateway)
-        self.connecting = True
-        self.ctp_ok = False
-        self.inited.clear()
-        self.recorded.clear()
-        self.connect_failures += 1
-        self.next_connect = now + self.connect_backoff_sec()
+        self.force_gateway_reconnect(
+            f"行情时间戳滞后 {int(lag)}s（阈值 {max_lag}s），强制关闭并重连 {self.gateway}"
+        )
         return False
 
     @staticmethod

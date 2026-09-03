@@ -19,6 +19,59 @@ services:
       retries: 12
       start_period: 25s
 
+  recorder:
+    image: vnpy-web-trader:4.4.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-}
+    restart: unless-stopped
+    depends_on:
+      questdb:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      LANG: zh_CN.UTF-8
+      LC_ALL: zh_CN.UTF-8
+      LC_CTYPE: zh_CN.UTF-8
+      LIVE_IRON_CONDOR: "0"
+      LIVE_RECORD_TICKS: "1"
+      LIVE_RECORD_MAX_CHAINS: ${LIVE_RECORD_MAX_CHAINS:-0}
+      LIVE_RECORD_BAR: ${LIVE_RECORD_BAR:-1}
+      LIVE_RECORD_FILTER_WINDOW: ${LIVE_RECORD_FILTER_WINDOW:-3600}
+      LIVE_MD_MAX_LAG_SEC: ${LIVE_MD_MAX_LAG_SEC:-180}
+      LIVE_PORTFOLIOS: ${LIVE_PORTFOLIOS:-IO.CFFEX}
+      LIVE_GATEWAY: ${LIVE_GATEWAY:-CTP}
+      STANDALONE_RECORDER: "1"
+      CTP_CONNECT_FILE: ${RECORDER_CTP_CONNECT_FILE:-}
+      RECORDER_HEARTBEAT_FILE: /tmp/recorder_heartbeat
+      DATABASE_DRIVER: questdb
+      DATABASE_HOST: questdb
+      DATABASE_PORT: "8812"
+      DATABASE_HTTP_PORT: "9000"
+      DATABASE_NAME: ${DATABASE_NAME:-qdb}
+      DATABASE_USER: ${DATABASE_USER:-admin}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD:-quest}
+    volumes:
+      - ./data/vntrader:/root/.vntrader
+      - ./run_recorder.py:/app/run_recorder.py
+      - ./server.py:/app/server.py
+      - ./vnpy_questdb:/app/vnpy_questdb
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import time; from pathlib import Path; p=Path('/tmp/recorder_heartbeat'); assert p.exists() and time.time()-p.stat().st_mtime<30",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 60s
+    entrypoint: ["python", "run_recorder.py"]
+
   web:
     build:
       context: .
@@ -30,6 +83,8 @@ services:
     depends_on:
       questdb:
         condition: service_healthy
+      recorder:
+        condition: service_started
     environment:
       TZ: Asia/Shanghai
       LANG: zh_CN.UTF-8
@@ -45,7 +100,8 @@ services:
       LIVE_PORTFOLIOS: ${LIVE_PORTFOLIOS:-IO.CFFEX}
       LIVE_GATEWAY: ${LIVE_GATEWAY:-CTP}
       LIVE_SCRIPT: ${LIVE_SCRIPT:-gex_tv_strangle.py}
-      LIVE_RECORD_TICKS: ${LIVE_RECORD_TICKS:-1}
+      # In-process recording off by default — standalone recorder service owns QuestDB writes.
+      LIVE_RECORD_TICKS: ${WEB_LIVE_RECORD_TICKS:-0}
       LIVE_RECORD_MAX_CHAINS: ${LIVE_RECORD_MAX_CHAINS:-0}
       LIVE_RECORD_BAR: ${LIVE_RECORD_BAR:-1}
       LIVE_RECORD_FILTER_WINDOW: ${LIVE_RECORD_FILTER_WINDOW:-3600}
@@ -71,6 +127,7 @@ services:
       - ./server.py:/app/server.py
       - ./scripts:/app/scripts
       - ./static:/app/static
+      - ./vnpy_questdb:/app/vnpy_questdb
     ports:
       - "${WEB_PUBLISH_PORT:-8000}:8000"
     extra_hosts:

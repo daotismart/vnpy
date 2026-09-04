@@ -500,9 +500,15 @@ def main() -> None:
     # Prefer MD-only when Redis already has the IF/IO universe — avoids dual TD
     # login kicking the web trading session on the same investor id.
     try:
+        from vnpy_ctp.gateway.ctp_gateway import symbol_contract_map
+
         warmed = load_contracts_from_redis(receiver.prefixes)
         for contract in warmed:
             receiver.contracts[contract.vt_symbol] = contract
+            # CtpGateway MdApi drops ticks unless symbol is in this map
+            # (normally filled by TD instrument query).
+            if getattr(contract, "symbol", None):
+                symbol_contract_map[contract.symbol] = contract
         print(f"[MD_RX] redis contract warm count={len(warmed)}", flush=True)
         if len(warmed) >= 50 or _env_flag("LIVE_CTP_SKIP_TD"):
             os.environ["LIVE_CTP_SKIP_TD"] = "1"

@@ -245,34 +245,43 @@ def contract_from_dict(data: dict[str, Any]) -> ContractData:
     return contract
 
 
-def create_redis_client():
+def create_redis_client(socket_timeout: float = 2.0, socket_connect_timeout: float = 2.0):
     import redis
 
     # Keep timeouts short so heartbeat / monitor paths cannot freeze a process.
     return redis.Redis.from_url(
         redis_url(),
         decode_responses=True,
-        socket_connect_timeout=2,
-        socket_timeout=2,
+        socket_connect_timeout=socket_connect_timeout,
+        socket_timeout=socket_timeout,
     )
 
 
 def load_contracts_from_redis(prefixes: tuple[str, ...] | list[str] | None = None) -> list:
     """Load cached ContractData from Redis (for MD-only receiver warm start)."""
     try:
-        client = create_redis_client()
-        mapping = client.hgetall(contracts_key()) or {}
+        # Full hash can be huge (all CTP contracts). Use a longer timeout and
+        # filter by hash field (vt_symbol) before fetching payloads.
+        client = create_redis_client(socket_timeout=30, socket_connect_timeout=5)
+        keys = client.hkeys(contracts_key()) or []
     except Exception:
         return []
-    out: list[ContractData] = []
     prefs = tuple(p.upper() for p in (prefixes or ()))
-    for raw in mapping.values():
+    wanted: list[str] = []
+    for key in keys:
+        name = str(key)
+        symbol = name.split(".", 1)[0].upper()
+        if prefs and not symbol.startswith(prefs):
+            continue
+        wanted.append(name)
+    out: list[ContractData] = []
+    for name in wanted:
         try:
+            raw = client.hget(contracts_key(), name)
+            if not raw:
+                continue
             contract = contract_from_dict(json.loads(raw))
         except Exception:
-            continue
-        symbol = (contract.symbol or "").upper()
-        if prefs and not symbol.startswith(prefs):
             continue
         out.append(contract)
     return out

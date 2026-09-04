@@ -3568,6 +3568,400 @@ def build_live_signals(monitor: dict[str, Any]) -> list[dict[str, Any]]:
     return signals
 
 
+def resolve_chain_expiry_info(portfolio_name: str, chain_symbol: str = "") -> dict[str, Any]:
+    """Return option expiry plus trading-day and calendar-day DTE."""
+    trading = None
+    calendar = None
+    expiry_text = ""
+    symbol = chain_symbol or ""
+    if option_engine is not None and portfolio_name:
+        portfolio = option_engine.portfolios.get(portfolio_name)
+        if portfolio:
+            chains = portfolio_chain_symbols(portfolio)
+            symbol = symbol or (chains[0] if chains else "")
+            chain = get_portfolio_chain(portfolio, symbol) if symbol else None
+            if chain:
+                trading = int(getattr(chain, "days_to_expiry", 0) or 0) or None
+                option = None
+                for bucket in (getattr(chain, "calls", None), getattr(chain, "puts", None)):
+                    if not bucket:
+                        continue
+                    option = next(iter(bucket.values()), None)
+                    if option:
+                        break
+                expiry = getattr(option, "option_expiry", None) if option else None
+                if expiry is not None:
+                    try:
+                        if hasattr(expiry, "date"):
+                            expiry_date = expiry.date()
+                            expiry_text = expiry.strftime("%Y-%m-%d")
+                        else:
+                            expiry_date = expiry
+                            expiry_text = str(expiry)[:10]
+                        today = datetime.now().date()
+                        calendar = max((expiry_date - today).days, 0)
+                    except Exception:
+                        pass
+                if trading is None and option is not None:
+                    try:
+                        trading = int(getattr(option, "days_to_expiry", 0) or 0) or None
+                    except (TypeError, ValueError):
+                        pass
+    return {
+        "chain_symbol": symbol,
+        "expiry": expiry_text,
+        "trading_dte": trading,
+        "calendar_dte": calendar,
+    }
+
+
+def live_chain_gex_profile(portfolio_name: str, chain_symbol: str = "") -> dict[str, Any]:
+    """Build strike-level GEX profile for live indicator explain charts."""
+    if option_engine is None or not portfolio_name:
+        return {}
+    portfolio = option_engine.portfolios.get(portfolio_name)
+    if not portfolio:
+        return {}
+    chains = portfolio_chain_symbols(portfolio)
+    symbol = chain_symbol or (chains[0] if chains else "")
+    chain = get_portfolio_chain(portfolio, symbol) if symbol else None
+    if not chain:
+        return {}
+    try:
+        gex = compute_chain_gex(chain)
+    except Exception:
+        return {}
+    rows = []
+    for row in gex.get("strikes") or []:
+        rows.append(
+            {
+                "strike": row.get("strike"),
+                "call_gex": row.get("call_gex"),
+                "put_gex": row.get("put_gex"),
+                "net_gex": row.get("net_gex"),
+                "call_oi": row.get("call_oi"),
+                "put_oi": row.get("put_oi"),
+                "call_gamma": row.get("call_gamma"),
+                "put_gamma": row.get("put_gamma"),
+            }
+        )
+    return {
+        "source": "live_oi",
+        "portfolio": portfolio_name,
+        "chain_symbol": symbol or gex.get("spot_chain") or "",
+        "spot": gex.get("spot"),
+        "underlying": gex.get("underlying"),
+        "days_to_expiry": gex.get("days_to_expiry"),
+        "call_wall": gex.get("call_wall"),
+        "put_wall": gex.get("put_wall"),
+        "flip_strike": gex.get("flip_strike"),
+        "pin": gex.get("pin"),
+        "call_gex": gex.get("call_gex"),
+        "put_gex": gex.get("put_gex"),
+        "net_gex": gex.get("net_gex"),
+        "strikes": rows,
+        "formula": "CallGEX = Γ_call × OI_call × S × 1%；PutGEX = −Γ_put × OI_put × S × 1%",
+        "rule": "Call墙 = argmax CallGEX；Put墙 = argmin PutGEX（最负）",
+    }
+
+
+def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
+    """Explain payloads for clickable live metrics (formula + steps + chart data)."""
+    indicators = data.get("indicators") or {}
+    book = data.get("book") or {}
+    pick = data.get("pick") or {}
+    kelly = data.get("kelly") or indicators.get("kelly") or {}
+    params = data.get("params") or {}
+    portfolio = str(data.get("portfolio") or params.get("portfolio_name") or "IO.CFFEX")
+    chain = str(data.get("chain") or indicators.get("chain") or "")
+    profile = live_chain_gex_profile(portfolio, chain)
+    dte_info = resolve_chain_expiry_info(portfolio, chain)
+    trading_dte = indicators.get("dte") if indicators.get("dte") is not None else data.get("dte")
+    if trading_dte is None:
+        trading_dte = dte_info.get("trading_dte")
+    calendar_dte = dte_info.get("calendar_dte")
+    spot = indicators.get("spot") if indicators.get("spot") is not None else data.get("spot")
+    call_wall = indicators.get("call_wall") if indicators.get("call_wall") is not None else data.get("call_wall")
+    put_wall = indicators.get("put_wall") if indicators.get("put_wall") is not None else data.get("put_wall")
+    profile_call = profile.get("call_wall")
+    profile_put = profile.get("put_wall")
+    walls_match = (
+        profile
+        and call_wall is not None
+        and put_wall is not None
+        and profile_call is not None
+        and profile_put is not None
+        and abs(float(call_wall) - float(profile_call)) < 1e-6
+        and abs(float(put_wall) - float(profile_put)) < 1e-6
+    )
+    wall_source = "链上真实 OI + theo_gamma" if walls_match else (
+        "策略 live_gex_walls / 必要时 synthetic_gex_walls；下图为当前链实时 GEX 剖面供对照"
+        if profile.get("strikes")
+        else "策略快照（链上剖面暂不可用）"
+    )
+
+    def _num(value: Any, digits: int = 4) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "—"
+        if digits <= 0:
+            return str(int(round(number)))
+        return f"{number:.{digits}f}".rstrip("0").rstrip(".")
+
+    explains: dict[str, Any] = {
+        "iv": {
+            "title": "IV（隐含/代理波动率）",
+            "value": indicators.get("iv") if indicators.get("iv") is not None else data.get("iv"),
+            "formula": "IV ≈ HV_20 × 1.12（实盘用实现波动代理，待期权 IV 行情可替换）",
+            "steps": [
+                f"当前值：{_num(indicators.get('iv') if indicators.get('iv') is not None else data.get('iv'), 4)}",
+                "取近 20 日收盘实现波动 HV，再乘 1.12 作为开仓定价/墙合成用 σ",
+                "IV Rank、铁鹰定价、Delta 带宽均基于该 σ",
+            ],
+            "chart": {
+                "type": "gauge",
+                "min": 0,
+                "max": 0.6,
+                "value": float(indicators.get("iv") or data.get("iv") or 0),
+                "label": "IV",
+                "zones": [{"to": 0.15, "color": "#54a0ff"}, {"to": 0.30, "color": "#1dd1a1"}, {"to": 0.6, "color": "#ff9f43"}],
+            },
+        },
+        "iv_rank": {
+            "title": "IV Rank",
+            "value": indicators.get("iv_rank") if indicators.get("iv_rank") is not None else data.get("iv_rank"),
+            "formula": "IV Rank = 100 × count(历史HV ≤ 当前IV) / N",
+            "steps": [
+                f"当前 IV Rank：{_num(indicators.get('iv_rank') if indicators.get('iv_rank') is not None else data.get('iv_rank'), 1)}",
+                f"开仓阈值：≥ {params.get('iv_rank_min') or data.get('config', {}).get('iv_rank_min') or 40}",
+                f"是否偏高：{'是' if data.get('iv_high') else '否'}",
+                "用历史 HV 分布给当前波动率定位百分位，越高越倾向卖波动",
+            ],
+            "chart": {
+                "type": "gauge",
+                "min": 0,
+                "max": 100,
+                "value": float(indicators.get("iv_rank") or data.get("iv_rank") or 0),
+                "threshold": float((data.get("config") or {}).get("iv_rank_min") or 40),
+                "label": "IV Rank",
+            },
+        },
+        "lsp": {
+            "title": "LSP（区间位置）",
+            "value": indicators.get("lsp") if indicators.get("lsp") is not None else data.get("lsp"),
+            "formula": "LSP = (C − LLV) / (HHV − LLV)，落在 [0,1]",
+            "steps": [
+                f"当前 LSP：{_num(indicators.get('lsp') if indicators.get('lsp') is not None else data.get('lsp'), 3)}",
+                "HHV/LLV 取回看窗口日高低",
+                "0 靠近下沿（偏多），1 靠近上沿（偏空）",
+                f"开仓窗口：区间过滤 {'通过' if data.get('range_ok') else '未通过'}",
+            ],
+            "chart": {
+                "type": "gauge",
+                "min": 0,
+                "max": 1,
+                "value": float(indicators.get("lsp") or data.get("lsp") or 0.5),
+                "label": "LSP",
+                "zones": [{"to": 0.35, "color": "#1dd1a1"}, {"to": 0.65, "color": "#54a0ff"}, {"to": 1.0, "color": "#ff6b6b"}],
+            },
+        },
+        "dte": {
+            "title": "DTE（剩余到期日）",
+            "value": (
+                f"交易日 {_num(trading_dte, 0)} ｜ 自然日 {_num(calendar_dte, 0)}"
+                if trading_dte is not None or calendar_dte is not None
+                else "—"
+            ),
+            "formula": (
+                f"交易日 DTE = 剔除周末与上交所节假日后的剩余交易日（年化基数 {ANNUAL_DAYS}）；"
+                "自然日 DTE = 到期日 − 今日"
+            ),
+            "steps": [
+                f"链：{dte_info.get('chain_symbol') or chain or '—'}",
+                f"期权到期日：{dte_info.get('expiry') or '—'}",
+                f"交易日 DTE：{_num(trading_dte, 0)} 天（vnpy_optionmaster / 策略开仓窗使用）",
+                f"自然日 DTE：{_num(calendar_dte, 0)} 天（日历剩余天数）",
+                "二者差值为期间周末与节假日；例如国庆长假会拉大差距",
+                "开仓窗 / 移仓阈值均按交易日 DTE 判断",
+            ],
+            "chart": {
+                "type": "dual_bar",
+                "items": [
+                    {
+                        "label": "交易日 DTE",
+                        "value": float(trading_dte or 0),
+                        "color": "#54a0ff",
+                    },
+                    {
+                        "label": "自然日 DTE",
+                        "value": float(calendar_dte or 0),
+                        "color": "#1dd1a1",
+                    },
+                ],
+                "max": max(90.0, float(trading_dte or 0), float(calendar_dte or 0)) * 1.15 or 90.0,
+                "note": f"到期 {dte_info.get('expiry') or '—'}",
+            },
+        },
+        "call_wall": {
+            "title": "Call墙",
+            "value": call_wall,
+            "formula": profile.get("formula") or "CallGEX = Γ × OI × S × 1%；Call墙 = argmax CallGEX",
+            "steps": [
+                f"策略 Call墙：{_num(call_wall, 0)}",
+                f"链上剖面 Call墙：{_num(profile_call, 0) if profile else '—'}",
+                f"数据来源：{wall_source}",
+                "遍历各行权价算 CallGEX，取正 GEX 最大的 K",
+                "铁鹰短 Call 只能开在 max(Call墙, ATM+1档) 外侧",
+            ],
+            "chart": {
+                "type": "gex_walls",
+                "highlight": "call",
+                "spot": spot or profile.get("spot"),
+                "call_wall": call_wall,
+                "put_wall": put_wall,
+                "profile_call_wall": profile_call,
+                "profile_put_wall": profile_put,
+                "strikes": profile.get("strikes") or [],
+            },
+        },
+        "put_wall": {
+            "title": "Put墙",
+            "value": put_wall,
+            "formula": profile.get("formula") or "PutGEX = −Γ × OI × S × 1%；Put墙 = argmin PutGEX",
+            "steps": [
+                f"策略 Put墙：{_num(put_wall, 0)}",
+                f"链上剖面 Put墙：{_num(profile_put, 0) if profile else '—'}",
+                f"数据来源：{wall_source}",
+                "遍历各行权价算 PutGEX，取最负（绝对值最大）的 K",
+                "铁鹰短 Put 只能开在 min(Put墙, ATM−1档) 外侧",
+            ],
+            "chart": {
+                "type": "gex_walls",
+                "highlight": "put",
+                "spot": spot or profile.get("spot"),
+                "call_wall": call_wall,
+                "put_wall": put_wall,
+                "profile_call_wall": profile_call,
+                "profile_put_wall": profile_put,
+                "strikes": profile.get("strikes") or [],
+            },
+        },
+        "entry_credit": {
+            "title": "权利金（净收）",
+            "value": indicators.get("entry_credit") if indicators.get("entry_credit") is not None else book.get("entry_credit"),
+            "formula": "Credit = (短Call + 短Put) − (长Call + 长Put)",
+            "steps": [
+                f"账面入场权利金：{_num(book.get('entry_credit'), 2)}",
+                f"候选结构权利金：{_num(pick.get('credit') if isinstance(pick, dict) else None, 2)}",
+                f"短腿 {book.get('k_put') or '—'}/{book.get('k_call') or '—'}，长腿 {book.get('k_put_long') or '—'}/{book.get('k_call_long') or '—'}",
+                "开仓还需满足 净权利金/翼宽 ≥ min_credit_frac",
+            ],
+            "chart": {
+                "type": "legs",
+                "legs": [
+                    {"name": "短Put", "strike": book.get("k_put") or (pick.get("k_put") if isinstance(pick, dict) else None)},
+                    {"name": "短Call", "strike": book.get("k_call") or (pick.get("k_call") if isinstance(pick, dict) else None)},
+                    {"name": "长Put", "strike": book.get("k_put_long") or (pick.get("k_put_long") if isinstance(pick, dict) else None)},
+                    {"name": "长Call", "strike": book.get("k_call_long") or (pick.get("k_call_long") if isinstance(pick, dict) else None)},
+                ],
+                "credit": book.get("entry_credit") or (pick.get("credit") if isinstance(pick, dict) else None),
+                "spot": spot,
+            },
+        },
+        "kelly": {
+            "title": "Kelly f",
+            "value": kelly.get("f") if isinstance(kelly, dict) else None,
+            "formula": "f_raw = (b·p − (1−p)) / b；f = clip(f_raw × scale, 0, cap)",
+            "steps": [
+                f"p（区间存活/联合胜率）：{_num(kelly.get('p_leg') if isinstance(kelly, dict) else None, 4)}",
+                f"f_raw：{_num(kelly.get('f_raw') if isinstance(kelly, dict) else None, 4)}",
+                f"缩放后 f：{_num(kelly.get('f') if isinstance(kelly, dict) else None, 4)}",
+                f"预算：{_num(kelly.get('budget') if isinstance(kelly, dict) else None, 0)}（f × NAV）",
+                "b 取净权利金/最大亏损；再乘 scale 并受 risk_cap 约束",
+            ],
+            "chart": {
+                "type": "gauge",
+                "min": 0,
+                "max": 0.2,
+                "value": float(kelly.get("f") or 0) if isinstance(kelly, dict) else 0,
+                "label": "Kelly f",
+            },
+        },
+        "efficiency": {
+            "title": "θ/风险（效率）",
+            "value": indicators.get("pick_efficiency") if indicators.get("pick_efficiency") is not None else (pick.get("efficiency") if isinstance(pick, dict) else None),
+            "formula": "efficiency ≈ 净Theta / 保证金占用",
+            "steps": [
+                f"当前效率：{_num(indicators.get('pick_efficiency') if indicators.get('pick_efficiency') is not None else (pick.get('efficiency') if isinstance(pick, dict) else None), 6)}",
+                "在墙外、Delta 带宽内的铁鹰候选中，优先选效率更高者",
+                f"候选权利金 {_num(pick.get('credit') if isinstance(pick, dict) else None, 2)}，存活概率 {_num(pick.get('range_prob') if isinstance(pick, dict) else None, 4)}",
+            ],
+            "chart": {
+                "type": "bar_single",
+                "value": float(
+                    indicators.get("pick_efficiency")
+                    or (pick.get("efficiency") if isinstance(pick, dict) else 0)
+                    or 0
+                ),
+                "max": max(
+                    0.01,
+                    float(
+                        indicators.get("pick_efficiency")
+                        or (pick.get("efficiency") if isinstance(pick, dict) else 0)
+                        or 0
+                    )
+                    * 1.5
+                    or 0.01,
+                ),
+                "label": "θ/风险",
+            },
+        },
+        "range_prob": {
+            "title": "存活概率",
+            "value": indicators.get("pick_range_prob") if indicators.get("pick_range_prob") is not None else (pick.get("range_prob") if isinstance(pick, dict) else None),
+            "formula": "P(短Put < S_T < 短Call)（对数正态到期近似）",
+            "steps": [
+                f"当前存活概率：{_num(indicators.get('pick_range_prob') if indicators.get('pick_range_prob') is not None else (pick.get('range_prob') if isinstance(pick, dict) else None), 4)}",
+                f"候选腿：{pick.get('k_put') if isinstance(pick, dict) else '—'} / {pick.get('k_call') if isinstance(pick, dict) else '—'}",
+                "用于 Kelly 的 p_joint，并作为结构优劣参考",
+            ],
+            "chart": {
+                "type": "gauge",
+                "min": 0,
+                "max": 1,
+                "value": float(
+                    indicators.get("pick_range_prob")
+                    or (pick.get("range_prob") if isinstance(pick, dict) else 0)
+                    or 0
+                ),
+                "label": "存活概率",
+            },
+        },
+        "spot": {
+            "title": "标的价格",
+            "value": spot,
+            "formula": "优先标的中间价 + 调整项；否则用链 ATM",
+            "steps": [
+                f"当前标的：{_num(spot, 2)}",
+                f"组合/链：{portfolio} / {chain or '—'}",
+                "用于 ATM、墙、Delta、定价与开平仓判断",
+            ],
+            "chart": {
+                "type": "spot_walls",
+                "spot": spot,
+                "call_wall": call_wall,
+                "put_wall": put_wall,
+                "strikes": profile.get("strikes") or [],
+            },
+        },
+    }
+    explains["gex_profile"] = profile
+    return explains
+
+
+
+
 def live_monitor_payload() -> dict[str, Any]:
     engine = require_script()
     data = (
@@ -3651,6 +4045,7 @@ def live_monitor_payload() -> dict[str, Any]:
     data["positions"] = positions
     data["config"] = load_live_setting()
     data["logs"] = list(log_buffer)[-40:]
+    data["explains"] = build_live_indicator_explains(data)
     return data
 
 

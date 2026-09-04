@@ -533,4 +533,138 @@ tr.pin td:nth-child(7) {
 .pill-ok { color: var(--buy); }
 .pill-bad { color: var(--sell); }
 
+.metric.clickable {
+    cursor: pointer;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.metric.clickable:hover {
+    border-color: #54a0ff;
+    transform: translateY(-1px);
+}
+
+.metric.clickable .label::after {
+    content: " ↗";
+    opacity: 0.45;
+    font-size: 10px;
+}
+
+.explain-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: stretch;
+    justify-content: center;
+    padding: 12px;
+}
+
+.explain-modal.hidden {
+    display: none;
+}
+
+.explain-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(8, 12, 18, 0.72);
+}
+
+.explain-card {
+    position: relative;
+    z-index: 1;
+    width: min(1200px, 100%);
+    height: calc(100vh - 24px);
+    max-height: calc(100vh - 24px);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--card, #151b24);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px 16px 12px;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.35);
+}
+
+.explain-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: flex-start;
+    margin-bottom: 8px;
+    flex-shrink: 0;
+}
+
+.explain-head h3 {
+    margin: 0 0 4px;
+    font-size: 18px;
+}
+
+.explain-formula {
+    margin: 0 0 8px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: rgba(84, 160, 255, 0.08);
+    border: 1px solid rgba(84, 160, 255, 0.25);
+    color: #d7e6ff;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    word-break: break-word;
+    flex-shrink: 0;
+}
+
+.explain-steps {
+    margin: 0 0 8px 18px;
+    padding: 0;
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.55;
+    flex: 0 1 auto;
+    max-height: min(22vh, 180px);
+    overflow: auto;
+}
+
+.explain-steps li {
+    margin: 4px 0;
+}
+
+.explain-chart-wrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+#live-explain-chart {
+    width: 100%;
+    flex: 1 1 auto;
+    min-height: 280px;
+    height: 100%;
+    display: block;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+}
+
+#live-explain-chart-hint {
+    flex-shrink: 0;
+    margin: 0;
+}
+
+@media (max-width: 720px) {
+    .explain-modal {
+        padding: 8px;
+    }
+
+    .explain-card {
+        height: calc(100vh - 16px);
+        max-height: calc(100vh - 16px);
+        padding: 12px;
+    }
+
+    .explain-steps {
+        max-height: min(18vh, 140px);
+    }
+}
 

@@ -2505,7 +2505,11 @@ def market_data_lag_sec() -> float | None:
         return None
     dt = tick.datetime
     now = datetime.now(dt.tzinfo) if getattr(dt, "tzinfo", None) else datetime.now()
-    return (now - dt).total_seconds()
+    lag = (now - dt).total_seconds()
+    # Cached / overnight Redis warmup ticks are not live MD.
+    if lag > 3600:
+        return None
+    return lag
 
 
 def portfolio_tick_universe(portfolio_name: str, max_chains: int | None = None) -> list[str]:

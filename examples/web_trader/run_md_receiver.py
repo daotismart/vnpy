@@ -158,6 +158,7 @@ class MdReceiver:
         self.last_tick_vt = ""
         self.tick_count = 0
         self.last_log = ""
+        self._subscribed_at = 0.0
         self.thread = threading.Thread(target=self._loop, name="md-receiver", daemon=True)
         event_engine.register(EVENT_CONTRACT, self._on_contract)
         event_engine.register(EVENT_TICK, self._on_tick)
@@ -223,9 +224,13 @@ class MdReceiver:
         self.subscribed.add(contract.vt_symbol)
 
     def _resubscribe_all(self) -> None:
+        if not self._md_logged_in():
+            self.log("skip subscribe — MD not logged in yet")
+            return
         self.subscribed.clear()
         for contract in list(self.contracts.values()):
             self._maybe_subscribe(contract)
+        self._subscribed_at = time.time()
         self.log(f"subscribed {len(self.subscribed)} contracts")
 
     def _on_tick(self, event: Event) -> None:
@@ -248,13 +253,35 @@ class MdReceiver:
                 self.log("loop error\n" + traceback.format_exc())
             _stop.wait(5.0)
 
+    def _md_logged_in(self) -> bool:
+        gateway = self.main_engine.gateways.get(GATEWAY)
+        md_api = getattr(gateway, "md_api", None) if gateway is not None else None
+        return bool(getattr(md_api, "login_status", False))
+
     def _tick(self) -> None:
         ready = self._ensure_ctp()
-        # Subscribe as soon as connect was kicked off — MD-only mode has no
-        # account snapshot to gate on, and we must not wait for the first tick.
-        if self.contracts and not self.subscribed and (ready or self.connecting or self.ctp_ok):
+        # CTP MdApi.subscribe is a no-op until login_status=True. Clear any
+        # optimistic subscribe marks made before login, then subscribe for real.
+        if self.subscribed and not self._md_logged_in():
+            self.subscribed.clear()
+        if self.contracts and self._md_logged_in() and not self.subscribed:
+            self._resubscribe_all()
+        elif (
+            self.contracts
+            and self._md_logged_in()
+            and self.subscribed
+            and self.tick_count == 0
+            and _cffex_md_active()
+            and time.time() - float(getattr(self, "_subscribed_at", 0.0) or 0.0) > 45
+        ):
+            self.log("MD logged in but no ticks — resubscribe")
+            self.subscribed.clear()
             self._resubscribe_all()
         if not ready:
+            # After MD login + subscribe, treat as ready even before first tick.
+            if self._md_logged_in() and self.subscribed:
+                self.ctp_ok = True
+                self.connecting = False
             return
         self._ensure_md_fresh()
         self._maybe_release_td()

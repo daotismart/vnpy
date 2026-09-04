@@ -70,6 +70,7 @@ services:
       - ./run_md_receiver.py:/app/run_md_receiver.py
       - ./md_bus.py:/app/md_bus.py
       - ./ctp_session.py:/app/ctp_session.py
+      - ./system_monitor.py:/app/system_monitor.py
     entrypoint:
       [
         "bash",
@@ -126,6 +127,7 @@ services:
       - ./data/vntrader:/root/.vntrader
       - ./run_recorder.py:/app/run_recorder.py
       - ./md_bus.py:/app/md_bus.py
+      - ./system_monitor.py:/app/system_monitor.py
       - ./vnpy_questdb:/app/vnpy_questdb
     entrypoint:
       [
@@ -211,6 +213,7 @@ services:
       - ./server.py:/app/server.py
       - ./md_bus.py:/app/md_bus.py
       - ./ctp_session.py:/app/ctp_session.py
+      - ./system_monitor.py:/app/system_monitor.py
       - ./scripts:/app/scripts
       - ./static:/app/static
       - ./vnpy_questdb:/app/vnpy_questdb

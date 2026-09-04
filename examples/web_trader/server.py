@@ -1341,6 +1341,25 @@ async def on_startup() -> None:
     event_loop = asyncio.get_running_loop()
     register_events()
 
+    def _web_heartbeat_loop() -> None:
+        while True:
+            try:
+                from system_monitor import write_service_heartbeat
+
+                write_service_heartbeat(
+                    "web",
+                    {
+                        "role": "web",
+                        "md_source": (os.getenv("LIVE_MD_SOURCE") or "ctp").lower(),
+                        "skip_md": os.getenv("LIVE_CTP_SKIP_MD", "0"),
+                    },
+                )
+            except Exception:
+                pass
+            time.sleep(10)
+
+    threading.Thread(target=_web_heartbeat_loop, name="web-sys-heartbeat", daemon=True).start()
+
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -2650,6 +2669,34 @@ def get_md_bus(_: bool = Depends(get_access)) -> dict[str, Any]:
         return md_bus_status()
     except Exception as exc:
         return {"enabled": False, "error": str(exc)}
+
+
+@app.get("/system/overview")
+def get_system_overview(_: bool = Depends(get_access)) -> dict[str, Any]:
+    from system_monitor import collect_system_overview
+
+    return collect_system_overview()
+
+
+@app.get("/system/processes")
+def get_system_processes(_: bool = Depends(get_access)) -> dict[str, Any]:
+    from system_monitor import collect_process_status
+
+    return collect_process_status()
+
+
+@app.get("/system/redis")
+def get_system_redis(_: bool = Depends(get_access)) -> dict[str, Any]:
+    from system_monitor import collect_redis_status
+
+    return collect_redis_status()
+
+
+@app.get("/system/questdb")
+def get_system_questdb(_: bool = Depends(get_access)) -> dict[str, Any]:
+    from system_monitor import collect_questdb_status
+
+    return collect_questdb_status()
 
 
 class RecorderAddModel(BaseModel):

@@ -344,9 +344,9 @@ class MdReceiver:
 
 
 def _write_heartbeat(receiver: MdReceiver) -> None:
+    st = receiver.status()
+    bus = md_bus_status()
     try:
-        st = receiver.status()
-        bus = md_bus_status()
         payload = (
             f"ts={time.time():.3f}\n"
             f"ctp_ok={st.get('ctp_ok')}\n"
@@ -364,6 +364,24 @@ def _write_heartbeat(receiver: MdReceiver) -> None:
             HEARTBEAT_PATH.write_text(f"ts={time.time():.3f}\nerror={exc}\n", encoding="utf-8")
         except Exception:
             pass
+    try:
+        from system_monitor import write_service_heartbeat
+
+        write_service_heartbeat(
+            "md_receiver",
+            {
+                "role": "md_receiver",
+                "ctp_ok": st.get("ctp_ok"),
+                "subscribed": st.get("subscribed"),
+                "tick_count": st.get("tick_count"),
+                "md_lag_sec": st.get("md_lag_sec"),
+                "last_tick_vt": st.get("last_tick_vt"),
+                "td_released": st.get("td_released"),
+                "md_bus": bus,
+            },
+        )
+    except Exception:
+        pass
 
 
 def main() -> None:

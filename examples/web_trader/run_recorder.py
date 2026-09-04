@@ -82,28 +82,51 @@ def _on_ticks(batch: list[tuple[str, TickData]]) -> None:
 
 
 def _write_heartbeat() -> None:
+    bus = md_bus_status()
+    with _lock:
+        write_count = _write_count
+        write_err = _write_err
+        last_vt = _last_vt
+        last_dt = _last_dt
+        last_err = _last_err
     try:
-        bus = md_bus_status()
-        with _lock:
-            payload = (
-                f"ts={time.time():.3f}\n"
-                f"write_count={_write_count}\n"
-                f"write_err={_write_err}\n"
-                f"last_vt={_last_vt}\n"
-                f"last_dt={_last_dt}\n"
-                f"stream={tick_stream()}\n"
-                f"read_count={bus.get('read_count')}\n"
-                f"ack_count={bus.get('ack_count')}\n"
-                f"pending={bus.get('pending')}\n"
-                f"bus_err={bus.get('err_count')}\n"
-                f"last_err={bus.get('last_err') or _last_err}\n"
-            )
+        payload = (
+            f"ts={time.time():.3f}\n"
+            f"write_count={write_count}\n"
+            f"write_err={write_err}\n"
+            f"last_vt={last_vt}\n"
+            f"last_dt={last_dt}\n"
+            f"stream={tick_stream()}\n"
+            f"read_count={bus.get('read_count')}\n"
+            f"ack_count={bus.get('ack_count')}\n"
+            f"pending={bus.get('pending')}\n"
+            f"bus_err={bus.get('err_count')}\n"
+            f"last_err={bus.get('last_err') or last_err}\n"
+        )
         HEARTBEAT_PATH.write_text(payload, encoding="utf-8")
     except Exception as exc:
         try:
             HEARTBEAT_PATH.write_text(f"ts={time.time():.3f}\nerror={exc}\n", encoding="utf-8")
         except Exception:
             pass
+    try:
+        from system_monitor import write_service_heartbeat
+
+        write_service_heartbeat(
+            "recorder",
+            {
+                "role": "recorder",
+                "write_count": write_count,
+                "write_err": write_err,
+                "last_vt": last_vt,
+                "last_dt": last_dt,
+                "stream": tick_stream(),
+                "md_bus": bus,
+                "last_err": bus.get("last_err") or last_err,
+            },
+        )
+    except Exception:
+        pass
 
 
 def main() -> None:

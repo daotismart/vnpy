@@ -51,6 +51,9 @@ function $(id) {
 
 function appendLog(msg) {
     const box = $("log-box");
+    if (!box) {
+        return;
+    }
     box.textContent += `${msg}\n`;
     box.scrollTop = box.scrollHeight;
 }
@@ -566,6 +569,8 @@ async function afterLogin() {
     }
     connectWs();
     startOptionPoll();
+    const hashTab = (location.hash || "").replace(/^#/, "").trim();
+    activateTab(hashTab || "trade");
 }
 
 $("login-form").addEventListener("submit", async (event) => {
@@ -602,18 +607,24 @@ $("logout-btn").addEventListener("click", () => {
 function activateTab(tabName) {
     const name = String(tabName || "").trim();
     if (!name) {
-        return;
+        return false;
     }
     const panel = $(`tab-${name}`);
-    const button = document.querySelector(`.tab[data-tab="${name}"]`);
+    const button = document.querySelector(`.tabs .tab[data-tab="${name}"], .tab[data-tab="${name}"]`);
     if (!panel || !button) {
         appendLog(`找不到页面：${name}`);
-        return;
+        return false;
     }
     document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
-    document.querySelectorAll(".tab-panel").forEach((item) => item.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach((item) => {
+        item.classList.remove("active");
+        item.classList.add("hidden");
+        item.setAttribute("hidden", "");
+    });
     button.classList.add("active");
     panel.classList.add("active");
+    panel.classList.remove("hidden");
+    panel.removeAttribute("hidden");
     try {
         if (location.hash !== `#${name}`) {
             history.replaceState(null, "", `#${name}`);
@@ -654,13 +665,26 @@ function activateTab(tabName) {
         scheduleSystemMonitor();
         refreshSystem().catch((error) => appendLog(error.message));
     }
+    return true;
 }
 
-document.querySelectorAll(".tab").forEach((button) => {
-    button.addEventListener("click", () => {
+const tabsNav = document.querySelector(".tabs");
+if (tabsNav) {
+    tabsNav.addEventListener("click", (event) => {
+        const button = event.target.closest(".tab[data-tab]");
+        if (!button || !tabsNav.contains(button)) {
+            return;
+        }
+        event.preventDefault();
         activateTab(button.dataset.tab);
     });
-});
+} else {
+    document.querySelectorAll(".tab[data-tab]").forEach((button) => {
+        button.addEventListener("click", () => {
+            activateTab(button.dataset.tab);
+        });
+    });
+}
 
 window.addEventListener("hashchange", () => {
     const name = (location.hash || "").replace(/^#/, "");
@@ -668,9 +692,6 @@ window.addEventListener("hashchange", () => {
         activateTab(name);
     }
 });
-if ((location.hash || "").replace(/^#/, "")) {
-    activateTab(location.hash.replace(/^#/, ""));
-}
 
 $("connect-btn").addEventListener("click", async () => {
     const setting = {};
@@ -1132,7 +1153,9 @@ function metricHtml(label, value, signed = false, explainKey = "") {
         cls += " clickable";
     }
     const text = value == null || value === "" ? "—" : value;
-    const attrs = explainKey ? ` data-explain="${explainKey}" tabindex="0" role="button"` : "";
+    const attrs = explainKey
+        ? ` data-explain="${explainKey}" tabindex="0" role="button" title="点击查看计算过程与可视化"`
+        : "";
     return `<div class="${cls}"${attrs}><div class="label">${label}</div><div class="value">${text}</div></div>`;
 }
 
@@ -4312,6 +4335,29 @@ function bindLiveExplainClicks(rootId) {
         }
         const metric = event.target.closest("[data-explain]");
         if (!metric || !root.contains(metric)) {
+            return;
+        }
+        event.preventDefault();
+        openLiveExplainModal(metric.dataset.explain);
+    });
+}
+
+// Document-level delegation — survives tab swaps / late DOM updates.
+if (!window.__liveExplainDocBound) {
+    window.__liveExplainDocBound = true;
+    document.addEventListener("click", (event) => {
+        const metric = event.target.closest("[data-explain]");
+        if (!metric) {
+            return;
+        }
+        openLiveExplainModal(metric.dataset.explain);
+    });
+    document.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") {
+            return;
+        }
+        const metric = event.target.closest("[data-explain]");
+        if (!metric) {
             return;
         }
         event.preventDefault();

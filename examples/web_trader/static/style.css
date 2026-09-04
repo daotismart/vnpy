@@ -169,10 +169,14 @@ button.ghost, #logout-btn {
 .status.on { color: var(--buy); }
 
 .tab-panel { display: none; overflow: hidden; }
+.tab-panel[hidden] { display: none !important; }
 .tab-panel.active {
     display: grid;
     grid-template-columns: 300px 1fr;
     min-height: 0;
+}
+.tab-panel.active:not([hidden]) {
+    display: grid;
 }
 
 .side {

@@ -1368,7 +1368,10 @@ def health() -> dict[str, str]:
 
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(STATIC_DIR.joinpath("index.html"))
+    return FileResponse(
+        STATIC_DIR.joinpath("index.html"),
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+    )
 
 
 @app.post("/token")

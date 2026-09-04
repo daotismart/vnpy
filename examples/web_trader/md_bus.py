@@ -248,7 +248,34 @@ def contract_from_dict(data: dict[str, Any]) -> ContractData:
 def create_redis_client():
     import redis
 
-    return redis.Redis.from_url(redis_url(), decode_responses=True)
+    # Keep timeouts short so heartbeat / monitor paths cannot freeze a process.
+    return redis.Redis.from_url(
+        redis_url(),
+        decode_responses=True,
+        socket_connect_timeout=2,
+        socket_timeout=2,
+    )
+
+
+def load_contracts_from_redis(prefixes: tuple[str, ...] | list[str] | None = None) -> list:
+    """Load cached ContractData from Redis (for MD-only receiver warm start)."""
+    try:
+        client = create_redis_client()
+        mapping = client.hgetall(contracts_key()) or {}
+    except Exception:
+        return []
+    out: list[ContractData] = []
+    prefs = tuple(p.upper() for p in (prefixes or ()))
+    for raw in mapping.values():
+        try:
+            contract = contract_from_dict(json.loads(raw))
+        except Exception:
+            continue
+        symbol = (contract.symbol or "").upper()
+        if prefs and not symbol.startswith(prefs):
+            continue
+        out.append(contract)
+    return out
 
 
 class MdBusPublisher:

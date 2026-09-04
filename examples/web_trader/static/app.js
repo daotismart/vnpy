@@ -2378,8 +2378,9 @@ function renderLiveStatus(status, monitor) {
     const active = Boolean((status && status.script_active) || (monitor && (monitor.engine_active || monitor.active)));
     const items = [
         { text: supervisor.enabled ? (supervisor.paused ? "守护暂停" : "守护运行") : "守护关闭", cls: supervisor.enabled ? (supervisor.paused ? "warn" : "on") : "off" },
-        { text: supervisor.ctp_ok || status.gateway_connected ? "CTP已连" : "CTP未连", cls: supervisor.ctp_ok || status.gateway_connected ? "on" : "off" },
-        { text: supervisor.session_open ? "交易时段" : "非交易时段", cls: supervisor.session_open ? "on" : "warn" },
+        { text: supervisor.ctp_ok || status.gateway_connected ? "CTP已连" : (supervisor.connecting ? "CTP连接中" : "CTP未连"), cls: supervisor.ctp_ok || status.gateway_connected ? "on" : "off" },
+        { text: supervisor.md_active ? "连续竞价" : (supervisor.session_open ? "登录窗口" : "非交易时段"), cls: supervisor.md_active ? "on" : (supervisor.session_open ? "warn" : "off") },
+        { text: supervisor.redis_md ? "行情Redis" : "行情CTP", cls: "on" },
         { text: active ? "策略运行" : "策略停止", cls: active ? "on" : "off" },
         { text: (monitor && monitor.dry_run) ? "DRY RUN" : "实盘", cls: (monitor && monitor.dry_run) ? "warn" : "on" },
     ];

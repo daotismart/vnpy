@@ -71,7 +71,13 @@ from vnpy.trader.utility import load_json
 from vnpy_ctp import CtpGateway
 
 from ctp_session import patch_ctp_connect_modes, release_ctp_td
-from md_bus import md_bus_status, start_md_bus_publisher, stop_md_bus, tick_stream
+from md_bus import (
+    load_contracts_from_redis,
+    md_bus_status,
+    start_md_bus_publisher,
+    stop_md_bus,
+    tick_stream,
+)
 
 
 HEARTBEAT_PATH = Path(_env("MD_RECEIVER_HEARTBEAT_FILE", "/tmp/md_receiver_heartbeat"))
@@ -81,11 +87,21 @@ _stop = threading.Event()
 
 
 def _cffex_session_open(now: datetime | None = None) -> bool:
+    """Login / pre-open window — allow CTP login but do not expect continuous ticks."""
     now = now or datetime.now()
     if now.weekday() >= 5:
         return False
     hhmm = now.hour * 100 + now.minute
     return (900 <= hhmm <= 1135) or (1255 <= hhmm <= 1515)
+
+
+def _cffex_md_active(now: datetime | None = None) -> bool:
+    """Official IF/IO continuous auction — only then treat tick lag as MD failure."""
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return False
+    hhmm = now.hour * 100 + now.minute
+    return (915 <= hhmm <= 1130) or (1300 <= hhmm <= 1500)
 
 
 def _load_ctp_setting() -> dict:
@@ -233,32 +249,44 @@ class MdReceiver:
             _stop.wait(5.0)
 
     def _tick(self) -> None:
-        if not self._ensure_ctp():
+        ready = self._ensure_ctp()
+        # Subscribe as soon as connect was kicked off — MD-only mode has no
+        # account snapshot to gate on, and we must not wait for the first tick.
+        if self.contracts and not self.subscribed and (ready or self.connecting or self.ctp_ok):
+            self._resubscribe_all()
+        if not ready:
             return
         self._ensure_md_fresh()
-        if self.contracts and not self.subscribed:
-            self._resubscribe_all()
         self._maybe_release_td()
 
     def _ensure_ctp(self) -> bool:
-        if self.td_released or _env_flag("LIVE_CTP_SKIP_TD"):
-            # MD-only mode after TD release.
-            if self.last_tick_dt is not None or self.contracts:
-                self.ctp_ok = True
-                self.connecting = False
+        skip_td = self.td_released or _env_flag("LIVE_CTP_SKIP_TD")
+        # MD flowing → ready (accounts may be empty in MD-only mode).
+        if self.last_tick_dt is not None:
+            wall = datetime.now(self.last_tick_dt.tzinfo) if self.last_tick_dt.tzinfo else datetime.now()
+            lag = (wall - self.last_tick_dt).total_seconds()
+            # Outside continuous auction, stale overnight ticks are expected.
+            if lag <= self.md_max_lag * 2 or not _cffex_md_active():
+                if not self.ctp_ok:
+                    self.ctp_ok = True
+                    self.connecting = False
+                    self.connect_failures = 0
+                    self.log("CTP MD ready")
+                    if self.contracts and not self.subscribed:
+                        self._resubscribe_all()
                 return True
-        accounts = self.main_engine.get_all_accounts() or []
-        if accounts:
-            if not self.ctp_ok:
-                self.ctp_ok = True
-                self.connecting = False
-                self.connect_failures = 0
-                self.log("CTP ready")
-                self._resubscribe_all()
-            return True
-        # Also treat as ready when MD is flowing even without account snapshot.
-        if self.last_tick_dt is not None and self.ctp_ok:
-            return True
+
+        if not skip_td:
+            accounts = self.main_engine.get_all_accounts() or []
+            if accounts:
+                if not self.ctp_ok:
+                    self.ctp_ok = True
+                    self.connecting = False
+                    self.connect_failures = 0
+                    self.log("CTP ready")
+                    self._resubscribe_all()
+                return True
+
         now = time.time()
         if now < self.next_connect:
             return False
@@ -270,7 +298,12 @@ class MdReceiver:
         if not _cffex_session_open():
             self.log("outside CFFEX session — slow reconnect")
         else:
-            self.log(f"connecting {GATEWAY}")
+            mode = "MD-only" if skip_td else "MD+TD"
+            self.log(f"connecting {GATEWAY} ({mode})")
+        # Preserve MD-only across reconnects when contracts are already known.
+        if skip_td or self.contracts:
+            os.environ["LIVE_CTP_SKIP_TD"] = "1"
+            self.td_released = True
         self.main_engine.connect(setting, GATEWAY)
         self.connecting = True
         self.ctp_ok = False
@@ -280,13 +313,19 @@ class MdReceiver:
         return False
 
     def _ensure_md_fresh(self) -> None:
-        if not _cffex_session_open():
+        if not _cffex_md_active():
             return
         now = time.time()
         if now - self.last_md_check < 20:
             return
         self.last_md_check = now
         if self.last_tick_dt is None:
+            # Continuous auction but no ticks yet — soft reconnect MD after grace.
+            if self.connecting or now - self.last_md_reconnect < 60:
+                return
+            if self.subscribed or self.contracts:
+                self.last_md_reconnect = now
+                self._reconnect_md("no ticks during continuous auction")
             return
         wall = datetime.now(self.last_tick_dt.tzinfo) if self.last_tick_dt.tzinfo else datetime.now()
         lag = (wall - self.last_tick_dt).total_seconds()
@@ -295,52 +334,58 @@ class MdReceiver:
         if now - self.last_md_reconnect < 45:
             return
         self.last_md_reconnect = now
+        self._reconnect_md(f"MD lag {int(lag)}s > {self.md_max_lag}s")
+
+    def _reconnect_md(self, reason: str) -> None:
         setting = _load_ctp_setting()
         if not setting:
             return
-        self.log(f"MD lag {int(lag)}s > {self.md_max_lag}s — close+reconnect")
+        self.log(f"{reason} — close+reconnect MD")
         gateway = self.main_engine.gateways.get(GATEWAY)
         if gateway is not None:
             try:
                 gateway.close()
             except Exception:
                 traceback.print_exc()
-        # After reconnect we may need TD briefly for contracts again.
-        os.environ["LIVE_CTP_SKIP_TD"] = "0"
-        self.td_released = False
+        # Prefer MD-only reconnect to avoid kicking the web TD session.
+        if self.contracts or self.td_released or _env_flag("LIVE_CTP_SKIP_TD"):
+            os.environ["LIVE_CTP_SKIP_TD"] = "1"
+            self.td_released = True
         self.subscribed.clear()
         self.ctp_ok = False
         self.connecting = True
         self.main_engine.connect(setting, GATEWAY)
         self.connect_failures += 1
-        self.next_connect = now + 30
+        self.next_connect = time.time() + 30
 
     def _maybe_release_td(self) -> None:
         if self.td_released or not _env_flag("LIVE_MD_RELEASE_TD", True):
             return
         if not self.subscribed:
             return
-        # Only yield TD after MD is alive in-session — overnight hard-close
-        # of td_api has been observed to restart the whole process.
-        if not _cffex_session_open():
+        # Only yield TD after MD is alive in continuous auction.
+        if not _cffex_md_active():
             return
         if self.tick_count < 10:
             return
-        gateway = self.main_engine.gateways.get(GATEWAY)
-        if gateway is None:
+        hard = _env_flag("LIVE_MD_HARD_RELEASE_TD", False)
+        if hard:
+            gateway = self.main_engine.gateways.get(GATEWAY)
+            if gateway is None:
+                return
+            try:
+                if release_ctp_td(gateway, hard=True):
+                    os.environ["LIVE_CTP_SKIP_TD"] = "1"
+                    self.td_released = True
+                    self.log("released CTP TD seat (hard-close); web may login trading front")
+            except Exception:
+                self.log("TD release failed\n" + traceback.format_exc())
             return
-        try:
-            if release_ctp_td(gateway):
-                self.td_released = True
-                os.environ["LIVE_CTP_SKIP_TD"] = "1"
-                hard = _env_flag("LIVE_MD_HARD_RELEASE_TD", False)
-                self.log(
-                    "released CTP TD seat (MD kept"
-                    + (", hard-close)" if hard else ", soft — web TD login may kick)")
-                    + " — web may login trading front"
-                )
-        except Exception:
-            self.log("TD release failed\n" + traceback.format_exc())
+        # Soft mark only — keep current TD socket but arm MD-only for future reconnects
+        # so web TD is not kicked by an MD+TD re-login from this process.
+        os.environ["LIVE_CTP_SKIP_TD"] = "1"
+        self.td_released = True
+        self.log("MD-only mode armed (soft TD release; web may own trading front)")
 
 
 def _write_heartbeat(receiver: MdReceiver) -> None:
@@ -412,11 +457,28 @@ def main() -> None:
 
     start_md_bus_publisher(event_engine, log=lambda m: main_engine.write_log(f"[MD_BUS] {m}"))
     receiver = MdReceiver(main_engine, event_engine)
+
+    # Prefer MD-only when Redis already has the IF/IO universe — avoids dual TD
+    # login kicking the web trading session on the same investor id.
+    try:
+        warmed = load_contracts_from_redis(receiver.prefixes)
+        for contract in warmed:
+            receiver.contracts[contract.vt_symbol] = contract
+        if len(warmed) >= 50 or _env_flag("LIVE_CTP_SKIP_TD"):
+            os.environ["LIVE_CTP_SKIP_TD"] = "1"
+            receiver.td_released = True
+            receiver.log(f"MD-only start: warmed {len(warmed)} contracts from Redis")
+        elif warmed:
+            receiver.log(f"warmed {len(warmed)} contracts from Redis (TD still needed)")
+    except Exception:
+        traceback.print_exc()
+
     receiver.start()
 
     print(
         f"MD receiver started redis={_env('REDIS_URL', 'redis://redis:6379/0')} "
-        f"stream={tick_stream()} gateway={GATEWAY}",
+        f"stream={tick_stream()} gateway={GATEWAY} "
+        f"skip_td={_env('LIVE_CTP_SKIP_TD', '0')} contracts={len(receiver.contracts)}",
         flush=True,
     )
 

@@ -3039,6 +3039,9 @@ class LiveSupervisor:
 
     def status(self) -> dict[str, Any]:
         lag = market_data_lag_sec()
+        redis_md = env_flag("LIVE_CTP_SKIP_MD") or (
+            (os.getenv("LIVE_MD_SOURCE") or "").strip().lower() in {"redis", "bus", "md_bus"}
+        )
         return {
             "enabled": True,
             "paused": self.paused,
@@ -3049,6 +3052,8 @@ class LiveSupervisor:
             "script": self.script_name,
             "auto_start_script": self.auto_start_script,
             "session_open": self.cffex_session_open(),
+            "md_active": self.cffex_md_active(),
+            "redis_md": redis_md,
             "connect_failures": self.connect_failures,
             "inited": sorted(self.inited),
             "next_connect_in": max(0.0, self.next_connect - time.time()),
@@ -3187,9 +3192,13 @@ class LiveSupervisor:
         self.next_connect = time.time() + self.connect_backoff_sec()
 
     def ensure_market_data_fresh(self) -> bool:
-        """Reconnect CTP when IF/IO tick timestamps fall far behind wall clock."""
+        """Reconnect CTP when IF/IO tick timestamps fall far behind wall clock.
+
+        Redis-MD / SKIP_MD live process must NOT thrash the local TD gateway —
+        MD is owned by md_receiver. We only gate strategy startup on lag.
+        """
         assert main_engine is not None
-        if not self.cffex_session_open():
+        if not self.cffex_md_active():
             return True
         now = time.time()
         if now - self.last_md_check < 20:
@@ -3202,6 +3211,14 @@ class LiveSupervisor:
         max_lag = md_max_lag_from_env()
         if lag <= max_lag:
             return True
+        redis_md = env_flag("LIVE_CTP_SKIP_MD") or (
+            (os.getenv("LIVE_MD_SOURCE") or "").strip().lower() in {"redis", "bus", "md_bus"}
+        )
+        if redis_md:
+            self.log(
+                f"Redis 行情滞后 {int(lag)}s（阈值 {max_lag}s），等待 md_receiver（不重连本机 TD）"
+            )
+            return False
         # Use a dedicated MD reconnect cooldown (do not inherit login backoff).
         last = float(getattr(self, "last_md_reconnect", 0.0) or 0.0)
         if now - last < 45:
@@ -3214,13 +3231,22 @@ class LiveSupervisor:
 
     @staticmethod
     def cffex_session_open(now: datetime | None = None) -> bool:
-        """Rough CFFEX IO/IF session gate (Asia/Shanghai wall clock)."""
+        """Rough CFFEX IO/IF login window (Asia/Shanghai wall clock)."""
         now = now or datetime.now()
         if now.weekday() >= 5:
             return False
         hhmm = now.hour * 100 + now.minute
         # day: 09:00-11:35, 12:55-15:15 (login buffer around official hours)
         return (900 <= hhmm <= 1135) or (1255 <= hhmm <= 1515)
+
+    @staticmethod
+    def cffex_md_active(now: datetime | None = None) -> bool:
+        """Official continuous auction — only then treat lag as MD failure."""
+        now = now or datetime.now()
+        if now.weekday() >= 5:
+            return False
+        hhmm = now.hour * 100 + now.minute
+        return (915 <= hhmm <= 1130) or (1300 <= hhmm <= 1500)
 
     def connect_backoff_sec(self) -> float:
         # Outside session: slow down hard to avoid CTP front thrash.

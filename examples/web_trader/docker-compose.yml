@@ -19,17 +19,153 @@ services:
       retries: 12
       start_period: 25s
 
-  web:
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4-alpine}
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # 1) MD receiver: CTP → Redis Stream (+ pub/sub). Minimal & restart-safe.
+  md_receiver:
+    image: vnpy-web-trader:4.4.0
     build:
       context: .
       dockerfile: Dockerfile
       args:
         DEBIAN_MIRROR: ${DEBIAN_MIRROR:-}
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      LANG: zh_CN.UTF-8
+      LC_ALL: zh_CN.UTF-8
+      LC_CTYPE: zh_CN.UTF-8
+      LIVE_GATEWAY: ${LIVE_GATEWAY:-CTP}
+      LIVE_MD_SOURCE: redis
+      MD_BUS_ENABLE: "1"
+      LIVE_RECORD_MAX_CHAINS: ${LIVE_RECORD_MAX_CHAINS:-0}
+      LIVE_MD_MAX_LAG_SEC: ${LIVE_MD_MAX_LAG_SEC:-90}
+      LIVE_MD_PREFIXES: ${LIVE_MD_PREFIXES:-IF,IO}
+      LIVE_MD_RELEASE_TD: ${LIVE_MD_RELEASE_TD:-1}
+      LIVE_CTP_SKIP_MD: "0"
+      LIVE_CTP_SKIP_TD: "1"
+      CTP_CONNECT_FILE: ${MD_CTP_CONNECT_FILE:-}
+      MD_RECEIVER_HEARTBEAT_FILE: /tmp/md_receiver_heartbeat
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      MD_BUS_TICK_STREAM: ${MD_BUS_TICK_STREAM:-vnpy:md:tick_stream}
+      MD_BUS_TICK_STREAM_MAXLEN: ${MD_BUS_TICK_STREAM_MAXLEN:-200000}
+    volumes:
+      - ./data/vntrader:/root/.vntrader
+      - ./run_md_receiver.py:/app/run_md_receiver.py
+      - ./md_bus.py:/app/md_bus.py
+      - ./ctp_session.py:/app/ctp_session.py
+      - ./system_monitor.py:/app/system_monitor.py
+    entrypoint:
+      [
+        "bash",
+        "-lc",
+        "pip install -q redis >/tmp/pip-redis.log 2>&1 || true; exec python run_md_receiver.py",
+      ]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import time; from pathlib import Path; p=Path('/tmp/md_receiver_heartbeat'); assert p.exists() and time.time()-p.stat().st_mtime<30",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 90s
+
+  # 2) Recorder: Redis Stream → QuestDB. ACK only after successful write.
+  recorder:
     image: vnpy-web-trader:4.4.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-}
     restart: unless-stopped
     depends_on:
       questdb:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      LANG: zh_CN.UTF-8
+      LC_ALL: zh_CN.UTF-8
+      LC_CTYPE: zh_CN.UTF-8
+      LIVE_MD_SOURCE: redis
+      MD_BUS_ENABLE: "1"
+      RECORDER_HEARTBEAT_FILE: /tmp/recorder_heartbeat
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      MD_BUS_TICK_STREAM: ${MD_BUS_TICK_STREAM:-vnpy:md:tick_stream}
+      MD_BUS_RECORDER_GROUP: ${MD_BUS_RECORDER_GROUP:-questdb-writer}
+      MD_BUS_RECORDER_CONSUMER: ${MD_BUS_RECORDER_CONSUMER:-recorder-1}
+      DATABASE_DRIVER: questdb
+      DATABASE_HOST: questdb
+      DATABASE_PORT: "8812"
+      DATABASE_HTTP_PORT: "9000"
+      DATABASE_NAME: ${DATABASE_NAME:-qdb}
+      DATABASE_USER: ${DATABASE_USER:-admin}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD:-quest}
+    volumes:
+      - ./data/vntrader:/root/.vntrader
+      - ./run_recorder.py:/app/run_recorder.py
+      - ./md_bus.py:/app/md_bus.py
+      - ./system_monitor.py:/app/system_monitor.py
+      - ./vnpy_questdb:/app/vnpy_questdb
+    entrypoint:
+      [
+        "bash",
+        "-lc",
+        "pip install -q redis >/tmp/pip-redis.log 2>&1 || true; exec python run_recorder.py",
+      ]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import time; from pathlib import Path; p=Path('/tmp/recorder_heartbeat'); assert p.exists() and time.time()-p.stat().st_mtime<30",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 60s
+
+  # 3) Web / strategy: Redis MD + CTP TD + QuestDB.
+  web:
+    image: vnpy-web-trader:4.4.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-}
+    restart: unless-stopped
+    depends_on:
+      questdb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      md_receiver:
+        condition: service_started
+      recorder:
+        condition: service_started
     environment:
       TZ: Asia/Shanghai
       LANG: zh_CN.UTF-8
@@ -41,13 +177,20 @@ services:
       WEB_PASSWORD: ${WEB_PASSWORD:-vnpy}
       WEB_SECRET_KEY: ${WEB_SECRET_KEY:-}
       LIVE_IRON_CONDOR: ${LIVE_IRON_CONDOR:-1}
+      LIVE_AUTO_CONNECT_CTP: ${LIVE_AUTO_CONNECT_CTP:-1}
       LIVE_DRY_RUN: ${LIVE_DRY_RUN:-0}
       LIVE_PORTFOLIOS: ${LIVE_PORTFOLIOS:-IO.CFFEX}
       LIVE_GATEWAY: ${LIVE_GATEWAY:-CTP}
       LIVE_SCRIPT: ${LIVE_SCRIPT:-gex_tv_strangle.py}
-      LIVE_RECORD_TICKS: ${LIVE_RECORD_TICKS:-1}
+      LIVE_MD_SOURCE: redis
+      MD_BUS_ENABLE: "1"
+      LIVE_CTP_SKIP_MD: "1"
+      LIVE_CTP_SKIP_TD: "0"
+      LIVE_RECORD_TICKS: "0"
       LIVE_RECORD_MAX_CHAINS: ${LIVE_RECORD_MAX_CHAINS:-0}
       LIVE_RECORD_BAR: ${LIVE_RECORD_BAR:-1}
+      LIVE_RECORD_FILTER_WINDOW: ${LIVE_RECORD_FILTER_WINDOW:-3600}
+      LIVE_MD_MAX_LAG_SEC: ${LIVE_MD_MAX_LAG_SEC:-90}
       LIVE_WING_STEPS: ${LIVE_WING_STEPS:-}
       LIVE_MIN_CREDIT_FRAC: ${LIVE_MIN_CREDIT_FRAC:-}
       LIVE_MIN_DELTA: ${LIVE_MIN_DELTA:-}
@@ -56,6 +199,7 @@ services:
       LIVE_MAX_LOTS: ${LIVE_MAX_LOTS:-}
       LIVE_IV_RANK_MIN: ${LIVE_IV_RANK_MIN:-}
       LIVE_TAKE_PROFIT: ${LIVE_TAKE_PROFIT:-}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       DATABASE_DRIVER: questdb
       DATABASE_HOST: questdb
       DATABASE_PORT: "8812"
@@ -67,10 +211,19 @@ services:
       - ./data/vntrader:/root/.vntrader
       - ./run_server.py:/app/run_server.py
       - ./server.py:/app/server.py
+      - ./md_bus.py:/app/md_bus.py
+      - ./ctp_session.py:/app/ctp_session.py
+      - ./system_monitor.py:/app/system_monitor.py
       - ./scripts:/app/scripts
       - ./static:/app/static
+      - ./vnpy_questdb:/app/vnpy_questdb
     ports:
       - "${WEB_PUBLISH_PORT:-8000}:8000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    entrypoint: ["python", "run_server.py"]
+    entrypoint:
+      [
+        "bash",
+        "-lc",
+        "pip install -q redis >/tmp/pip-redis.log 2>&1 || true; exec python run_server.py",
+      ]

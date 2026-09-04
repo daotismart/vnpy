@@ -16,6 +16,8 @@ const state = {
     scriptBacktest: null,
     scriptBtPresets: [],
     scriptBtPresetKey: "",
+    liveMonitor: null,
+    liveExplainChart: null,
     meta: { exchanges: [], intervals: [], directions: [], offsets: [], order_types: [], option_models: [] },
 };
 
@@ -49,6 +51,9 @@ function $(id) {
 
 function appendLog(msg) {
     const box = $("log-box");
+    if (!box) {
+        return;
+    }
     box.textContent += `${msg}\n`;
     box.scrollTop = box.scrollHeight;
 }
@@ -564,6 +569,8 @@ async function afterLogin() {
     }
     connectWs();
     startOptionPoll();
+    const hashTab = (location.hash || "").replace(/^#/, "").trim();
+    activateTab(hashTab || "trade");
 }
 
 $("login-form").addEventListener("submit", async (event) => {
@@ -597,42 +604,93 @@ $("logout-btn").addEventListener("click", () => {
     location.reload();
 });
 
-document.querySelectorAll(".tab").forEach((button) => {
-    button.addEventListener("click", () => {
-        document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
-        document.querySelectorAll(".tab-panel").forEach((item) => item.classList.remove("active"));
-        button.classList.add("active");
-        $(`tab-${button.dataset.tab}`).classList.add("active");
-        if (button.dataset.tab === "option") {
-            startOptionPoll();
-            if (lastOptionChain) {
-                renderGexChart(lastOptionChain.gex || {});
-                renderTvYieldChart(lastOptionChain);
-                renderIvSmileChart(lastOptionChain);
-            }
-            refreshOptionChain().catch((error) => appendLog(error.message));
-        }
-        if (button.dataset.tab === "futures" && state.futuresCurve) {
-            renderFuturesCharts(state.futuresCurve);
-            renderFuturesCapitalCharts(state.futuresCurve);
-        }
-        if (button.dataset.tab === "live") {
-            scheduleLiveMonitor();
-            refreshLive().catch((error) => appendLog(error.message));
-        }
-        if (button.dataset.tab === "script") {
-            scheduleScriptMonitor();
-            refreshScriptBacktest().then(() => {
-                if (state.scriptBacktest && state.scriptBacktest.running) {
-                    scheduleScriptBtPoll();
-                }
-            }).catch((error) => appendLog(error.message));
-        }
-        if (button.dataset.tab === "data") {
-            refreshRecorder();
-            refreshData();
-        }
+function activateTab(tabName) {
+    const name = String(tabName || "").trim();
+    if (!name) {
+        return false;
+    }
+    const panel = $(`tab-${name}`);
+    const button = document.querySelector(`.tabs .tab[data-tab="${name}"], .tab[data-tab="${name}"]`);
+    if (!panel || !button) {
+        appendLog(`找不到页面：${name}`);
+        return false;
+    }
+    document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach((item) => {
+        item.classList.remove("active");
+        item.classList.add("hidden");
+        item.setAttribute("hidden", "");
     });
+    button.classList.add("active");
+    panel.classList.add("active");
+    panel.classList.remove("hidden");
+    panel.removeAttribute("hidden");
+    try {
+        if (location.hash !== `#${name}`) {
+            history.replaceState(null, "", `#${name}`);
+        }
+    } catch (error) {
+        // ignore
+    }
+    if (name === "option") {
+        startOptionPoll();
+        if (lastOptionChain) {
+            renderGexChart(lastOptionChain.gex || {});
+            renderTvYieldChart(lastOptionChain);
+            renderIvSmileChart(lastOptionChain);
+        }
+        refreshOptionChain().catch((error) => appendLog(error.message));
+    }
+    if (name === "futures" && state.futuresCurve) {
+        renderFuturesCharts(state.futuresCurve);
+        renderFuturesCapitalCharts(state.futuresCurve);
+    }
+    if (name === "live") {
+        scheduleLiveMonitor();
+        refreshLive().catch((error) => appendLog(error.message));
+    }
+    if (name === "script") {
+        scheduleScriptMonitor();
+        refreshScriptBacktest().then(() => {
+            if (state.scriptBacktest && state.scriptBacktest.running) {
+                scheduleScriptBtPoll();
+            }
+        }).catch((error) => appendLog(error.message));
+    }
+    if (name === "data") {
+        refreshRecorder();
+        refreshData();
+    }
+    if (name === "system") {
+        scheduleSystemMonitor();
+        refreshSystem().catch((error) => appendLog(error.message));
+    }
+    return true;
+}
+
+const tabsNav = document.querySelector(".tabs");
+if (tabsNav) {
+    tabsNav.addEventListener("click", (event) => {
+        const button = event.target.closest(".tab[data-tab]");
+        if (!button || !tabsNav.contains(button)) {
+            return;
+        }
+        event.preventDefault();
+        activateTab(button.dataset.tab);
+    });
+} else {
+    document.querySelectorAll(".tab[data-tab]").forEach((button) => {
+        button.addEventListener("click", () => {
+            activateTab(button.dataset.tab);
+        });
+    });
+}
+
+window.addEventListener("hashchange", () => {
+    const name = (location.hash || "").replace(/^#/, "");
+    if (name) {
+        activateTab(name);
+    }
 });
 
 $("connect-btn").addEventListener("click", async () => {
@@ -1081,7 +1139,7 @@ function formatGex(value) {
     return number.toFixed(2);
 }
 
-function metricHtml(label, value, signed = false) {
+function metricHtml(label, value, signed = false, explainKey = "") {
     let cls = "metric";
     const tone = typeof signed === "number" ? signed : (signed === true ? Number(value) : null);
     if (tone != null && !Number.isNaN(tone)) {
@@ -1091,8 +1149,14 @@ function metricHtml(label, value, signed = false) {
             cls += " neg";
         }
     }
+    if (explainKey) {
+        cls += " clickable";
+    }
     const text = value == null || value === "" ? "—" : value;
-    return `<div class="${cls}"><div class="label">${label}</div><div class="value">${text}</div></div>`;
+    const attrs = explainKey
+        ? ` data-explain="${explainKey}" tabindex="0" role="button" title="点击查看计算过程与可视化"`
+        : "";
+    return `<div class="${cls}"${attrs}><div class="label">${label}</div><div class="value">${text}</div></div>`;
 }
 
 function gexMode() {
@@ -2374,8 +2438,9 @@ function renderLiveStatus(status, monitor) {
     const active = Boolean((status && status.script_active) || (monitor && (monitor.engine_active || monitor.active)));
     const items = [
         { text: supervisor.enabled ? (supervisor.paused ? "守护暂停" : "守护运行") : "守护关闭", cls: supervisor.enabled ? (supervisor.paused ? "warn" : "on") : "off" },
-        { text: supervisor.ctp_ok || status.gateway_connected ? "CTP已连" : "CTP未连", cls: supervisor.ctp_ok || status.gateway_connected ? "on" : "off" },
-        { text: supervisor.session_open ? "交易时段" : "非交易时段", cls: supervisor.session_open ? "on" : "warn" },
+        { text: supervisor.ctp_ok || status.gateway_connected ? "CTP已连" : (supervisor.connecting ? "CTP连接中" : "CTP未连"), cls: supervisor.ctp_ok || status.gateway_connected ? "on" : "off" },
+        { text: supervisor.md_active ? "连续竞价" : (supervisor.session_open ? "登录窗口" : "非交易时段"), cls: supervisor.md_active ? "on" : (supervisor.session_open ? "warn" : "off") },
+        { text: supervisor.redis_md ? "行情Redis" : "行情CTP", cls: "on" },
         { text: active ? "策略运行" : "策略停止", cls: active ? "on" : "off" },
         { text: (monitor && monitor.dry_run) ? "DRY RUN" : "实盘", cls: (monitor && monitor.dry_run) ? "warn" : "on" },
     ];
@@ -2391,6 +2456,7 @@ function renderLiveStatus(status, monitor) {
 }
 
 function renderLiveMonitor(data) {
+    state.liveMonitor = data || null;
     const runBox = $("live-run-metrics");
     const indBox = $("live-indicators");
     const sigBox = $("live-signals");
@@ -2407,8 +2473,8 @@ function renderLiveMonitor(data) {
             metricHtml("模式", data.dry_run ? "DRY RUN" : "实盘", data.dry_run ? -1 : 1),
             metricHtml("组合", data.portfolio || params.portfolio_name || "—"),
             metricHtml("链", data.chain || indicators.chain || "—"),
-            metricHtml("标的", indicators.spot ?? data.spot ?? "—"),
-            metricHtml("IV Rank", indicators.iv_rank ?? data.iv_rank ?? "—", data.iv_high ? 1 : -1),
+            metricHtml("标的", indicators.spot ?? data.spot ?? "—", false, "spot"),
+            metricHtml("IV Rank", indicators.iv_rank ?? data.iv_rank ?? "—", data.iv_high ? 1 : -1, "iv_rank"),
             metricHtml("手数", book.lots ?? 0, Number(book.lots || 0)),
             metricHtml("净值份额", indicators.nav ?? data.nav ?? "—"),
             metricHtml("状态", data.reason || "正常", data.reason ? 0 : 1),
@@ -2417,15 +2483,15 @@ function renderLiveMonitor(data) {
     if (indBox) {
         const kelly = indicators.kelly || data.kelly || {};
         indBox.innerHTML = [
-            metricHtml("IV", indicators.iv ?? "—"),
-            metricHtml("LSP", indicators.lsp ?? "—"),
-            metricHtml("DTE", indicators.dte ?? "—"),
-            metricHtml("Call墙", indicators.call_wall ?? "—"),
-            metricHtml("Put墙", indicators.put_wall ?? "—"),
-            metricHtml("权利金", indicators.entry_credit ?? book.entry_credit ?? "—"),
-            metricHtml("Kelly f", kelly.f != null ? Number(kelly.f).toFixed(3) : "—"),
-            metricHtml("θ/风险", indicators.pick_efficiency ?? pick.efficiency ?? "—"),
-            metricHtml("存活概率", indicators.pick_range_prob ?? pick.range_prob ?? "—"),
+            metricHtml("IV", indicators.iv ?? "—", false, "iv"),
+            metricHtml("LSP", indicators.lsp ?? "—", false, "lsp"),
+            metricHtml("DTE", indicators.dte ?? "—", false, "dte"),
+            metricHtml("Call墙", indicators.call_wall ?? "—", false, "call_wall"),
+            metricHtml("Put墙", indicators.put_wall ?? "—", false, "put_wall"),
+            metricHtml("权利金", indicators.entry_credit ?? book.entry_credit ?? "—", false, "entry_credit"),
+            metricHtml("Kelly f", kelly.f != null ? Number(kelly.f).toFixed(3) : "—", false, "kelly"),
+            metricHtml("θ/风险", indicators.pick_efficiency ?? pick.efficiency ?? "—", false, "efficiency"),
+            metricHtml("存活概率", indicators.pick_range_prob ?? pick.range_prob ?? "—", false, "range_prob"),
         ].join("");
     }
     if (sigBox) {
@@ -2453,7 +2519,7 @@ function renderLiveMonitor(data) {
             metricHtml("候选", pick.k_put_long
                 ? `${pick.k_put_long}/${pick.k_put}/${pick.k_call}/${pick.k_call_long}`
                 : "—"),
-            metricHtml("候选权利金", pick.credit ?? "—"),
+            metricHtml("候选权利金", pick.credit ?? "—", false, "entry_credit"),
         ].join("");
     }
     renderTable("live-market-body", data.market || [], (row) => `
@@ -3868,4 +3934,649 @@ if (state.token) {
     });
 } else {
     fillScriptFileSelect([]);
+}
+
+function closeLiveExplainModal() {
+    const modal = $("live-explain-modal");
+    if (!modal) {
+        return;
+    }
+    modal.classList.add("hidden");
+    modal.setAttribute("aria-hidden", "true");
+    state.liveExplainChart = null;
+}
+
+function openLiveExplainModal(key) {
+    const modal = $("live-explain-modal");
+    if (!modal) {
+        return;
+    }
+    const explains = (state.liveMonitor && state.liveMonitor.explains) || {};
+    const payload = explains[key];
+    if (!payload) {
+        appendLog(`暂无 ${key} 的计算说明`);
+        return;
+    }
+    $("live-explain-title").textContent = payload.title || key;
+    const value = payload.value == null || payload.value === "" ? "—" : payload.value;
+    $("live-explain-value").textContent = `当前值：${value}`;
+    $("live-explain-formula").textContent = payload.formula || "";
+    const steps = Array.isArray(payload.steps) ? payload.steps : [];
+    $("live-explain-steps").innerHTML = steps.map((item) => `<li>${item}</li>`).join("");
+    const chart = payload.chart || {};
+    state.liveExplainChart = chart;
+    const hint = $("live-explain-chart-hint");
+    if (hint) {
+        if (chart.type === "gex_walls" && !(chart.strikes || []).length) {
+            hint.textContent = "链上 GEX 剖面暂不可用（需期权组合已初始化并收到行情）";
+        } else if (chart.type === "gex_walls") {
+            hint.textContent = "柱状为各行权价 CallGEX（橙）/ PutGEX（蓝）；竖线为策略墙与现价";
+        } else if (chart.type === "dual_bar") {
+            hint.textContent = "蓝色为交易日 DTE，绿色为自然日 DTE";
+        } else {
+            hint.textContent = "";
+        }
+    }
+    modal.classList.remove("hidden");
+    modal.setAttribute("aria-hidden", "false");
+    // Layout must settle before measuring chart wrap size.
+    requestAnimationFrame(() => {
+        drawLiveExplainChart(chart);
+        requestAnimationFrame(() => drawLiveExplainChart(chart));
+    });
+}
+
+function explainChartSize(canvas) {
+    const wrap = canvas.closest(".explain-chart-wrap") || canvas.parentElement;
+    const hint = $("live-explain-chart-hint");
+    const hintH = hint && hint.offsetParent !== null ? hint.offsetHeight + 6 : 0;
+    const width = Math.max(280, Math.floor((wrap && wrap.clientWidth) || canvas.clientWidth || 640));
+    const available = wrap ? wrap.clientHeight - hintH : 0;
+    const height = Math.max(280, Math.floor(available > 40 ? available : Math.min(window.innerHeight * 0.55, 560)));
+    return { cssWidth: width, cssHeight: height };
+}
+
+function drawLiveExplainChart(chart) {
+    const canvas = $("live-explain-chart");
+    if (!canvas) {
+        return;
+    }
+    const { cssWidth, cssHeight } = explainChartSize(canvas);
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = cssWidth * dpr;
+    canvas.height = cssHeight * dpr;
+    canvas.style.width = `${cssWidth}px`;
+    canvas.style.height = `${cssHeight}px`;
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
+    ctx.fillStyle = "rgba(255,255,255,0.02)";
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
+    const type = chart && chart.type;
+    if (type === "gex_walls" || type === "spot_walls") {
+        drawExplainGexWalls(ctx, cssWidth, cssHeight, chart);
+        return;
+    }
+    if (type === "gauge") {
+        drawExplainGauge(ctx, cssWidth, cssHeight, chart);
+        return;
+    }
+    if (type === "bar_single") {
+        drawExplainBar(ctx, cssWidth, cssHeight, chart);
+        return;
+    }
+    if (type === "dual_bar") {
+        drawExplainDualBar(ctx, cssWidth, cssHeight, chart);
+        return;
+    }
+    if (type === "legs") {
+        drawExplainLegs(ctx, cssWidth, cssHeight, chart);
+        return;
+    }
+    ctx.fillStyle = "#8b98a8";
+    ctx.font = "13px Microsoft YaHei, sans-serif";
+    ctx.fillText("无可视化数据", 16, 28);
+}
+
+function drawExplainGexWalls(ctx, width, height, chart) {
+    const pad = { top: 40, right: 20, bottom: 46, left: 68 };
+    const innerW = width - pad.left - pad.right;
+    const innerH = height - pad.top - pad.bottom;
+    const rows = (chart.strikes || []).filter((row) => Number.isFinite(Number(row.strike)));
+    if (!rows.length) {
+        ctx.fillStyle = "#8b98a8";
+        ctx.font = "13px Microsoft YaHei, sans-serif";
+        ctx.fillText("暂无行权价 GEX 数据", 16, 28);
+        return;
+    }
+    const values = rows.flatMap((row) => [Number(row.call_gex || 0), Number(row.put_gex || 0)]);
+    const maxAbs = Math.max(1e-9, ...values.map((item) => Math.abs(item)));
+    const zeroY = pad.top + innerH / 2;
+    const yOf = (gex) => zeroY - (Number(gex) / maxAbs) * (innerH * 0.5);
+    const barW = Math.max(2, (innerW / rows.length) * 0.36);
+
+    // Plot frame + zero line
+    ctx.strokeStyle = "rgba(255,255,255,0.22)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(pad.left, pad.top, innerW, innerH);
+    ctx.beginPath();
+    ctx.moveTo(pad.left, zeroY);
+    ctx.lineTo(pad.left + innerW, zeroY);
+    ctx.stroke();
+
+    // Y-axis ticks / grid / labels (GEX)
+    const yTicks = [1, 0.5, 0, -0.5, -1];
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    yTicks.forEach((ratio) => {
+        const gex = maxAbs * ratio;
+        const y = yOf(gex);
+        ctx.strokeStyle = ratio === 0 ? "rgba(255,255,255,0.28)" : "rgba(255,255,255,0.08)";
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(pad.left + innerW, y);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(pad.left - 5, y);
+        ctx.lineTo(pad.left, y);
+        ctx.strokeStyle = "rgba(255,255,255,0.35)";
+        ctx.stroke();
+        ctx.fillStyle = "#9aa8b8";
+        ctx.textAlign = "right";
+        ctx.textBaseline = "middle";
+        ctx.fillText(formatGex(gex), pad.left - 8, y);
+    });
+
+    // Bars
+    rows.forEach((row, index) => {
+        const x = pad.left + ((index + 0.5) / rows.length) * innerW;
+        const call = Number(row.call_gex || 0);
+        const put = Number(row.put_gex || 0);
+        const callTop = yOf(Math.max(0, call));
+        const putBottom = yOf(Math.min(0, put));
+        ctx.fillStyle = "rgba(255,159,67,0.85)";
+        ctx.fillRect(x - barW - 1, callTop, barW, zeroY - callTop);
+        ctx.fillStyle = "rgba(84,160,255,0.85)";
+        ctx.fillRect(x + 1, zeroY, barW, putBottom - zeroY);
+    });
+
+    // X-axis ticks / strike labels
+    const maxLabels = Math.max(4, Math.min(14, Math.floor(innerW / 52)));
+    const step = Math.max(1, Math.ceil(rows.length / maxLabels));
+    ctx.fillStyle = "#9aa8b8";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    rows.forEach((row, index) => {
+        if (index % step !== 0 && index !== rows.length - 1) {
+            return;
+        }
+        const x = pad.left + ((index + 0.5) / rows.length) * innerW;
+        ctx.strokeStyle = "rgba(255,255,255,0.28)";
+        ctx.beginPath();
+        ctx.moveTo(x, pad.top + innerH);
+        ctx.lineTo(x, pad.top + innerH + 5);
+        ctx.stroke();
+        ctx.fillStyle = "#9aa8b8";
+        ctx.fillText(String(row.strike), x, pad.top + innerH + 8);
+    });
+
+    // Axis titles
+    ctx.fillStyle = "#c5d0dc";
+    ctx.font = "12px Microsoft YaHei, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText("行权价", pad.left + innerW / 2, height - 8);
+    ctx.save();
+    ctx.translate(14, pad.top + innerH / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText("GEX", 0, 0);
+    ctx.restore();
+
+    // Legend
+    const legendY = 14;
+    ctx.fillStyle = "rgba(255,159,67,0.9)";
+    ctx.fillRect(pad.left, legendY - 7, 12, 8);
+    ctx.fillStyle = "#d7dee8";
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText("CallGEX", pad.left + 16, legendY - 3);
+    ctx.fillStyle = "rgba(84,160,255,0.9)";
+    ctx.fillRect(pad.left + 78, legendY - 7, 12, 8);
+    ctx.fillStyle = "#d7dee8";
+    ctx.fillText("PutGEX", pad.left + 94, legendY - 3);
+
+    // Wall / spot markers (drawn last)
+    const levels = [
+        { strike: chart.spot, color: "#e8edf2", label: `现价 ${chart.spot ?? "—"}`, width: 1.4, dash: true },
+        { strike: chart.call_wall, color: "#ff9f43", label: `Call墙 ${chart.call_wall ?? "—"}`, width: 1.6, dash: false },
+        { strike: chart.put_wall, color: "#54a0ff", label: `Put墙 ${chart.put_wall ?? "—"}`, width: 1.6, dash: false },
+    ];
+    levels.forEach((level, levelIndex) => {
+        const strike = Number(level.strike);
+        if (!Number.isFinite(strike)) {
+            return;
+        }
+        const x = strikeToX(strike, rows, pad.left, innerW);
+        ctx.save();
+        ctx.strokeStyle = level.color;
+        ctx.lineWidth = level.width;
+        ctx.setLineDash(level.dash ? [4, 4] : []);
+        ctx.beginPath();
+        ctx.moveTo(x, pad.top);
+        ctx.lineTo(x, pad.top + innerH);
+        ctx.stroke();
+        ctx.fillStyle = level.color;
+        ctx.font = "11px Microsoft YaHei, sans-serif";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "alphabetic";
+        const labelY = pad.top + 12 + levelIndex * 14;
+        ctx.fillText(level.label, Math.min(x + 4, width - 120), labelY);
+        ctx.restore();
+    });
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+}
+
+function drawExplainGauge(ctx, width, height, chart) {
+    const min = Number(chart.min || 0);
+    const max = Number(chart.max || 1);
+    const value = Math.min(max, Math.max(min, Number(chart.value || 0)));
+    const cx = width / 2;
+    const cy = height * 0.68;
+    const radius = Math.min(width, height) * 0.34;
+    const start = Math.PI;
+    const end = 0;
+    ctx.lineWidth = 18;
+    ctx.strokeStyle = "rgba(255,255,255,0.08)";
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, start, end);
+    ctx.stroke();
+    const ratio = max === min ? 0 : (value - min) / (max - min);
+    ctx.strokeStyle = "#54a0ff";
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, start, start + Math.PI * ratio);
+    ctx.stroke();
+    if (chart.threshold != null && Number.isFinite(Number(chart.threshold))) {
+        const th = (Number(chart.threshold) - min) / (max - min || 1);
+        const ang = start + Math.PI * Math.min(1, Math.max(0, th));
+        ctx.strokeStyle = "#ff9f43";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(cx + Math.cos(ang) * (radius - 14), cy + Math.sin(ang) * (radius - 14));
+        ctx.lineTo(cx + Math.cos(ang) * (radius + 10), cy + Math.sin(ang) * (radius + 10));
+        ctx.stroke();
+    }
+    ctx.fillStyle = "#e8edf2";
+    ctx.font = "22px Microsoft YaHei, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(String(Number(value.toFixed(4))), cx, cy - 8);
+    ctx.fillStyle = "#8b98a8";
+    ctx.font = "12px Microsoft YaHei, sans-serif";
+    ctx.fillText(chart.label || "", cx, cy + 18);
+    ctx.textAlign = "left";
+}
+
+function drawExplainBar(ctx, width, height, chart) {
+    const pad = 40;
+    const max = Math.max(Number(chart.max || 1), 1e-9);
+    const value = Number(chart.value || 0);
+    const barW = width - pad * 2;
+    const barH = 28;
+    const y = height / 2 - barH / 2;
+    ctx.fillStyle = "rgba(255,255,255,0.08)";
+    ctx.fillRect(pad, y, barW, barH);
+    ctx.fillStyle = "#1dd1a1";
+    ctx.fillRect(pad, y, barW * Math.min(1, Math.max(0, value / max)), barH);
+    ctx.fillStyle = "#e8edf2";
+    ctx.font = "14px Microsoft YaHei, sans-serif";
+    ctx.fillText(`${chart.label || ""} = ${value}`, pad, y - 12);
+}
+
+function drawExplainDualBar(ctx, width, height, chart) {
+    const items = Array.isArray(chart.items) ? chart.items : [];
+    const padX = 48;
+    const padTop = 36;
+    const max = Math.max(Number(chart.max || 1), ...items.map((item) => Number(item.value || 0)), 1e-9);
+    const barH = 30;
+    const gap = 28;
+    items.forEach((item, index) => {
+        const y = padTop + index * (barH + gap);
+        const value = Number(item.value || 0);
+        const barW = width - padX * 2;
+        ctx.fillStyle = "rgba(255,255,255,0.08)";
+        ctx.fillRect(padX, y, barW, barH);
+        ctx.fillStyle = item.color || "#54a0ff";
+        ctx.fillRect(padX, y, barW * Math.min(1, Math.max(0, value / max)), barH);
+        ctx.fillStyle = "#e8edf2";
+        ctx.font = "13px Microsoft YaHei, sans-serif";
+        ctx.fillText(`${item.label || ""} = ${value} 天`, padX, y - 8);
+    });
+    if (chart.note) {
+        ctx.fillStyle = "#8b98a8";
+        ctx.font = "12px Microsoft YaHei, sans-serif";
+        ctx.fillText(String(chart.note), padX, height - 16);
+    }
+}
+
+function drawExplainLegs(ctx, width, height, chart) {
+    const legs = (chart.legs || []).filter((item) => item && item.strike != null && item.strike !== "");
+    const pad = { top: 36, right: 20, bottom: 30, left: 40 };
+    const innerW = width - pad.left - pad.right;
+    const innerH = height - pad.top - pad.bottom;
+    if (!legs.length) {
+        ctx.fillStyle = "#8b98a8";
+        ctx.font = "13px Microsoft YaHei, sans-serif";
+        ctx.fillText("暂无腿结构", 16, 28);
+        return;
+    }
+    const strikes = legs.map((item) => Number(item.strike)).filter((item) => Number.isFinite(item));
+    if (chart.spot != null) {
+        strikes.push(Number(chart.spot));
+    }
+    const minK = Math.min(...strikes);
+    const maxK = Math.max(...strikes);
+    const xOf = (strike) => {
+        if (maxK === minK) {
+            return pad.left + innerW / 2;
+        }
+        return pad.left + ((Number(strike) - minK) / (maxK - minK)) * innerW;
+    };
+    ctx.strokeStyle = "rgba(255,255,255,0.15)";
+    ctx.beginPath();
+    ctx.moveTo(pad.left, pad.top + innerH * 0.55);
+    ctx.lineTo(pad.left + innerW, pad.top + innerH * 0.55);
+    ctx.stroke();
+    if (Number.isFinite(Number(chart.spot))) {
+        const x = xOf(chart.spot);
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = "#e8edf2";
+        ctx.beginPath();
+        ctx.moveTo(x, pad.top);
+        ctx.lineTo(x, pad.top + innerH);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = "#e8edf2";
+        ctx.font = "11px Microsoft YaHei, sans-serif";
+        ctx.fillText(`现价 ${chart.spot}`, x + 4, pad.top + 12);
+    }
+    legs.forEach((leg, index) => {
+        const x = xOf(leg.strike);
+        const color = String(leg.name || "").includes("长") ? "#1dd1a1" : "#ff9f43";
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(x, pad.top + innerH * 0.55, 7, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.font = "11px Microsoft YaHei, sans-serif";
+        ctx.fillText(`${leg.name} ${leg.strike}`, x - 24, pad.top + 28 + index * 14);
+    });
+    if (chart.credit != null) {
+        ctx.fillStyle = "#d7e6ff";
+        ctx.font = "13px Microsoft YaHei, sans-serif";
+        ctx.fillText(`净权利金 ${chart.credit}`, pad.left, height - 12);
+    }
+}
+
+function bindLiveExplainClicks(rootId) {
+    const root = $(rootId);
+    if (!root) {
+        return;
+    }
+    root.addEventListener("click", (event) => {
+        const metric = event.target.closest("[data-explain]");
+        if (!metric || !root.contains(metric)) {
+            return;
+        }
+        openLiveExplainModal(metric.dataset.explain);
+    });
+    root.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") {
+            return;
+        }
+        const metric = event.target.closest("[data-explain]");
+        if (!metric || !root.contains(metric)) {
+            return;
+        }
+        event.preventDefault();
+        openLiveExplainModal(metric.dataset.explain);
+    });
+}
+
+// Document-level delegation — survives tab swaps / late DOM updates.
+if (!window.__liveExplainDocBound) {
+    window.__liveExplainDocBound = true;
+    document.addEventListener("click", (event) => {
+        const metric = event.target.closest("[data-explain]");
+        if (!metric) {
+            return;
+        }
+        openLiveExplainModal(metric.dataset.explain);
+    });
+    document.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") {
+            return;
+        }
+        const metric = event.target.closest("[data-explain]");
+        if (!metric) {
+            return;
+        }
+        event.preventDefault();
+        openLiveExplainModal(metric.dataset.explain);
+    });
+}
+
+bindLiveExplainClicks("live-indicators");
+bindLiveExplainClicks("live-run-metrics");
+bindLiveExplainClicks("live-book");
+
+if ($("live-explain-close")) {
+    $("live-explain-close").addEventListener("click", closeLiveExplainModal);
+}
+if ($("live-explain-modal")) {
+    $("live-explain-modal").addEventListener("click", (event) => {
+        if (event.target && event.target.dataset && event.target.dataset.explainClose) {
+            closeLiveExplainModal();
+        }
+    });
+}
+document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+        closeLiveExplainModal();
+    }
+});
+window.addEventListener("resize", () => {
+    const modal = $("live-explain-modal");
+    if (!modal || modal.classList.contains("hidden") || !state.liveExplainChart) {
+        return;
+    }
+    drawLiveExplainChart(state.liveExplainChart);
+});
+
+
+let systemAutoRefresh = true;
+let systemMonitorTimer = null;
+
+function formatBytes(n) {
+    const v = Number(n);
+    if (!Number.isFinite(v) || v < 0) {
+        return "—";
+    }
+    if (v < 1024) {
+        return `${v} B`;
+    }
+    if (v < 1024 * 1024) {
+        return `${(v / 1024).toFixed(1)} KB`;
+    }
+    if (v < 1024 * 1024 * 1024) {
+        return `${(v / (1024 * 1024)).toFixed(1)} MB`;
+    }
+    return `${(v / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function sysMetricHtml(label, value, cls) {
+    return `<div class="metric${cls ? ` ${cls}` : ""}"><div class="label">${label}</div><div class="value">${value ?? "—"}</div></div>`;
+}
+
+function scheduleSystemMonitor() {
+    if (!state.token || !$("tab-system") || !$("tab-system").classList.contains("active") || !systemAutoRefresh) {
+        return;
+    }
+    if (systemMonitorTimer) {
+        return;
+    }
+    systemMonitorTimer = setTimeout(async () => {
+        systemMonitorTimer = null;
+        try {
+            await refreshSystem();
+        } catch (error) {
+            appendLog(error.message);
+        }
+        if (state.token && $("tab-system") && $("tab-system").classList.contains("active") && systemAutoRefresh) {
+            scheduleSystemMonitor();
+        }
+    }, 5000);
+}
+
+async function refreshSystem() {
+    if (!$("tab-system")) {
+        return;
+    }
+    const data = await api("/system/overview");
+    renderSystem(data);
+}
+
+function renderSystem(data) {
+    const alertsBox = $("sys-alerts");
+    const overview = $("sys-overview-metrics");
+    const processMetrics = $("sys-process-metrics");
+    const processBody = $("sys-process-body");
+    const redisMetrics = $("sys-redis-metrics");
+    const redisGroups = $("sys-redis-groups-body");
+    const qdbMetrics = $("sys-questdb-metrics");
+    const qdbTables = $("sys-questdb-tables-body");
+    const updated = $("sys-updated");
+    const hint = $("sys-hint");
+    if (!overview || !processBody) {
+        return;
+    }
+
+    const alerts = data.alerts || [];
+    if (alertsBox) {
+        if (!alerts.length) {
+            alertsBox.innerHTML = `<div class="sys-alert empty">全部正常</div>`;
+        } else {
+            alertsBox.innerHTML = alerts.map((a) => `<div class="sys-alert">${a}</div>`).join("");
+        }
+    }
+    if (hint) {
+        hint.textContent = data.ok ? "系统运行正常。" : "存在告警，请检查下方详情。";
+    }
+    if (updated) {
+        updated.textContent = `更新于 ${data.iso || "—"}`;
+    }
+
+    const processes = (data.processes && data.processes.services) || {};
+    const redis = data.redis || {};
+    const qdb = data.questdb || {};
+    const okCount = Object.values(processes).filter((s) => s && s.ok).length;
+    overview.innerHTML = [
+        sysMetricHtml("整体", data.ok ? "正常" : "告警", data.ok ? "pos" : "neg"),
+        sysMetricHtml("进程心跳", `${okCount}/3`, okCount === 3 ? "pos" : "neg"),
+        sysMetricHtml("Redis", redis.ok ? (redis.used_memory_human || "OK") : "异常", redis.ok ? "pos" : "neg"),
+        sysMetricHtml("QuestDB", qdb.ok ? `${qdb.total_disk_mb ?? "—"} MB` : "异常", qdb.ok ? "pos" : "neg"),
+        sysMetricHtml("Tick 滞后", qdb.tick_lag_sec != null ? `${qdb.tick_lag_sec}s` : "—"),
+        sysMetricHtml("Stream 长度", redis.tick_stream_len != null ? String(redis.tick_stream_len) : "—"),
+    ].join("");
+
+    processMetrics.innerHTML = Object.keys(processes).map((name) => {
+        const s = processes[name] || {};
+        return sysMetricHtml(name, s.ok ? "在线" : "离线", s.ok ? "pos" : "neg");
+    }).join("");
+
+    processBody.innerHTML = ["md_receiver", "recorder", "web"].map((name) => {
+        const s = processes[name] || {};
+        const status = s.ok
+            ? `<span class="pill-ok">正常</span>`
+            : `<span class="pill-bad">${s.error || "无心跳"}</span>`;
+        const age = s.age_sec != null ? `${s.age_sec}s` : "—";
+        let detail = "";
+        if (name === "md_receiver") {
+            detail = `sub=${s.subscribed ?? "—"} ticks=${s.tick_count ?? "—"} lag=${s.md_lag_sec ?? "—"}`;
+        } else if (name === "recorder") {
+            detail = `write=${s.write_count ?? "—"} err=${s.write_err ?? "—"} pending=${(s.md_bus && s.md_bus.pending) ?? "—"}`;
+        } else {
+            detail = `md=${s.md_source || (s.md_bus && s.md_bus.mode) || "—"} skip_md=${s.skip_md != null ? s.skip_md : "—"} rss=${s.rss_mb != null ? s.rss_mb : "—"}MB`;
+        }
+        return `<tr><td>${name}</td><td>${status}</td><td>${age}</td><td>${s.pid ?? "—"}</td><td>${detail}</td></tr>`;
+    }).join("");
+
+    if (redisMetrics) {
+        const hit = Number(redis.keyspace_hits || 0);
+        const miss = Number(redis.keyspace_misses || 0);
+        const hitRate = hit + miss > 0 ? `${((100 * hit) / (hit + miss)).toFixed(1)}%` : "—";
+        redisMetrics.innerHTML = [
+            sysMetricHtml("版本", redis.redis_version || "—"),
+            sysMetricHtml("内存", redis.used_memory_human || "—"),
+            sysMetricHtml("内存占比", redis.used_memory_pct != null ? `${redis.used_memory_pct}%` : "—",
+                redis.used_memory_pct >= 80 ? "neg" : ""),
+            sysMetricHtml("峰值", redis.used_memory_peak_human || "—"),
+            sysMetricHtml("客户端", redis.connected_clients),
+            sysMetricHtml("OPS/s", redis.instantaneous_ops_per_sec),
+            sysMetricHtml("命中率", hitRate),
+            sysMetricHtml("键数", redis.dbsize),
+            sysMetricHtml("最新Tick", redis.latest_ticks),
+            sysMetricHtml("合约缓存", redis.contracts),
+            sysMetricHtml("Stream", redis.tick_stream_len),
+        ].join("");
+    }
+    if (redisGroups) {
+        const groups = redis.stream_groups || [];
+        redisGroups.innerHTML = groups.length
+            ? groups.map((g) => {
+                if (g.error) {
+                    return `<tr><td colspan="5">${g.error}</td></tr>`;
+                }
+                return `<tr><td>${g.name || "—"}</td><td>${g.consumers ?? "—"}</td><td>${g.pending ?? "—"}</td><td>${g.lag ?? "—"}</td><td>${g.last_delivered_id || "—"}</td></tr>`;
+            }).join("")
+            : `<tr><td colspan="5">无消费组</td></tr>`;
+    }
+
+    if (qdbMetrics) {
+        qdbMetrics.innerHTML = [
+            sysMetricHtml("状态", qdb.ok ? "正常" : (qdb.error || "异常"), qdb.ok ? "pos" : "neg"),
+            sysMetricHtml("总磁盘", qdb.total_disk_mb != null ? `${qdb.total_disk_mb} MB` : "—"),
+            sysMetricHtml("总行数", qdb.total_rows),
+            sysMetricHtml("Tick 行", (qdb.tick && qdb.tick.count) ?? "—"),
+            sysMetricHtml("Tick 最新", (qdb.tick && qdb.tick.max_datetime) || "—"),
+            sysMetricHtml("Tick 滞后", qdb.tick_lag_sec != null ? `${qdb.tick_lag_sec}s` : "—"),
+            sysMetricHtml("Bar 行", (qdb.bar && qdb.bar.count) ?? "—"),
+            sysMetricHtml("Bar 最新", (qdb.bar && qdb.bar.max_datetime) || "—"),
+        ].join("");
+    }
+    if (qdbTables) {
+        const tables = (qdb.tables || []).slice().sort((a, b) => (b.disk_bytes || 0) - (a.disk_bytes || 0));
+        const prefer = tables.filter((t) => {
+            const n = String(t.table || "").toLowerCase();
+            return n.startsWith("db");
+        });
+        const show = prefer.length ? prefer : tables.slice(0, 20);
+        qdbTables.innerHTML = show.length
+            ? show.map((t) => `<tr><td>${t.table || "—"}</td><td>${t.row_count ?? "—"}</td><td>${t.disk_mb != null ? `${t.disk_mb} MB` : formatBytes(t.disk_bytes)}</td><td>${t.partitions ?? "—"}</td><td>${t.wal ?? "—"}</td></tr>`).join("")
+            : `<tr><td colspan="5">${qdb.error || "无表信息"}</td></tr>`;
+    }
+}
+
+if ($("sys-refresh")) {
+    $("sys-refresh").addEventListener("click", () => {
+        refreshSystem().catch((error) => appendLog(error.message));
+    });
+}
+if ($("sys-auto")) {
+    $("sys-auto").addEventListener("click", () => {
+        systemAutoRefresh = !systemAutoRefresh;
+        $("sys-auto").textContent = `自动刷新: ${systemAutoRefresh ? "开" : "关"}`;
+        if (systemAutoRefresh) {
+            scheduleSystemMonitor();
+        }
+    });
 }

@@ -599,47 +599,78 @@ $("logout-btn").addEventListener("click", () => {
     location.reload();
 });
 
+function activateTab(tabName) {
+    const name = String(tabName || "").trim();
+    if (!name) {
+        return;
+    }
+    const panel = $(`tab-${name}`);
+    const button = document.querySelector(`.tab[data-tab="${name}"]`);
+    if (!panel || !button) {
+        appendLog(`找不到页面：${name}`);
+        return;
+    }
+    document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach((item) => item.classList.remove("active"));
+    button.classList.add("active");
+    panel.classList.add("active");
+    try {
+        if (location.hash !== `#${name}`) {
+            history.replaceState(null, "", `#${name}`);
+        }
+    } catch (error) {
+        // ignore
+    }
+    if (name === "option") {
+        startOptionPoll();
+        if (lastOptionChain) {
+            renderGexChart(lastOptionChain.gex || {});
+            renderTvYieldChart(lastOptionChain);
+            renderIvSmileChart(lastOptionChain);
+        }
+        refreshOptionChain().catch((error) => appendLog(error.message));
+    }
+    if (name === "futures" && state.futuresCurve) {
+        renderFuturesCharts(state.futuresCurve);
+        renderFuturesCapitalCharts(state.futuresCurve);
+    }
+    if (name === "live") {
+        scheduleLiveMonitor();
+        refreshLive().catch((error) => appendLog(error.message));
+    }
+    if (name === "script") {
+        scheduleScriptMonitor();
+        refreshScriptBacktest().then(() => {
+            if (state.scriptBacktest && state.scriptBacktest.running) {
+                scheduleScriptBtPoll();
+            }
+        }).catch((error) => appendLog(error.message));
+    }
+    if (name === "data") {
+        refreshRecorder();
+        refreshData();
+    }
+    if (name === "system") {
+        scheduleSystemMonitor();
+        refreshSystem().catch((error) => appendLog(error.message));
+    }
+}
+
 document.querySelectorAll(".tab").forEach((button) => {
     button.addEventListener("click", () => {
-        document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
-        document.querySelectorAll(".tab-panel").forEach((item) => item.classList.remove("active"));
-        button.classList.add("active");
-        $(`tab-${button.dataset.tab}`).classList.add("active");
-        if (button.dataset.tab === "option") {
-            startOptionPoll();
-            if (lastOptionChain) {
-                renderGexChart(lastOptionChain.gex || {});
-                renderTvYieldChart(lastOptionChain);
-                renderIvSmileChart(lastOptionChain);
-            }
-            refreshOptionChain().catch((error) => appendLog(error.message));
-        }
-        if (button.dataset.tab === "futures" && state.futuresCurve) {
-            renderFuturesCharts(state.futuresCurve);
-            renderFuturesCapitalCharts(state.futuresCurve);
-        }
-        if (button.dataset.tab === "live") {
-            scheduleLiveMonitor();
-            refreshLive().catch((error) => appendLog(error.message));
-        }
-        if (button.dataset.tab === "script") {
-            scheduleScriptMonitor();
-            refreshScriptBacktest().then(() => {
-                if (state.scriptBacktest && state.scriptBacktest.running) {
-                    scheduleScriptBtPoll();
-                }
-            }).catch((error) => appendLog(error.message));
-        }
-        if (button.dataset.tab === "data") {
-            refreshRecorder();
-            refreshData();
-        }
-        if (button.dataset.tab === "system") {
-            scheduleSystemMonitor();
-            refreshSystem().catch((error) => appendLog(error.message));
-        }
+        activateTab(button.dataset.tab);
     });
 });
+
+window.addEventListener("hashchange", () => {
+    const name = (location.hash || "").replace(/^#/, "");
+    if (name) {
+        activateTab(name);
+    }
+});
+if ((location.hash || "").replace(/^#/, "")) {
+    activateTab(location.hash.replace(/^#/, ""));
+}
 
 $("connect-btn").addEventListener("click", async () => {
     const setting = {};

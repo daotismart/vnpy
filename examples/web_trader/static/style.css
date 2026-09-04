@@ -536,11 +536,13 @@ tr.pin td:nth-child(7) {
 .metric.clickable {
     cursor: pointer;
     transition: border-color 0.15s ease, transform 0.15s ease;
+    border-color: color-mix(in srgb, #54a0ff 45%, var(--line));
 }
 
 .metric.clickable:hover {
     border-color: #54a0ff;
     transform: translateY(-1px);
+    box-shadow: 0 0 0 1px rgba(84, 160, 255, 0.25);
 }
 
 .metric.clickable .label::after {

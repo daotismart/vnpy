@@ -632,6 +632,10 @@ document.querySelectorAll(".tab").forEach((button) => {
             refreshRecorder();
             refreshData();
         }
+        if (button.dataset.tab === "system") {
+            scheduleSystemMonitor();
+            refreshSystem().catch((error) => appendLog(error.message));
+        }
     });
 });
 
@@ -2374,8 +2378,9 @@ function renderLiveStatus(status, monitor) {
     const active = Boolean((status && status.script_active) || (monitor && (monitor.engine_active || monitor.active)));
     const items = [
         { text: supervisor.enabled ? (supervisor.paused ? "守护暂停" : "守护运行") : "守护关闭", cls: supervisor.enabled ? (supervisor.paused ? "warn" : "on") : "off" },
-        { text: supervisor.ctp_ok || status.gateway_connected ? "CTP已连" : "CTP未连", cls: supervisor.ctp_ok || status.gateway_connected ? "on" : "off" },
-        { text: supervisor.session_open ? "交易时段" : "非交易时段", cls: supervisor.session_open ? "on" : "warn" },
+        { text: supervisor.ctp_ok || status.gateway_connected ? "CTP已连" : (supervisor.connecting ? "CTP连接中" : "CTP未连"), cls: supervisor.ctp_ok || status.gateway_connected ? "on" : "off" },
+        { text: supervisor.md_active ? "连续竞价" : (supervisor.session_open ? "登录窗口" : "非交易时段"), cls: supervisor.md_active ? "on" : (supervisor.session_open ? "warn" : "off") },
+        { text: supervisor.redis_md ? "行情Redis" : "行情CTP", cls: "on" },
         { text: active ? "策略运行" : "策略停止", cls: active ? "on" : "off" },
         { text: (monitor && monitor.dry_run) ? "DRY RUN" : "实盘", cls: (monitor && monitor.dry_run) ? "warn" : "on" },
     ];
@@ -3868,4 +3873,192 @@ if (state.token) {
     });
 } else {
     fillScriptFileSelect([]);
+}
+
+let systemAutoRefresh = true;
+let systemMonitorTimer = null;
+
+function formatBytes(n) {
+    const v = Number(n);
+    if (!Number.isFinite(v) || v < 0) {
+        return "—";
+    }
+    if (v < 1024) {
+        return `${v} B`;
+    }
+    if (v < 1024 * 1024) {
+        return `${(v / 1024).toFixed(1)} KB`;
+    }
+    if (v < 1024 * 1024 * 1024) {
+        return `${(v / (1024 * 1024)).toFixed(1)} MB`;
+    }
+    return `${(v / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function metricHtml(label, value, cls) {
+    return `<div class="metric${cls ? ` ${cls}` : ""}"><div class="label">${label}</div><div class="value">${value ?? "—"}</div></div>`;
+}
+
+function scheduleSystemMonitor() {
+    if (!state.token || !$("tab-system") || !$("tab-system").classList.contains("active") || !systemAutoRefresh) {
+        return;
+    }
+    if (systemMonitorTimer) {
+        return;
+    }
+    systemMonitorTimer = setTimeout(async () => {
+        systemMonitorTimer = null;
+        try {
+            await refreshSystem();
+        } catch (error) {
+            appendLog(error.message);
+        }
+        if (state.token && $("tab-system") && $("tab-system").classList.contains("active") && systemAutoRefresh) {
+            scheduleSystemMonitor();
+        }
+    }, 5000);
+}
+
+async function refreshSystem() {
+    if (!$("tab-system")) {
+        return;
+    }
+    const data = await api("/system/overview");
+    renderSystem(data);
+}
+
+function renderSystem(data) {
+    const alertsBox = $("sys-alerts");
+    const overview = $("sys-overview-metrics");
+    const processMetrics = $("sys-process-metrics");
+    const processBody = $("sys-process-body");
+    const redisMetrics = $("sys-redis-metrics");
+    const redisGroups = $("sys-redis-groups-body");
+    const qdbMetrics = $("sys-questdb-metrics");
+    const qdbTables = $("sys-questdb-tables-body");
+    const updated = $("sys-updated");
+    const hint = $("sys-hint");
+    if (!overview || !processBody) {
+        return;
+    }
+
+    const alerts = data.alerts || [];
+    if (alertsBox) {
+        if (!alerts.length) {
+            alertsBox.innerHTML = `<div class="sys-alert empty">全部正常</div>`;
+        } else {
+            alertsBox.innerHTML = alerts.map((a) => `<div class="sys-alert">${a}</div>`).join("");
+        }
+    }
+    if (hint) {
+        hint.textContent = data.ok ? "系统运行正常。" : "存在告警，请检查下方详情。";
+    }
+    if (updated) {
+        updated.textContent = `更新于 ${data.iso || "—"}`;
+    }
+
+    const processes = (data.processes && data.processes.services) || {};
+    const redis = data.redis || {};
+    const qdb = data.questdb || {};
+    const okCount = Object.values(processes).filter((s) => s && s.ok).length;
+    overview.innerHTML = [
+        metricHtml("整体", data.ok ? "正常" : "告警", data.ok ? "pos" : "neg"),
+        metricHtml("进程心跳", `${okCount}/3`, okCount === 3 ? "pos" : "neg"),
+        metricHtml("Redis", redis.ok ? (redis.used_memory_human || "OK") : "异常", redis.ok ? "pos" : "neg"),
+        metricHtml("QuestDB", qdb.ok ? `${qdb.total_disk_mb ?? "—"} MB` : "异常", qdb.ok ? "pos" : "neg"),
+        metricHtml("Tick 滞后", qdb.tick_lag_sec != null ? `${qdb.tick_lag_sec}s` : "—"),
+        metricHtml("Stream 长度", redis.tick_stream_len != null ? String(redis.tick_stream_len) : "—"),
+    ].join("");
+
+    processMetrics.innerHTML = Object.keys(processes).map((name) => {
+        const s = processes[name] || {};
+        return metricHtml(name, s.ok ? "在线" : "离线", s.ok ? "pos" : "neg");
+    }).join("");
+
+    processBody.innerHTML = ["md_receiver", "recorder", "web"].map((name) => {
+        const s = processes[name] || {};
+        const status = s.ok
+            ? `<span class="pill-ok">正常</span>`
+            : `<span class="pill-bad">${s.error || "无心跳"}</span>`;
+        const age = s.age_sec != null ? `${s.age_sec}s` : "—";
+        let detail = "";
+        if (name === "md_receiver") {
+            detail = `sub=${s.subscribed ?? "—"} ticks=${s.tick_count ?? "—"} lag=${s.md_lag_sec ?? "—"}`;
+        } else if (name === "recorder") {
+            detail = `write=${s.write_count ?? "—"} err=${s.write_err ?? "—"} pending=${(s.md_bus && s.md_bus.pending) ?? "—"}`;
+        } else {
+            detail = `md=${s.md_source || (s.md_bus && s.md_bus.mode) || "—"} skip_md=${s.skip_md != null ? s.skip_md : "—"} rss=${s.rss_mb != null ? s.rss_mb : "—"}MB`;
+        }
+        return `<tr><td>${name}</td><td>${status}</td><td>${age}</td><td>${s.pid ?? "—"}</td><td>${detail}</td></tr>`;
+    }).join("");
+
+    if (redisMetrics) {
+        const hit = Number(redis.keyspace_hits || 0);
+        const miss = Number(redis.keyspace_misses || 0);
+        const hitRate = hit + miss > 0 ? `${((100 * hit) / (hit + miss)).toFixed(1)}%` : "—";
+        redisMetrics.innerHTML = [
+            metricHtml("版本", redis.redis_version || "—"),
+            metricHtml("内存", redis.used_memory_human || "—"),
+            metricHtml("内存占比", redis.used_memory_pct != null ? `${redis.used_memory_pct}%` : "—",
+                redis.used_memory_pct >= 80 ? "neg" : ""),
+            metricHtml("峰值", redis.used_memory_peak_human || "—"),
+            metricHtml("客户端", redis.connected_clients),
+            metricHtml("OPS/s", redis.instantaneous_ops_per_sec),
+            metricHtml("命中率", hitRate),
+            metricHtml("键数", redis.dbsize),
+            metricHtml("最新Tick", redis.latest_ticks),
+            metricHtml("合约缓存", redis.contracts),
+            metricHtml("Stream", redis.tick_stream_len),
+        ].join("");
+    }
+    if (redisGroups) {
+        const groups = redis.stream_groups || [];
+        redisGroups.innerHTML = groups.length
+            ? groups.map((g) => {
+                if (g.error) {
+                    return `<tr><td colspan="5">${g.error}</td></tr>`;
+                }
+                return `<tr><td>${g.name || "—"}</td><td>${g.consumers ?? "—"}</td><td>${g.pending ?? "—"}</td><td>${g.lag ?? "—"}</td><td>${g.last_delivered_id || "—"}</td></tr>`;
+            }).join("")
+            : `<tr><td colspan="5">无消费组</td></tr>`;
+    }
+
+    if (qdbMetrics) {
+        qdbMetrics.innerHTML = [
+            metricHtml("状态", qdb.ok ? "正常" : (qdb.error || "异常"), qdb.ok ? "pos" : "neg"),
+            metricHtml("总磁盘", qdb.total_disk_mb != null ? `${qdb.total_disk_mb} MB` : "—"),
+            metricHtml("总行数", qdb.total_rows),
+            metricHtml("Tick 行", (qdb.tick && qdb.tick.count) ?? "—"),
+            metricHtml("Tick 最新", (qdb.tick && qdb.tick.max_datetime) || "—"),
+            metricHtml("Tick 滞后", qdb.tick_lag_sec != null ? `${qdb.tick_lag_sec}s` : "—"),
+            metricHtml("Bar 行", (qdb.bar && qdb.bar.count) ?? "—"),
+            metricHtml("Bar 最新", (qdb.bar && qdb.bar.max_datetime) || "—"),
+        ].join("");
+    }
+    if (qdbTables) {
+        const tables = (qdb.tables || []).slice().sort((a, b) => (b.disk_bytes || 0) - (a.disk_bytes || 0));
+        const prefer = tables.filter((t) => {
+            const n = String(t.table || "").toLowerCase();
+            return n.startsWith("db");
+        });
+        const show = prefer.length ? prefer : tables.slice(0, 20);
+        qdbTables.innerHTML = show.length
+            ? show.map((t) => `<tr><td>${t.table || "—"}</td><td>${t.row_count ?? "—"}</td><td>${t.disk_mb != null ? `${t.disk_mb} MB` : formatBytes(t.disk_bytes)}</td><td>${t.partitions ?? "—"}</td><td>${t.wal ?? "—"}</td></tr>`).join("")
+            : `<tr><td colspan="5">${qdb.error || "无表信息"}</td></tr>`;
+    }
+}
+
+if ($("sys-refresh")) {
+    $("sys-refresh").addEventListener("click", () => {
+        refreshSystem().catch((error) => appendLog(error.message));
+    });
+}
+if ($("sys-auto")) {
+    $("sys-auto").addEventListener("click", () => {
+        systemAutoRefresh = !systemAutoRefresh;
+        $("sys-auto").textContent = `自动刷新: ${systemAutoRefresh ? "开" : "关"}`;
+        if (systemAutoRefresh) {
+            scheduleSystemMonitor();
+        }
+    });
 }

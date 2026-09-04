@@ -62,6 +62,15 @@ from vnpy.trader.object import (
 )
 from vnpy.trader.database import get_database
 from vnpy.trader.utility import get_file_path, get_folder_path, load_json, save_json
+
+
+def safe_load_json(filename: str) -> dict[str, Any]:
+    """Load JSON status/config without crashing on empty or partial writes."""
+    try:
+        data = load_json(filename)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 from vnpy_ctabacktester.engine import (
     EVENT_BACKTESTER_BACKTESTING_FINISHED,
     EVENT_BACKTESTER_LOG,
@@ -160,13 +169,13 @@ def load_web_setting() -> None:
 def attach_runtime(
     attached_main: MainEngine,
     attached_event: EventEngine,
-    attached_cta: CtaEngine,
-    attached_backtester: BacktesterEngine,
-    attached_data: ManagerEngine,
+    attached_cta: CtaEngine | None,
+    attached_backtester: BacktesterEngine | None,
+    attached_data: ManagerEngine | None,
     attached_recorder: RecorderEngine,
     attached_option: OptionEngine,
-    attached_spread: SpreadEngine,
-    attached_script: ScriptEngine,
+    attached_spread: SpreadEngine | None,
+    attached_script: ScriptEngine | None,
 ) -> None:
     global main_engine, event_engine, cta_engine, backtester_engine, data_engine
     global recorder_engine, option_engine, spread_engine, script_engine
@@ -1163,12 +1172,26 @@ def mask_setting(setting: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_saved_gateway_setting(gateway_name: str) -> dict[str, Any]:
-    filename = CONNECT_FILE_MAP.get(gateway_name, f"connect_{gateway_name.lower()}.json")
-    filepath = get_file_path(filename)
-    if not filepath.exists():
-        return {}
-    data = load_json(filename)
-    return data if isinstance(data, dict) else {}
+    """Load CTP/gateway connect JSON.
+
+    STANDALONE_RECORDER may prefer connect_ctp_recorder.json (second MD account)
+    to avoid kicking the web trader session on the same investor id.
+    """
+    override = (os.getenv("CTP_CONNECT_FILE") or "").strip()
+    if override:
+        candidates = [override]
+    elif gateway_name.upper() == "CTP" and env_flag("STANDALONE_RECORDER"):
+        candidates = ["connect_ctp_recorder.json", "connect_ctp.json"]
+    else:
+        candidates = [CONNECT_FILE_MAP.get(gateway_name, f"connect_{gateway_name.lower()}.json")]
+    for filename in candidates:
+        filepath = get_file_path(filename)
+        if not filepath.exists():
+            continue
+        data = load_json(filename)
+        if isinstance(data, dict) and data:
+            return data
+    return {}
 
 
 def save_gateway_setting(gateway_name: str, setting: dict[str, Any]) -> None:
@@ -1317,6 +1340,25 @@ async def on_startup() -> None:
     global event_loop
     event_loop = asyncio.get_running_loop()
     register_events()
+
+    def _web_heartbeat_loop() -> None:
+        while True:
+            try:
+                from system_monitor import write_service_heartbeat
+
+                write_service_heartbeat(
+                    "web",
+                    {
+                        "role": "web",
+                        "md_source": (os.getenv("LIVE_MD_SOURCE") or "ctp").lower(),
+                        "skip_md": os.getenv("LIVE_CTP_SKIP_MD", "0"),
+                    },
+                )
+            except Exception:
+                pass
+            time.sleep(10)
+
+    threading.Thread(target=_web_heartbeat_loop, name="web-sys-heartbeat", daemon=True).start()
 
 
 @app.get("/health")
@@ -2403,10 +2445,71 @@ def record_max_chains_from_env() -> int:
     return env_int("LIVE_RECORD_MAX_CHAINS", 0)
 
 
+def record_filter_window_from_env() -> int:
+    """Seconds of allowed |tick.datetime - now| before DataRecorder drops ticks.
+
+    Default 3600: CTP MD can lag under full-chain subscribe load; the stock
+    recorder default of 60s silently discards everything once lag exceeds 1m.
+    """
+    return max(60, env_int("LIVE_RECORD_FILTER_WINDOW", 3600))
+
+
+def md_max_lag_from_env() -> int:
+    """Force CTP reconnect when newest IF/IO tick lags wall clock by this many seconds."""
+    return max(60, env_int("LIVE_MD_MAX_LAG_SEC", 90))
+
+
 def record_scope_label(max_chains: int) -> str:
     if max_chains is None or max_chains <= 0:
         return "全部到期月"
     return f"近{max_chains}个到期月"
+
+
+def apply_recorder_filter_window(window: int | None = None) -> int:
+    """Keep DataRecorder filter aligned with LIVE_RECORD_FILTER_WINDOW."""
+    engine = require_recorder()
+    value = record_filter_window_from_env() if window is None else max(60, int(window))
+    engine.filter_window = value
+    engine.filter_delta = timedelta(seconds=value)
+    # Refresh baseline so a long lag after restart does not keep rejecting ticks
+    # until the next EVENT_TIMER arrives.
+    try:
+        from vnpy.trader.database import DB_TZ
+
+        engine.filter_dt = datetime.now(DB_TZ)
+    except Exception:
+        engine.filter_dt = datetime.now()
+    return value
+
+
+def newest_io_if_tick() -> Any | None:
+    """Newest in-memory tick among IF/IO symbols (for lag diagnostics)."""
+    if main_engine is None:
+        return None
+    newest = None
+    for tick in main_engine.get_all_ticks() or []:
+        symbol = (getattr(tick, "symbol", "") or "").upper()
+        if not (symbol.startswith("IF") or symbol.startswith("IO")):
+            continue
+        dt = getattr(tick, "datetime", None)
+        if dt is None:
+            continue
+        if newest is None or dt > getattr(newest, "datetime", dt):
+            newest = tick
+    return newest
+
+
+def market_data_lag_sec() -> float | None:
+    tick = newest_io_if_tick()
+    if tick is None or getattr(tick, "datetime", None) is None:
+        return None
+    dt = tick.datetime
+    now = datetime.now(dt.tzinfo) if getattr(dt, "tzinfo", None) else datetime.now()
+    lag = (now - dt).total_seconds()
+    # Cached / overnight Redis warmup ticks are not live MD.
+    if lag > 3600:
+        return None
+    return lag
 
 
 def portfolio_tick_universe(portfolio_name: str, max_chains: int | None = None) -> list[str]:
@@ -2444,16 +2547,18 @@ def ensure_tick_recording_universe(
     names = portfolios or live_portfolios_from_env()
     chain_limit = record_max_chains_from_env() if max_chains is None else max_chains
     record_bar = env_flag("LIVE_RECORD_BAR", True) if bar is None else bar
+    filter_window = apply_recorder_filter_window()
     symbols: list[str] = []
     by_portfolio: dict[str, int] = {}
     for name in names:
         items = portfolio_tick_universe(name, chain_limit)
         by_portfolio[name] = len(items)
         symbols.extend(items)
-    result = add_recordings(symbols, tick=tick, bar=record_bar)
+    result = sync_recorder_universe(symbols, tick=tick, bar=record_bar)
     result["portfolios"] = names
     result["max_chains"] = chain_limit
     result["record_bar"] = record_bar
+    result["filter_window"] = filter_window
     result["universe_size"] = len(symbols)
     result["by_portfolio"] = by_portfolio
     kinds = []
@@ -2465,13 +2570,23 @@ def ensure_tick_recording_universe(
     result["message"] = (
         f"已订阅录制 {kind_text} 合约池：目标 {len(symbols)}，"
         f"新增 {len(result['added'])}，已在列表 {len(result['skipped'])}，"
-        f"未找到 {len(result['missing'])}（{record_scope_label(chain_limit)}）"
+        f"未找到 {len(result['missing'])}（{record_scope_label(chain_limit)}，"
+        f"过滤窗{filter_window}s）"
     )
     return result
 
 
 def recorder_status() -> dict[str, Any]:
     engine = require_recorder()
+    lag = market_data_lag_sec()
+    newest = newest_io_if_tick()
+    bus: dict[str, Any] = {}
+    try:
+        from md_bus import md_bus_status
+
+        bus = md_bus_status()
+    except Exception:
+        bus = {"enabled": False}
     return {
         "tick": sorted(engine.tick_recordings.keys()),
         "bar": sorted(engine.bar_recordings.keys()),
@@ -2483,6 +2598,18 @@ def recorder_status() -> dict[str, Any]:
         "max_chains": record_max_chains_from_env(),
         "scope": record_scope_label(record_max_chains_from_env()),
         "portfolios": live_portfolios_from_env(),
+        "filter_window": int(getattr(engine, "filter_window", record_filter_window_from_env())),
+        "md_lag_sec": None if lag is None else round(float(lag), 1),
+        "md_max_lag_sec": md_max_lag_from_env(),
+        "md_source": (os.getenv("LIVE_MD_SOURCE") or "ctp").strip().lower(),
+        "md_bus": bus,
+        "newest_tick": None
+        if newest is None
+        else {
+            "vt_symbol": getattr(newest, "vt_symbol", ""),
+            "datetime": str(getattr(newest, "datetime", "")),
+            "last_price": getattr(newest, "last_price", None),
+        },
     }
 
 
@@ -2536,6 +2663,44 @@ def option_chain_record_symbols(portfolio_name: str, chain_symbol: str) -> list[
 @app.get("/recorder")
 def get_recorder(_: bool = Depends(get_access)) -> dict[str, Any]:
     return recorder_status()
+
+
+@app.get("/md_bus")
+def get_md_bus(_: bool = Depends(get_access)) -> dict[str, Any]:
+    try:
+        from md_bus import md_bus_status
+
+        return md_bus_status()
+    except Exception as exc:
+        return {"enabled": False, "error": str(exc)}
+
+
+@app.get("/system/overview")
+def get_system_overview(_: bool = Depends(get_access)) -> dict[str, Any]:
+    from system_monitor import collect_system_overview
+
+    return collect_system_overview()
+
+
+@app.get("/system/processes")
+def get_system_processes(_: bool = Depends(get_access)) -> dict[str, Any]:
+    from system_monitor import collect_process_status
+
+    return collect_process_status()
+
+
+@app.get("/system/redis")
+def get_system_redis(_: bool = Depends(get_access)) -> dict[str, Any]:
+    from system_monitor import collect_redis_status
+
+    return collect_redis_status()
+
+
+@app.get("/system/questdb")
+def get_system_questdb(_: bool = Depends(get_access)) -> dict[str, Any]:
+    from system_monitor import collect_questdb_status
+
+    return collect_questdb_status()
 
 
 class RecorderAddModel(BaseModel):
@@ -2720,6 +2885,17 @@ def ensure_option_portfolio(portfolio_name: str) -> tuple[bool, str]:
     live_map = build_live_chain_map(engine, portfolio_name)
     if not live_map:
         return False, "尚未加载到期权合约"
+    # Optionally keep only nearest N chains subscribed (MD load control).
+    # 0 / negative = all chains. Falls back to LIVE_RECORD_MAX_CHAINS when unset.
+    raw_sub = os.getenv("LIVE_SUBSCRIBE_MAX_CHAINS")
+    if raw_sub is None or str(raw_sub).strip() == "":
+        sub_limit = record_max_chains_from_env()
+    else:
+        sub_limit = env_int("LIVE_SUBSCRIBE_MAX_CHAINS", 0)
+    if sub_limit > 0:
+        ranked = sorted(live_map.keys(), key=lambda sym: chain_record_sort_key(sym))
+        keep = set(ranked[:sub_limit])
+        live_map = {k: v for k, v in live_map.items() if k in keep}
     saved = engine.get_portfolio_setting(portfolio_name)
     apply_option_portfolio_setting(
         engine,
@@ -2735,20 +2911,43 @@ def ensure_option_portfolio(portfolio_name: str) -> tuple[bool, str]:
     except AttributeError:
         pass
     portfolio = engine.get_portfolio(portfolio_name)
+    # When MD comes from Redis bus, do not subscribe again via CTP MD.
+    subscribe_md = not (
+        env_flag("LIVE_CTP_SKIP_MD")
+        or (os.getenv("LIVE_MD_SOURCE") or "").strip().lower() in {"redis", "bus", "md_bus"}
+    )
     for underlying in (portfolio.underlyings or {}).values():
         engine.instruments[underlying.vt_symbol] = underlying
-        if getattr(underlying.exchange, "value", "") != "LOCAL":
+        if subscribe_md and getattr(underlying.exchange, "value", "") != "LOCAL":
             engine.subscribe_data(underlying.vt_symbol)
     for option in (portfolio.options or {}).values():
         if not getattr(option, "underlying", None):
             continue
         engine.instruments[option.vt_symbol] = option
-        engine.subscribe_data(option.vt_symbol)
+        if subscribe_md:
+            engine.subscribe_data(option.vt_symbol)
     try:
         portfolio.calculate_pos_greeks()
     except Exception:
         pass
-    return True, f"已初始化组合 {portfolio_name}，期权链 {len(live_map)} 条"
+    suffix = "（行情=Redis）" if not subscribe_md else ""
+    return True, f"已初始化组合 {portfolio_name}，期权链 {len(live_map)} 条{suffix}"
+
+
+
+def sync_recorder_universe(vt_symbols: list[str], tick: bool, bar: bool) -> dict[str, Any]:
+    """Replace recorder lists with the target universe (drop stale symbols)."""
+    engine = require_recorder()
+    wanted = {s.strip() for s in vt_symbols if s and s.strip()}
+    if tick:
+        for symbol in list(engine.tick_recordings.keys()):
+            if symbol not in wanted:
+                engine.remove_tick_recording(symbol)
+    if bar:
+        for symbol in list(engine.bar_recordings.keys()):
+            if symbol not in wanted:
+                engine.remove_bar_recording(symbol)
+    return add_recordings(sorted(wanted), tick=tick, bar=bar)
 
 
 class LiveSupervisor:
@@ -2773,6 +2972,10 @@ class LiveSupervisor:
         self.connecting = False
         self.paused = False
         self.auto_start_script = True
+        self.last_md_check = 0.0
+        self.last_md_reconnect = 0.0
+        self.last_record_refresh = 0.0
+        self.td_released = False
 
     def start(self) -> None:
         os.environ.setdefault("LIVE_PORTFOLIOS", ",".join(self.portfolios))
@@ -2784,10 +2987,17 @@ class LiveSupervisor:
             kinds = ["Tick"]
             if self.record_bar:
                 kinds.append("K线")
-            parts.append(f"{'+'.join(kinds)}录制{record_scope_label(self.max_chains)}")
+            parts.append(
+                f"{'+'.join(kinds)}录制{record_scope_label(self.max_chains)}"
+                f"/过滤{record_filter_window_from_env()}s"
+            )
         if self.run_script or self.auto_start_script:
             parts.append(f"脚本={self.script_name}")
         self.log("实盘守护已启动 " + " ".join(parts))
+        try:
+            apply_recorder_filter_window()
+        except Exception:
+            pass
 
     def pause(self, paused: bool = True) -> None:
         self.paused = bool(paused)
@@ -2832,6 +3042,10 @@ class LiveSupervisor:
         )
 
     def status(self) -> dict[str, Any]:
+        lag = market_data_lag_sec()
+        redis_md = env_flag("LIVE_CTP_SKIP_MD") or (
+            (os.getenv("LIVE_MD_SOURCE") or "").strip().lower() in {"redis", "bus", "md_bus"}
+        )
         return {
             "enabled": True,
             "paused": self.paused,
@@ -2842,9 +3056,14 @@ class LiveSupervisor:
             "script": self.script_name,
             "auto_start_script": self.auto_start_script,
             "session_open": self.cffex_session_open(),
+            "md_active": self.cffex_md_active(),
+            "redis_md": redis_md,
             "connect_failures": self.connect_failures,
             "inited": sorted(self.inited),
             "next_connect_in": max(0.0, self.next_connect - time.time()),
+            "md_lag_sec": None if lag is None else round(float(lag), 1),
+            "md_max_lag_sec": md_max_lag_from_env(),
+            "record_filter_window": record_filter_window_from_env(),
         }
 
     def log(self, msg: str) -> None:
@@ -2874,6 +3093,10 @@ class LiveSupervisor:
             return
         if not self.ensure_ctp():
             return
+        if not self.ensure_market_data_fresh():
+            return
+        if self.record_ticks:
+            self.ensure_recorder_alive()
         if not self.contracts_ready():
             self.log("等待 IO 期权合约查询完成")
             return
@@ -2895,12 +3118,124 @@ class LiveSupervisor:
                 )
                 self.recorded.add(name)
                 self.log(result["message"])
+        self.maybe_release_td()
+        # Periodic re-apply filter window + refresh universe (covers setting wipe / new strikes)
+        now = time.time()
+        if self.record_ticks and now - self.last_record_refresh > 300:
+            self.last_record_refresh = now
+            try:
+                apply_recorder_filter_window()
+                for name in self.portfolios:
+                    if name in self.inited:
+                        ensure_tick_recording_universe(
+                            portfolios=[name],
+                            max_chains=self.max_chains,
+                            tick=True,
+                            bar=self.record_bar,
+                        )
+            except Exception:
+                self.log("周期性刷新录制池失败\n" + traceback.format_exc())
         if self.auto_start_script and self.run_script:
             self.ensure_script()
 
+    def ensure_recorder_alive(self) -> None:
+        """Restart DataRecorder writer thread if it died after a DB/write exception."""
+        try:
+            engine = require_recorder()
+        except Exception:
+            return
+        thread = getattr(engine, "thread", None)
+        if engine.active and thread is not None and thread.is_alive():
+            return
+        self.log("录制线程已停止，正在重启 DataRecorder 写入线程")
+        try:
+            try:
+                while not engine.queue.empty():
+                    engine.queue.get_nowait()
+            except Exception:
+                pass
+            engine.active = False
+            if thread is not None and thread.is_alive():
+                try:
+                    thread.join(timeout=1.0)
+                except Exception:
+                    pass
+            engine.thread = threading.Thread(target=engine.run)
+            engine.start()
+            try:
+                apply_recorder_filter_window()
+            except Exception:
+                pass
+            self.log(
+                f"录制线程已重启 active={engine.active} pending={engine.queue.qsize()}"
+            )
+        except Exception:
+            self.log("重启录制线程失败\n" + traceback.format_exc())
+
+    def force_gateway_reconnect(self, reason: str) -> None:
+        """Close then reconnect gateway — soft connect() alone often leaves MD frozen."""
+        assert main_engine is not None
+        setting = load_saved_gateway_setting(self.gateway)
+        if not setting:
+            self.log(f"{reason}，但缺少 {self.gateway} 配置，无法重连")
+            self.next_connect = time.time() + 60.0
+            return
+        self.log(reason)
+        gateway = main_engine.gateways.get(self.gateway)
+        if gateway is not None:
+            try:
+                gateway.close()
+            except Exception:
+                self.log(f"关闭 {self.gateway} 失败\n" + traceback.format_exc())
+        main_engine.connect(setting, self.gateway)
+        self.connecting = True
+        self.ctp_ok = False
+        self.inited.clear()
+        self.recorded.clear()
+        self.connect_failures += 1
+        self.next_connect = time.time() + self.connect_backoff_sec()
+
+    def ensure_market_data_fresh(self) -> bool:
+        """Reconnect CTP when IF/IO tick timestamps fall far behind wall clock.
+
+        Redis-MD / SKIP_MD live process must NOT thrash the local TD gateway —
+        MD is owned by md_receiver. We only gate strategy startup on lag.
+        """
+        assert main_engine is not None
+        if not self.cffex_md_active():
+            return True
+        now = time.time()
+        if now - self.last_md_check < 20:
+            return True
+        self.last_md_check = now
+        lag = market_data_lag_sec()
+        if lag is None:
+            # Connected but no ticks yet — wait for subscribe/init.
+            return True
+        max_lag = md_max_lag_from_env()
+        if lag <= max_lag:
+            return True
+        redis_md = env_flag("LIVE_CTP_SKIP_MD") or (
+            (os.getenv("LIVE_MD_SOURCE") or "").strip().lower() in {"redis", "bus", "md_bus"}
+        )
+        if redis_md:
+            self.log(
+                f"Redis 行情滞后 {int(lag)}s（阈值 {max_lag}s），等待 md_receiver（不重连本机 TD）"
+            )
+            return False
+        # Use a dedicated MD reconnect cooldown (do not inherit login backoff).
+        last = float(getattr(self, "last_md_reconnect", 0.0) or 0.0)
+        if now - last < 45:
+            return False
+        self.last_md_reconnect = now
+        self.force_gateway_reconnect(
+            f"行情时间戳滞后 {int(lag)}s（阈值 {max_lag}s），强制关闭并重连 {self.gateway}"
+        )
+        return False
+
     @staticmethod
     def cffex_session_open(now: datetime | None = None) -> bool:
-        """Rough CFFEX IO/IF session gate (Asia/Shanghai wall clock)."""
+        """Rough CFFEX IO/IF login window (Asia/Shanghai wall clock)."""
         now = now or datetime.now()
         if now.weekday() >= 5:
             return False
@@ -2908,14 +3243,72 @@ class LiveSupervisor:
         # day: 09:00-11:35, 12:55-15:15 (login buffer around official hours)
         return (900 <= hhmm <= 1135) or (1255 <= hhmm <= 1515)
 
+    @staticmethod
+    def cffex_md_active(now: datetime | None = None) -> bool:
+        """Official continuous auction — only then treat lag as MD failure."""
+        now = now or datetime.now()
+        if now.weekday() >= 5:
+            return False
+        hhmm = now.hour * 100 + now.minute
+        return (915 <= hhmm <= 1130) or (1300 <= hhmm <= 1500)
+
     def connect_backoff_sec(self) -> float:
         # Outside session: slow down hard to avoid CTP front thrash.
         if not self.cffex_session_open():
             return min(900.0, 120.0 * max(1, self.connect_failures))
         return min(300.0, 30.0 * (2 ** min(self.connect_failures, 3)))
 
+    def maybe_release_td(self) -> None:
+        """Recorder yields CTP TD seat to the live process after MD subscribe is ready."""
+        if self.td_released:
+            return
+        if not env_flag("STANDALONE_RECORDER"):
+            return
+        if not env_flag("LIVE_RECORDER_RELEASE_TD", True):
+            return
+        if self.record_ticks and not self.recorded:
+            return
+        if not self.inited:
+            return
+        assert main_engine is not None
+        gateway = main_engine.gateways.get(self.gateway)
+        if gateway is None:
+            return
+        try:
+            from ctp_session import release_ctp_td
+
+            if release_ctp_td(gateway):
+                self.td_released = True
+                os.environ["LIVE_CTP_SKIP_TD"] = "1"
+                self.log("录制进程已释放 CTP 交易通道（保留行情）；实盘进程可登录交易前置")
+        except Exception:
+            self.log("释放 CTP 交易通道失败\n" + traceback.format_exc())
+
     def ensure_ctp(self) -> bool:
         assert main_engine is not None
+        if not env_flag("LIVE_AUTO_CONNECT_CTP", True):
+            # Redis-MD live process may still run strategies once ticks arrive.
+            if (os.getenv("LIVE_MD_SOURCE") or "").strip().lower() in {"redis", "bus", "md_bus"}:
+                lag = market_data_lag_sec()
+                if lag is not None and lag < md_max_lag_from_env() * 2:
+                    if not self.ctp_ok:
+                        self.ctp_ok = True
+                        self.log("行情已由 Redis MD bus 提供（未自动连接 CTP）")
+                    return True
+            if not getattr(self, "_logged_ctp_disabled", False):
+                self.log("已禁用自动连接 CTP（LIVE_AUTO_CONNECT_CTP=0），本进程不登录行情/交易")
+                self._logged_ctp_disabled = True
+            return False
+        # MD-only recorder after TD release: stay connected without TD account.
+        if self.td_released or env_flag("LIVE_CTP_SKIP_TD"):
+            lag = market_data_lag_sec()
+            if lag is not None:
+                self.ctp_ok = True
+                self.connecting = False
+                return True
+            if self.contracts_ready():
+                self.ctp_ok = True
+                return True
         accounts = main_engine.get_all_accounts() or []
         if accounts:
             if not self.ctp_ok:
@@ -2924,6 +3317,10 @@ class LiveSupervisor:
                 self.connecting = False
                 self.log("CTP 账户已就绪")
             return True
+        # TD-only live process (SKIP_MD): also treat gateway connected via positions/contracts wait.
+        if env_flag("LIVE_CTP_SKIP_MD") and not self.connecting:
+            # Fall through to connect TD.
+            pass
         was_ok = self.ctp_ok
         self.ctp_ok = False
         now = time.time()
@@ -2943,6 +3340,7 @@ class LiveSupervisor:
         if was_ok:
             self.inited.clear()
             self.recorded.clear()
+            self.td_released = False
         self.connect_failures += 1
         self.next_connect = now + self.connect_backoff_sec()
         return False
@@ -3172,7 +3570,11 @@ def build_live_signals(monitor: dict[str, Any]) -> list[dict[str, Any]]:
 
 def live_monitor_payload() -> dict[str, Any]:
     engine = require_script()
-    data = load_json("gex_tv_strangle_status.json") or load_json("as_option_mm_status.json") or {}
+    data = (
+        safe_load_json("gex_tv_strangle_status.json")
+        or safe_load_json("as_option_mm_status.json")
+        or {}
+    )
     if not isinstance(data, dict):
         data = {}
     data = dict(data)
@@ -3583,9 +3985,9 @@ def stop_script(_: bool = Depends(get_access)) -> dict[str, str]:
 def get_script_monitor(_: bool = Depends(get_access)) -> dict[str, Any]:
     engine = require_script()
     data = (
-        load_json("gex_tv_strangle_status.json")
-        or load_json("io_covered_call_status.json")
-        or load_json("as_option_mm_status.json")
+        safe_load_json("gex_tv_strangle_status.json")
+        or safe_load_json("io_covered_call_status.json")
+        or safe_load_json("as_option_mm_status.json")
         or {}
     )
     data["engine_active"] = bool(engine.strategy_active)

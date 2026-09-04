@@ -502,3 +502,35 @@ tr.pin td:nth-child(7) {
     word-break: break-word;
 }
 
+.sys-alerts {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 8px 0 12px;
+}
+
+.sys-alert {
+    font-size: 12px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+    background: color-mix(in srgb, var(--sell) 12%, var(--panel));
+    color: var(--text);
+}
+
+.sys-alert.empty {
+    background: color-mix(in srgb, var(--buy) 12%, var(--panel));
+}
+
+.pill-ok, .pill-bad {
+    display: inline-block;
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+}
+
+.pill-ok { color: var(--buy); }
+.pill-bad { color: var(--sell); }
+
+

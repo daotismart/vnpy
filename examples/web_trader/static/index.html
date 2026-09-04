@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VeighNa Web Trader</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260902b">
+    <link rel="stylesheet" href="/static/style.css?v=20260904sys">
 </head>
 <body>
     <section id="login-page" class="login-page">
@@ -31,6 +31,7 @@
                 <button class="tab" data-tab="script">脚本</button>
                 <button class="tab" data-tab="backtest">回测</button>
                 <button class="tab" data-tab="data">数据</button>
+                <button class="tab" data-tab="system">系统</button>
             </nav>
             <div class="topbar-right">
                 <span id="ws-status" class="status off">推送断开</span>
@@ -820,12 +821,77 @@
             </section>
         </main>
 
+        <main id="tab-system" class="tab-panel">
+            <aside class="side">
+                <section class="card">
+                    <h2>系统管理</h2>
+                    <p id="sys-hint" class="hint">监控后台进程、Redis 与 QuestDB 容量/性能。</p>
+                    <div id="sys-alerts" class="sys-alerts"></div>
+                    <div class="btn-row">
+                        <button id="sys-refresh" class="ok" type="button">刷新</button>
+                        <button id="sys-auto" class="ghost" type="button">自动刷新: 开</button>
+                    </div>
+                    <p id="sys-updated" class="hint">—</p>
+                </section>
+                <section class="card">
+                    <h2>总览</h2>
+                    <div id="sys-overview-metrics" class="metric-grid"></div>
+                </section>
+            </aside>
+            <section class="workspace">
+                <article class="card">
+                    <h2>后台进程</h2>
+                    <div id="sys-process-metrics" class="metric-grid"></div>
+                    <div class="table-wrap" style="margin-top:10px">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>服务</th><th>状态</th><th>年龄</th><th>PID</th><th>关键指标</th>
+                                </tr>
+                            </thead>
+                            <tbody id="sys-process-body"></tbody>
+                        </table>
+                    </div>
+                </article>
+                <div class="grid-2">
+                    <article class="card">
+                        <h2>Redis</h2>
+                        <div id="sys-redis-metrics" class="metric-grid"></div>
+                        <div class="table-wrap" style="margin-top:10px">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>消费组</th><th>消费者</th><th>Pending</th><th>Lag</th><th>Last ID</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="sys-redis-groups-body"></tbody>
+                            </table>
+                        </div>
+                    </article>
+                    <article class="card">
+                        <h2>QuestDB</h2>
+                        <div id="sys-questdb-metrics" class="metric-grid"></div>
+                        <div class="table-wrap" style="margin-top:10px">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>表</th><th>行数</th><th>磁盘</th><th>分区</th><th>WAL</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="sys-questdb-tables-body"></tbody>
+                            </table>
+                        </div>
+                    </article>
+                </div>
+            </section>
+        </main>
+
         <footer class="log-panel">
             <h2>日志</h2>
             <pre id="log-box"></pre>
         </footer>
     </section>
 
-    <script src="/static/app.js?v=20260902b"></script>
+    <script src="/static/app.js?v=20260904sys"></script>
 </body>
 </html>

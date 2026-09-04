@@ -60,6 +60,7 @@ services:
       LIVE_MD_RELEASE_TD: ${LIVE_MD_RELEASE_TD:-1}
       LIVE_CTP_SKIP_MD: "0"
       LIVE_CTP_SKIP_TD: "1"
+      LIVE_MD_RECONNECT_EXIT: "1"
       CTP_CONNECT_FILE: ${MD_CTP_CONNECT_FILE:-}
       MD_RECEIVER_HEARTBEAT_FILE: /tmp/md_receiver_heartbeat
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
@@ -71,12 +72,8 @@ services:
       - ./md_bus.py:/app/md_bus.py
       - ./ctp_session.py:/app/ctp_session.py
       - ./system_monitor.py:/app/system_monitor.py
-    entrypoint:
-      [
-        "bash",
-        "-lc",
-        "pip install -q redis >/tmp/pip-redis.log 2>&1 || true; exec python run_md_receiver.py",
-      ]
+      - ./scripts/md_receiver_entry.sh:/app/scripts/md_receiver_entry.sh
+    entrypoint: ["bash", "/app/scripts/md_receiver_entry.sh"]
     healthcheck:
       test:
         [

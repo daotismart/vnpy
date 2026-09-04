@@ -157,6 +157,7 @@ class MdReceiver:
         self.last_tick_dt: datetime | None = None
         self.last_tick_vt = ""
         self.tick_count = 0
+        self._soft_reconnect_attempts = 0
         self.last_log = ""
         self._subscribed_at = 0.0
         self.thread = threading.Thread(target=self._loop, name="md-receiver", daemon=True)
@@ -376,24 +377,54 @@ class MdReceiver:
         self._reconnect_md(f"MD lag {int(lag)}s > {self.md_max_lag}s")
 
     def _reconnect_md(self, reason: str) -> None:
+        """Recover MD without calling gateway.close().
+
+        Native CTP ``ReleaseApi`` / ``close()`` can deadlock the whole process
+        (GIL + MdApi select thread), which freezes heartbeats and leaves Docker
+        ``unhealthy`` until a manual restart. Prefer a soft re-login; if we are
+        already mid-reconnect or soft attempts keep failing, exit so
+        ``restart: unless-stopped`` brings up a clean process.
+        """
         setting = _load_ctp_setting()
         if not setting:
             return
-        self.log(f"{reason} — close+reconnect MD")
-        gateway = self.main_engine.gateways.get(GATEWAY)
-        if gateway is not None:
+        hard_exit = _env_flag("LIVE_MD_RECONNECT_EXIT", True)
+        attempts = int(getattr(self, "_soft_reconnect_attempts", 0) or 0)
+        if hard_exit and attempts >= 2:
+            self.log(f"{reason} — soft reconnect exhausted, exiting for Docker restart")
             try:
-                gateway.close()
+                HEARTBEAT_PATH.write_text(
+                    f"ts={time.time():.3f}\nexiting=1\nreason={reason}\n",
+                    encoding="utf-8",
+                )
             except Exception:
-                traceback.print_exc()
-        # Prefer MD-only reconnect to avoid kicking the web TD session.
+                pass
+            # Daemon exit: avoid gateway.close() hang on the way out.
+            threading.Thread(target=lambda: (time.sleep(0.2), os._exit(75)), daemon=True).start()
+            return
+
+        self.log(f"{reason} — soft reconnect MD (no gateway.close)")
         if self.contracts or self.td_released or _env_flag("LIVE_CTP_SKIP_TD"):
             os.environ["LIVE_CTP_SKIP_TD"] = "1"
             self.td_released = True
         self.subscribed.clear()
         self.ctp_ok = False
         self.connecting = True
-        self.main_engine.connect(setting, GATEWAY)
+        self._soft_reconnect_attempts = attempts + 1
+        gateway = self.main_engine.gateways.get(GATEWAY)
+        md_api = getattr(gateway, "md_api", None) if gateway is not None else None
+        if md_api is not None and hasattr(md_api, "login_status"):
+            try:
+                md_api.login_status = False
+            except Exception:
+                pass
+        try:
+            self.main_engine.connect(setting, GATEWAY)
+        except Exception:
+            self.log("soft reconnect connect failed\n" + traceback.format_exc())
+            if hard_exit:
+                threading.Thread(target=lambda: (time.sleep(0.2), os._exit(75)), daemon=True).start()
+                return
         self.connect_failures += 1
         self.next_connect = time.time() + 30
 
@@ -428,8 +459,26 @@ class MdReceiver:
 
 
 def _write_heartbeat(receiver: MdReceiver) -> None:
-    st = receiver.status()
-    bus = md_bus_status()
+    # Touch the file first so Docker healthcheck stays green even if Redis/status stalls.
+    try:
+        HEARTBEAT_PATH.write_text(f"ts={time.time():.3f}\nphase=start\n", encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        st = receiver.status()
+    except Exception as exc:
+        try:
+            HEARTBEAT_PATH.write_text(f"ts={time.time():.3f}\nerror=status:{exc}\n", encoding="utf-8")
+        except Exception:
+            pass
+        return
+    try:
+        bus = md_bus_status()
+    except Exception:
+        bus = {"pub_count": None, "err_count": None}
+    # Successful MD flow resets soft-reconnect budget.
+    if st.get("ctp_ok") and (st.get("md_lag_sec") is None or float(st.get("md_lag_sec") or 0) < 30):
+        receiver._soft_reconnect_attempts = 0
     try:
         payload = (
             f"ts={time.time():.3f}\n"

@@ -34,7 +34,8 @@ def _now_ts() -> float:
 def write_service_heartbeat(service: str, extra: dict[str, Any] | None = None) -> None:
     """Publish service heartbeat to Redis (survives across containers)."""
     try:
-        client = create_redis_client()
+        # Short timeouts: never block the caller if Redis/DNS stalls.
+        client = create_redis_client(socket_timeout=1.0, socket_connect_timeout=1.0)
         payload = {
             "service": service,
             "ts": _now_ts(),
@@ -47,6 +48,10 @@ def write_service_heartbeat(service: str, extra: dict[str, Any] | None = None) -
         import json
 
         client.setex(f"{HEARTBEAT_PREFIX}{service}", 30, json.dumps(payload, ensure_ascii=False))
+        try:
+            client.close()
+        except Exception:
+            pass
     except Exception:
         pass
 

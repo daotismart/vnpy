@@ -59,7 +59,7 @@ services:
       LIVE_MD_PREFIXES: ${LIVE_MD_PREFIXES:-IF,IO}
       LIVE_MD_RELEASE_TD: ${LIVE_MD_RELEASE_TD:-1}
       LIVE_CTP_SKIP_MD: "0"
-      LIVE_CTP_SKIP_TD: "0"
+      LIVE_CTP_SKIP_TD: "1"
       CTP_CONNECT_FILE: ${MD_CTP_CONNECT_FILE:-}
       MD_RECEIVER_HEARTBEAT_FILE: /tmp/md_receiver_heartbeat
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}

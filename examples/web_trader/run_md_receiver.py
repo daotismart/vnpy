@@ -286,22 +286,34 @@ class MdReceiver:
         self._ensure_md_fresh()
         self._maybe_release_td()
 
+    def _tick_is_live(self, dt: datetime | None = None) -> bool:
+        """Reject pre-open / overnight stamps so they cannot drive reconnect storms."""
+        dt = dt or self.last_tick_dt
+        if dt is None:
+            return False
+        wall = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+        lag = (wall - dt).total_seconds()
+        if lag > 3600:
+            return False
+        if not _cffex_md_active(wall):
+            return True
+        # During continuous auction, tick must be from today after 09:14.
+        local = dt.astimezone() if dt.tzinfo else dt
+        hhmm = local.hour * 100 + local.minute
+        return local.date() == wall.date() and hhmm >= 914
+
     def _ensure_ctp(self) -> bool:
         skip_td = self.td_released or _env_flag("LIVE_CTP_SKIP_TD")
         # MD flowing → ready (accounts may be empty in MD-only mode).
-        if self.last_tick_dt is not None:
-            wall = datetime.now(self.last_tick_dt.tzinfo) if self.last_tick_dt.tzinfo else datetime.now()
-            lag = (wall - self.last_tick_dt).total_seconds()
-            # Outside continuous auction, stale overnight ticks are expected.
-            if lag <= self.md_max_lag * 2 or not _cffex_md_active():
-                if not self.ctp_ok:
-                    self.ctp_ok = True
-                    self.connecting = False
-                    self.connect_failures = 0
-                    self.log("CTP MD ready")
-                    if self.contracts and not self.subscribed:
-                        self._resubscribe_all()
-                return True
+        if self.last_tick_dt is not None and self._tick_is_live(self.last_tick_dt):
+            if not self.ctp_ok:
+                self.ctp_ok = True
+                self.connecting = False
+                self.connect_failures = 0
+                self.log("CTP MD ready")
+                if self.contracts and not self.subscribed:
+                    self._resubscribe_all()
+            return True
 
         if not skip_td:
             accounts = self.main_engine.get_all_accounts() or []
@@ -346,13 +358,13 @@ class MdReceiver:
         if now - self.last_md_check < 20:
             return
         self.last_md_check = now
-        if self.last_tick_dt is None:
-            # Continuous auction but no ticks yet — soft reconnect MD after grace.
-            if self.connecting or now - self.last_md_reconnect < 60:
+        if self.last_tick_dt is None or not self._tick_is_live(self.last_tick_dt):
+            # Continuous auction but no live ticks yet — soft reconnect MD after grace.
+            if self.connecting or now - self.last_md_reconnect < 90:
                 return
             if self.subscribed or self.contracts:
                 self.last_md_reconnect = now
-                self._reconnect_md("no ticks during continuous auction")
+                self._reconnect_md("no live ticks during continuous auction")
             return
         wall = datetime.now(self.last_tick_dt.tzinfo) if self.last_tick_dt.tzinfo else datetime.now()
         lag = (wall - self.last_tick_dt).total_seconds()
@@ -491,12 +503,15 @@ def main() -> None:
         warmed = load_contracts_from_redis(receiver.prefixes)
         for contract in warmed:
             receiver.contracts[contract.vt_symbol] = contract
+        print(f"[MD_RX] redis contract warm count={len(warmed)}", flush=True)
         if len(warmed) >= 50 or _env_flag("LIVE_CTP_SKIP_TD"):
             os.environ["LIVE_CTP_SKIP_TD"] = "1"
             receiver.td_released = True
             receiver.log(f"MD-only start: warmed {len(warmed)} contracts from Redis")
         elif warmed:
             receiver.log(f"warmed {len(warmed)} contracts from Redis (TD still needed)")
+        else:
+            receiver.log("Redis contract cache empty — will use TD query")
     except Exception:
         traceback.print_exc()
 

@@ -126,6 +126,58 @@ def main() -> None:
 
     if md_bus_enabled():
         start_md_bus_subscriber(event_engine, log=lambda m: main_engine.write_log(f"[MD_BUS] {m}"))
+        # Keep Redis contract hash warm from web TD so md_receiver can MD-only recover
+        # after Redis restarts without needing a TD seat.
+        try:
+            import threading
+            import time as _time
+
+            from vnpy.trader.event import EVENT_CONTRACT
+            from vnpy.trader.object import ContractData
+            from md_bus import store_contracts_to_redis
+
+            _pending: list = []
+            _lock = threading.Lock()
+            _last_flush = 0.0
+
+            def _flush_pending(force: bool = False) -> None:
+                nonlocal _last_flush
+                now = _time.time()
+                with _lock:
+                    if not _pending:
+                        return
+                    if not force and now - _last_flush < 5 and len(_pending) < 100:
+                        return
+                    batch = list(_pending)
+                    _pending.clear()
+                    _last_flush = now
+                try:
+                    store_contracts_to_redis(batch)
+                except Exception:
+                    pass
+
+            def _seed_contract(event) -> None:
+                contract = event.data
+                if not isinstance(contract, ContractData):
+                    return
+                symbol = str(contract.symbol or "").upper()
+                if not symbol.startswith(("IF", "IO", "IH", "IC", "IM")):
+                    return
+                with _lock:
+                    _pending.append(contract)
+                _flush_pending(False)
+
+            event_engine.register(EVENT_CONTRACT, _seed_contract)
+            existing = [
+                c
+                for c in (main_engine.get_all_contracts() or [])
+                if str(getattr(c, "symbol", "") or "").upper().startswith(("IF", "IO", "IH", "IC", "IM"))
+            ]
+            if existing:
+                result = store_contracts_to_redis(existing)
+                main_engine.write_log(f"[MD_BUS] seeded Redis contracts from web TD: {result}")
+        except Exception:
+            traceback.print_exc()
 
     attach_runtime(
         main_engine,

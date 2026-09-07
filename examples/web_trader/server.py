@@ -2706,6 +2706,31 @@ def get_system_questdb(_: bool = Depends(get_access)) -> dict[str, Any]:
     return collect_questdb_status()
 
 
+@app.post("/system/md/seed_contracts")
+def seed_md_contracts(_: bool = Depends(get_access)) -> dict[str, Any]:
+    """Push web TD contract universe into Redis for md_receiver warm-start."""
+    from md_bus import store_contracts_to_redis
+
+    engine = require_main()
+    contracts = list(engine.get_all_contracts() or [])
+    prefs = tuple(
+        p.strip().upper()
+        for p in (os.getenv("LIVE_MD_PREFIXES") or "IF,IO").split(",")
+        if p.strip()
+    )
+    filtered = []
+    for contract in contracts:
+        symbol = str(getattr(contract, "symbol", "") or "").upper()
+        if prefs and not symbol.startswith(prefs):
+            continue
+        filtered.append(contract)
+    result = store_contracts_to_redis(filtered or contracts)
+    result["source_total"] = len(contracts)
+    result["filtered"] = len(filtered)
+    result["prefixes"] = list(prefs)
+    return result
+
+
 class RecorderAddModel(BaseModel):
     vt_symbol: str
     tick: bool = True

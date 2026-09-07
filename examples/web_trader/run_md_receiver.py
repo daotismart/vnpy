@@ -158,6 +158,9 @@ class MdReceiver:
         self.last_tick_vt = ""
         self.tick_count = 0
         self._soft_reconnect_attempts = 0
+        self._last_rewarm = 0.0
+        self._empty_since = 0.0
+        self._started_at = time.time()
         self.last_log = ""
         self._subscribed_at = 0.0
         self.thread = threading.Thread(target=self._loop, name="md-receiver", daemon=True)
@@ -254,12 +257,62 @@ class MdReceiver:
                 self.log("loop error\n" + traceback.format_exc())
             _stop.wait(5.0)
 
+    def _rewarm_contracts_from_redis(self) -> int:
+        """Reload IF/IO contracts from Redis when local cache is empty/thin."""
+        now = time.time()
+        last = float(getattr(self, "_last_rewarm", 0.0) or 0.0)
+        if now - last < 20:
+            return 0
+        self._last_rewarm = now
+        try:
+            from vnpy_ctp.gateway.ctp_gateway import symbol_contract_map
+
+            warmed = load_contracts_from_redis(self.prefixes)
+        except Exception:
+            traceback.print_exc()
+            return 0
+        added = 0
+        for contract in warmed:
+            if contract.vt_symbol in self.contracts:
+                continue
+            self.contracts[contract.vt_symbol] = contract
+            if getattr(contract, "symbol", None):
+                symbol_contract_map[contract.symbol] = contract
+            added += 1
+        if added:
+            self.log(f"rewarmed {added} contracts from Redis (total={len(self.contracts)})")
+        return added
+
+    def _need_td_seed(self) -> bool:
+        """MD-only is unsafe without an instrument map — temporarily allow TD."""
+        return len(self.contracts) < 50
+
+    def _arm_md_only(self) -> None:
+        os.environ["LIVE_CTP_SKIP_TD"] = "1"
+        self.td_released = True
+
+    def _arm_td_seed(self) -> None:
+        os.environ["LIVE_CTP_SKIP_TD"] = "0"
+        self.td_released = False
+
     def _md_logged_in(self) -> bool:
         gateway = self.main_engine.gateways.get(GATEWAY)
         md_api = getattr(gateway, "md_api", None) if gateway is not None else None
         return bool(getattr(md_api, "login_status", False))
 
     def _tick(self) -> None:
+        if self._need_td_seed():
+            self._rewarm_contracts_from_redis()
+        if self._need_td_seed():
+            # Still thin after Redis rewarm — force one TD instrument query cycle.
+            if self.td_released or _env_flag("LIVE_CTP_SKIP_TD"):
+                self._arm_td_seed()
+                self.log("contract cache thin — temporary TD seed enabled")
+                self.next_connect = 0.0
+        elif not self.td_released and len(self.contracts) >= 50 and self.subscribed:
+            # Seed complete — yield TD seat back to web on next opportunity.
+            pass
+
         ready = self._ensure_ctp()
         # CTP MdApi.subscribe is a no-op until login_status=True. Clear any
         # optimistic subscribe marks made before login, then subscribe for real.
@@ -278,6 +331,25 @@ class MdReceiver:
             self.log("MD logged in but no ticks — resubscribe")
             self.subscribed.clear()
             self._resubscribe_all()
+
+        # Empty universe during continuous auction for too long → clean Docker restart.
+        if (
+            _cffex_md_active()
+            and self._need_td_seed()
+            and not self.subscribed
+            and time.time() - float(getattr(self, "_started_at", time.time()) or time.time()) > 180
+            and _env_flag("LIVE_MD_RECONNECT_EXIT", True)
+        ):
+            empty_since = float(getattr(self, "_empty_since", 0.0) or 0.0)
+            if empty_since <= 0:
+                self._empty_since = time.time()
+            elif time.time() - empty_since > 120:
+                self.log("no contracts/subscriptions for 120s in session — exiting for Docker restart")
+                threading.Thread(target=lambda: (time.sleep(0.2), os._exit(76)), daemon=True).start()
+                return
+        else:
+            self._empty_since = 0.0
+
         if not ready:
             # After MD login + subscribe, treat as ready even before first tick.
             if self._md_logged_in() and self.subscribed:
@@ -304,7 +376,8 @@ class MdReceiver:
         return local.date() == wall.date() and hhmm >= 914
 
     def _ensure_ctp(self) -> bool:
-        skip_td = self.td_released or _env_flag("LIVE_CTP_SKIP_TD")
+        # Never stay MD-only without instruments — TD seed fills Redis + symbol_contract_map.
+        skip_td = (self.td_released or _env_flag("LIVE_CTP_SKIP_TD")) and not self._need_td_seed()
         # MD flowing → ready (accounts may be empty in MD-only mode).
         if self.last_tick_dt is not None and self._tick_is_live(self.last_tick_dt):
             if not self.ctp_ok:
@@ -340,10 +413,11 @@ class MdReceiver:
         else:
             mode = "MD-only" if skip_td else "MD+TD"
             self.log(f"connecting {GATEWAY} ({mode})")
-        # Preserve MD-only across reconnects when contracts are already known.
-        if skip_td or self.contracts:
-            os.environ["LIVE_CTP_SKIP_TD"] = "1"
-            self.td_released = True
+        # Preserve MD-only across reconnects only when contracts are already known.
+        if skip_td and self.contracts:
+            self._arm_md_only()
+        elif self._need_td_seed():
+            self._arm_td_seed()
         self.main_engine.connect(setting, GATEWAY)
         self.connecting = True
         self.ctp_ok = False
@@ -404,9 +478,10 @@ class MdReceiver:
             return
 
         self.log(f"{reason} — soft reconnect MD (no gateway.close)")
-        if self.contracts or self.td_released or _env_flag("LIVE_CTP_SKIP_TD"):
-            os.environ["LIVE_CTP_SKIP_TD"] = "1"
-            self.td_released = True
+        if self.contracts and not self._need_td_seed():
+            self._arm_md_only()
+        elif self._need_td_seed():
+            self._arm_td_seed()
         self.subscribed.clear()
         self.ctp_ok = False
         self.connecting = True
@@ -453,8 +528,9 @@ class MdReceiver:
             return
         # Soft mark only — keep current TD socket but arm MD-only for future reconnects
         # so web TD is not kicked by an MD+TD re-login from this process.
-        os.environ["LIVE_CTP_SKIP_TD"] = "1"
-        self.td_released = True
+        if self._need_td_seed():
+            return
+        self._arm_md_only()
         self.log("MD-only mode armed (soft TD release; web may own trading front)")
 
 
@@ -559,16 +635,20 @@ def main() -> None:
             if getattr(contract, "symbol", None):
                 symbol_contract_map[contract.symbol] = contract
         print(f"[MD_RX] redis contract warm count={len(warmed)}", flush=True)
-        if len(warmed) >= 50 or _env_flag("LIVE_CTP_SKIP_TD"):
-            os.environ["LIVE_CTP_SKIP_TD"] = "1"
-            receiver.td_released = True
+        if len(warmed) >= 50:
+            receiver._arm_md_only()
             receiver.log(f"MD-only start: warmed {len(warmed)} contracts from Redis")
-        elif warmed:
-            receiver.log(f"warmed {len(warmed)} contracts from Redis (TD still needed)")
         else:
-            receiver.log("Redis contract cache empty — will use TD query")
+            # Compose may set LIVE_CTP_SKIP_TD=1, but an empty Redis cache cannot
+            # subscribe. Temporarily allow TD to seed instruments into Redis.
+            receiver._arm_td_seed()
+            receiver.log(
+                f"Redis contract cache thin ({len(warmed)}) — temporary TD seed "
+                "(will soft-release after subscribe)"
+            )
     except Exception:
         traceback.print_exc()
+        receiver._arm_td_seed()
 
     receiver.start()
 

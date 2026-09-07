@@ -693,6 +693,44 @@ class MdStreamConsumer:
             self._last_err = f"reclaim: {exc}"
 
 
+def store_contracts_to_redis(contracts: list) -> dict[str, Any]:
+    """Persist ContractData list into Redis hash (and publish) for MD-only warm start."""
+    try:
+        client = create_redis_client(socket_timeout=10, socket_connect_timeout=5)
+    except Exception as exc:
+        return {"ok": False, "stored": 0, "error": str(exc)}
+    stored = 0
+    errors = 0
+    try:
+        pipe = client.pipeline(transaction=False)
+        pending = 0
+        for contract in contracts:
+            if not isinstance(contract, ContractData):
+                continue
+            try:
+                payload = json.dumps(contract_to_dict(contract), ensure_ascii=False, separators=(",", ":"))
+                pipe.publish(contract_channel(), payload)
+                pipe.hset(contracts_key(), contract.vt_symbol, payload)
+                pending += 2
+                stored += 1
+                if pending >= 200:
+                    pipe.execute()
+                    pipe = client.pipeline(transaction=False)
+                    pending = 0
+            except Exception:
+                errors += 1
+        if pending:
+            pipe.execute()
+        total = int(client.hlen(contracts_key()) or 0)
+        try:
+            client.close()
+        except Exception:
+            pass
+        return {"ok": True, "stored": stored, "errors": errors, "total": total}
+    except Exception as exc:
+        return {"ok": False, "stored": stored, "errors": errors, "error": str(exc)}
+
+
 def start_md_bus_publisher(event_engine: EventEngine, log: Callable[[str], None] | None = None) -> MdBusPublisher:
     global _publisher
     if _publisher is not None:

@@ -49,6 +49,8 @@ from vnpy_optionmaster.base import OptionData
 from vnpy_scripttrader import ScriptTraderApp
 from vnpy_spreadtrading import SpreadTradingApp
 
+from ctp_session import patch_ctp_connect_modes
+from md_bus import md_bus_enabled, start_md_bus_subscriber, stop_md_bus
 from server import app, attach_runtime
 
 
@@ -95,6 +97,13 @@ def _patch_option_greeks() -> None:
 
 
 def main() -> None:
+    # Default web role when Redis MD bus is used: TD for trading, MD from Redis.
+    if md_bus_enabled():
+        os.environ.setdefault("LIVE_CTP_SKIP_MD", "1")
+        if os.getenv("LIVE_RECORD_TICKS") in (None, ""):
+            os.environ["LIVE_RECORD_TICKS"] = "0"
+
+    patch_ctp_connect_modes()
     _patch_event_engine()
     _patch_option_greeks()
 
@@ -115,6 +124,9 @@ def main() -> None:
     spread_engine.start()
     script_engine.init()
 
+    if md_bus_enabled():
+        start_md_bus_subscriber(event_engine, log=lambda m: main_engine.write_log(f"[MD_BUS] {m}"))
+
     attach_runtime(
         main_engine,
         event_engine,
@@ -134,11 +146,17 @@ def main() -> None:
         f"{SETTINGS['database.host']}:{SETTINGS['database.port']} "
         f"(HTTP ILP {SETTINGS['database.http_port']})"
     )
+    if md_bus_enabled():
+        print(f"Market data: Redis MD bus ({_env('REDIS_URL', 'redis://redis:6379/0')})")
     print("Login with username/password from ~/.vntrader/web_trader_setting.json (default vnpy / vnpy)")
 
     try:
         uvicorn.run(app, host=HOST, port=PORT, log_level="info")
     finally:
+        try:
+            stop_md_bus()
+        except Exception:
+            traceback.print_exc()
         main_engine.close()
 
 

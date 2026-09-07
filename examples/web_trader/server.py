@@ -4001,8 +4001,6 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
     return explains
 
 
-
-
 def live_monitor_payload() -> dict[str, Any]:
     engine = require_script()
     data = (

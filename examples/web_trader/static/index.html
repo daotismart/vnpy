@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VeighNa Web Trader</title>
     <meta http-equiv="Cache-Control" content="no-store, max-age=0">
-    <link rel="stylesheet" href="/static/style.css?v=20260904explain3">
+    <link rel="stylesheet" href="/static/style.css?v=20260907tickview">
 </head>
 <body>
     <section id="login-page" class="login-page">
@@ -913,6 +913,34 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=20260904explain3"></script>
+    <div id="tick-view-modal" class="explain-modal hidden" aria-hidden="true">
+        <div class="explain-backdrop" data-tick-view-close="1"></div>
+        <div class="explain-card tick-view-card" role="dialog" aria-modal="true">
+            <header class="explain-head">
+                <div>
+                    <h3 id="tick-view-title">Tick 曲线</h3>
+                    <p id="tick-view-meta" class="hint"></p>
+                </div>
+                <button id="tick-view-close" class="ghost" type="button">关闭</button>
+            </header>
+            <div class="tick-view-toolbar">
+                <label>开始<input id="tick-view-start" type="datetime-local" step="1"></label>
+                <label>结束<input id="tick-view-end" type="datetime-local" step="1"></label>
+                <button id="tick-view-apply" class="ok" type="button">查询</button>
+                <div class="tick-view-presets">
+                    <button type="button" class="ghost small" data-tick-range="all">全部</button>
+                    <button type="button" class="ghost small" data-tick-range="30m">近30分</button>
+                    <button type="button" class="ghost small" data-tick-range="2h">近2小时</button>
+                    <button type="button" class="ghost small" data-tick-range="1d">近1天</button>
+                </div>
+            </div>
+            <div class="explain-chart-wrap">
+                <canvas id="tick-view-chart" width="960" height="520"></canvas>
+                <p id="tick-view-hint" class="hint"></p>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=20260907tickview"></script>
 </body>
 </html>

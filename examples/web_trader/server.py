@@ -2335,6 +2335,47 @@ def query_ticks(
     return to_plain(ticks)
 
 
+@app.get("/data/tick/series")
+def query_tick_series(
+    symbol: str,
+    exchange: Exchange,
+    start: str,
+    end: str,
+    max_points: int = Query(2000, ge=100, le=10000),
+    sample: str = Query(""),
+    _: bool = Depends(get_access),
+) -> dict[str, Any]:
+    """Downsampled tick price series for the data-menu chart viewer."""
+    start_dt = parse_datetime(start)
+    end_dt = parse_datetime(end)
+    if end_dt < start_dt:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="结束时间早于开始时间")
+    db = get_database()
+    sample_interval, points = db.load_tick_series(
+        symbol,
+        exchange,
+        start_dt,
+        end_dt,
+        max_points=max_points,
+        sample=sample or None,
+    )
+    raw_count = 0
+    try:
+        raw_count = db.count_tick_range(symbol, exchange, start_dt, end_dt)
+    except Exception:
+        raw_count = sum(int(p.get("tick_count") or 0) for p in points)
+    return {
+        "symbol": symbol,
+        "exchange": exchange.value,
+        "start": to_plain(start_dt),
+        "end": to_plain(end_dt),
+        "sample": sample_interval,
+        "raw_count": raw_count,
+        "count": len(points),
+        "points": to_plain(points),
+    }
+
+
 @app.delete("/data/tick")
 def delete_ticks(
     symbol: str,

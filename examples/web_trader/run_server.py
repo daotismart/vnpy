@@ -49,6 +49,8 @@ from vnpy_optionmaster.base import OptionData
 from vnpy_scripttrader import ScriptTraderApp
 from vnpy_spreadtrading import SpreadTradingApp
 
+from ctp_session import patch_ctp_connect_modes
+from md_bus import md_bus_enabled, start_md_bus_subscriber, stop_md_bus
 from server import app, attach_runtime
 
 
@@ -95,6 +97,13 @@ def _patch_option_greeks() -> None:
 
 
 def main() -> None:
+    # Default web role when Redis MD bus is used: TD for trading, MD from Redis.
+    if md_bus_enabled():
+        os.environ.setdefault("LIVE_CTP_SKIP_MD", "1")
+        if os.getenv("LIVE_RECORD_TICKS") in (None, ""):
+            os.environ["LIVE_RECORD_TICKS"] = "0"
+
+    patch_ctp_connect_modes()
     _patch_event_engine()
     _patch_option_greeks()
 
@@ -115,6 +124,77 @@ def main() -> None:
     spread_engine.start()
     script_engine.init()
 
+    if md_bus_enabled():
+        start_md_bus_subscriber(event_engine, log=lambda m: main_engine.write_log(f"[MD_BUS] {m}"))
+        # Keep Redis contract hash warm from web TD so md_receiver can MD-only recover
+        # after Redis restarts without needing a TD seat.
+        # IMPORTANT: never PUBLISH back to the contract channel from this handler —
+        # the MD bus subscriber also emits EVENT_CONTRACT, which would feedback-loop
+        # and cause DataRecorder to spam CTP subscribe logs.
+        try:
+            import threading
+            import time as _time
+
+            from vnpy.trader.event import EVENT_CONTRACT
+            from vnpy.trader.object import ContractData
+            from md_bus import store_contracts_to_redis
+
+            _pending: list = []
+            _lock = threading.Lock()
+            _last_flush = 0.0
+
+            def _flush_pending(force: bool = False) -> None:
+                nonlocal _last_flush
+                now = _time.time()
+                with _lock:
+                    if not _pending:
+                        return
+                    if not force and now - _last_flush < 5 and len(_pending) < 100:
+                        return
+                    batch = list(_pending)
+                    _pending.clear()
+                    _last_flush = now
+                try:
+                    store_contracts_to_redis(batch, publish=False)
+                except Exception:
+                    pass
+
+            def _seed_contract(event) -> None:
+                contract = event.data
+                if not isinstance(contract, ContractData):
+                    return
+                symbol = str(contract.symbol or "").upper()
+                if not symbol.startswith(("IF", "IO", "IH", "IC", "IM")):
+                    return
+                with _lock:
+                    _pending.append(contract)
+                _flush_pending(False)
+
+            event_engine.register(EVENT_CONTRACT, _seed_contract)
+            existing = [
+                c
+                for c in (main_engine.get_all_contracts() or [])
+                if str(getattr(c, "symbol", "") or "").upper().startswith(("IF", "IO", "IH", "IC", "IM"))
+            ]
+            if existing:
+                result = store_contracts_to_redis(existing, publish=False)
+                main_engine.write_log(f"[MD_BUS] seeded Redis contracts from web TD: {result}")
+        except Exception:
+            traceback.print_exc()
+
+        # Web uses Redis MD — DataRecorder must not re-subscribe via CTP on every
+        # contract event (useless + log spam when SKIP_MD=1).
+        try:
+            from vnpy_datarecorder.engine import RecorderEngine
+
+            def _skip_ctp_subscribe(self, contract) -> None:  # noqa: ANN001
+                return
+
+            RecorderEngine.subscribe = _skip_ctp_subscribe  # type: ignore[method-assign]
+            main_engine.write_log("[MD_BUS] DataRecorder CTP subscribe disabled (Redis MD)")
+        except Exception:
+            traceback.print_exc()
+
     attach_runtime(
         main_engine,
         event_engine,
@@ -134,11 +214,17 @@ def main() -> None:
         f"{SETTINGS['database.host']}:{SETTINGS['database.port']} "
         f"(HTTP ILP {SETTINGS['database.http_port']})"
     )
+    if md_bus_enabled():
+        print(f"Market data: Redis MD bus ({_env('REDIS_URL', 'redis://redis:6379/0')})")
     print("Login with username/password from ~/.vntrader/web_trader_setting.json (default vnpy / vnpy)")
 
     try:
         uvicorn.run(app, host=HOST, port=PORT, log_level="info")
     finally:
+        try:
+            stop_md_bus()
+        except Exception:
+            traceback.print_exc()
         main_engine.close()
 
 

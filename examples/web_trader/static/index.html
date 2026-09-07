@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VeighNa Web Trader</title>
     <meta http-equiv="Cache-Control" content="no-store, max-age=0">
-    <link rel="stylesheet" href="/static/style.css?v=20260907tickview">
+    <link rel="stylesheet" href="/static/style.css?v=20260907barview">
 </head>
 <body>
     <section id="login-page" class="login-page">
@@ -941,6 +941,34 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=20260907tickview"></script>
+    <div id="bar-view-modal" class="explain-modal hidden" aria-hidden="true">
+        <div class="explain-backdrop" data-bar-view-close="1"></div>
+        <div class="explain-card tick-view-card" role="dialog" aria-modal="true">
+            <header class="explain-head">
+                <div>
+                    <h3 id="bar-view-title">K线</h3>
+                    <p id="bar-view-meta" class="hint"></p>
+                </div>
+                <button id="bar-view-close" class="ghost" type="button">关闭</button>
+            </header>
+            <div class="tick-view-toolbar">
+                <label>开始<input id="bar-view-start" type="datetime-local" step="1"></label>
+                <label>结束<input id="bar-view-end" type="datetime-local" step="1"></label>
+                <button id="bar-view-apply" class="ok" type="button">查询</button>
+                <div class="tick-view-presets">
+                    <button type="button" class="ghost small" data-bar-range="all">全部</button>
+                    <button type="button" class="ghost small" data-bar-range="1d">近1天</button>
+                    <button type="button" class="ghost small" data-bar-range="5d">近5天</button>
+                    <button type="button" class="ghost small" data-bar-range="20d">近20天</button>
+                </div>
+            </div>
+            <div class="explain-chart-wrap">
+                <canvas id="bar-view-chart" width="960" height="520"></canvas>
+                <p id="bar-view-hint" class="hint"></p>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=20260907barview"></script>
 </body>
 </html>

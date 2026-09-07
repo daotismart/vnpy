@@ -1,4 +1,4 @@
-"""Smoke tests for local tick series viewer (data menu)."""
+"""Smoke tests for local tick/bar series viewers (data menu)."""
 
 from __future__ import annotations
 
@@ -43,18 +43,24 @@ def main() -> int:
     js = APP_JS.read_text(encoding="utf-8")
 
     assert '@app.get("/data/tick/series")' in server
+    assert '@app.get("/data/bar/series")' in server
     assert "def query_tick_series" in server
+    assert "def query_bar_series" in server
+    assert "def _aggregate_bars" in server
     assert "def load_tick_series" in db
-    assert "def choose_tick_sample_interval" in db
     assert "SAMPLE BY" in db
     assert 'id="tick-view-modal"' in html
-    assert 'id="tick-view-chart"' in html
-    assert 'type="datetime-local"' in html
+    assert 'id="bar-view-modal"' in html
+    assert 'id="bar-view-chart"' in html
     assert 'data-tick="view"' in js
+    assert 'data-data="view"' in js
     assert "function openTickViewModal" in js
-    assert "function drawTickViewChart" in js
+    assert "function openBarViewModal" in js
+    assert "function drawBarViewChart" in js
     assert "/data/tick/series" in js
+    assert "/data/bar/series" in js
     assert 'data-tick="export"' not in js
+    assert 'data-data="export"' not in js
 
     start = datetime(2026, 9, 7, 9, 30, 0)
     assert choose_tick_sample_interval(start, start + timedelta(minutes=10)) == "1s"

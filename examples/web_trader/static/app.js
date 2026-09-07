@@ -19,6 +19,7 @@ const state = {
     liveMonitor: null,
     liveExplainChart: null,
     tickView: null,
+    barView: null,
     meta: { exchanges: [], intervals: [], directions: [], offsets: [], order_types: [], option_models: [] },
 };
 
@@ -460,7 +461,7 @@ async function refreshData() {
             <td>${item.start || ""}</td>
             <td>${item.end || ""}</td>
             <td>
-                <button class="small ghost" data-data="export" data-symbol="${item.symbol}" data-exchange="${item.exchange}" data-interval="${item.interval}" data-start="${item.start || ""}" data-end="${item.end || ""}">导出</button>
+                <button class="small ghost" data-data="view" data-symbol="${item.symbol}" data-exchange="${item.exchange}" data-interval="${item.interval}" data-start="${item.start || ""}" data-end="${item.end || ""}" data-count="${item.count ?? ""}">查看</button>
                 <button class="small danger" data-data="delete" data-symbol="${item.symbol}" data-exchange="${item.exchange}" data-interval="${item.interval}">删除</button>
             </td>
         </tr>`);
@@ -871,26 +872,14 @@ $("data-body").addEventListener("click", async (event) => {
     if (!button) {
         return;
     }
-    const { symbol, exchange, interval, start, end } = button.dataset;
+    const { symbol, exchange, interval, start, end, count } = button.dataset;
     try {
         if (button.dataset.data === "delete") {
             const result = await api(`/data/bar?symbol=${encodeURIComponent(symbol)}&exchange=${encodeURIComponent(exchange)}&interval=${encodeURIComponent(interval)}`, { method: "DELETE" });
             appendLog(`已删除 ${result.count} 条`);
             await refreshData();
-        } else {
-            const response = await fetch(`/data/export?symbol=${encodeURIComponent(symbol)}&exchange=${encodeURIComponent(exchange)}&interval=${encodeURIComponent(interval)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`, {
-                headers: { Authorization: `Bearer ${state.token}` },
-            });
-            if (!response.ok) {
-                throw new Error("导出失败");
-            }
-            const blob = await response.blob();
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement("a");
-            link.href = url;
-            link.download = `${symbol}_${exchange}_${interval}.csv`;
-            link.click();
-            URL.revokeObjectURL(url);
+        } else if (button.dataset.data === "view") {
+            openBarViewModal({ symbol, exchange, interval, start, end, count });
         }
     } catch (error) {
         appendLog(error.message);
@@ -1210,6 +1199,257 @@ if ($("tick-view-modal")) {
             return;
         }
         drawTickViewChart(state.tickView.series);
+    });
+}
+
+function closeBarViewModal() {
+    const modal = $("bar-view-modal");
+    if (!modal) {
+        return;
+    }
+    modal.classList.add("hidden");
+    modal.setAttribute("aria-hidden", "true");
+    state.barView = null;
+}
+
+function openBarViewModal({ symbol, exchange, interval, start, end, count }) {
+    const modal = $("bar-view-modal");
+    if (!modal) {
+        return;
+    }
+    state.barView = {
+        symbol,
+        exchange,
+        interval,
+        fullStart: start || "",
+        fullEnd: end || "",
+        count: count || "",
+    };
+    $("bar-view-title").textContent = `${symbol}.${exchange} ${interval} K线`;
+    $("bar-view-meta").textContent = count ? `库内约 ${count} 根` : "";
+    $("bar-view-start").value = toDatetimeLocalValue(start);
+    $("bar-view-end").value = toDatetimeLocalValue(end);
+    $("bar-view-hint").textContent = "加载中…";
+    modal.classList.remove("hidden");
+    modal.setAttribute("aria-hidden", "false");
+    requestAnimationFrame(() => {
+        refreshBarViewChart().catch((error) => appendLog(error.message));
+    });
+}
+
+async function refreshBarViewChart() {
+    const ctxState = state.barView;
+    if (!ctxState) {
+        return;
+    }
+    const start = fromDatetimeLocalValue($("bar-view-start").value);
+    const end = fromDatetimeLocalValue($("bar-view-end").value);
+    if (!start || !end) {
+        $("bar-view-hint").textContent = "请选择开始与结束时间";
+        return;
+    }
+    $("bar-view-hint").textContent = "查询中…";
+    const data = await api(
+        `/data/bar/series?symbol=${encodeURIComponent(ctxState.symbol)}`
+        + `&exchange=${encodeURIComponent(ctxState.exchange)}`
+        + `&interval=${encodeURIComponent(ctxState.interval)}`
+        + `&start=${encodeURIComponent(start)}`
+        + `&end=${encodeURIComponent(end)}`
+        + `&max_points=800`
+    );
+    state.barView.series = data;
+    drawBarViewChart(data);
+    const merge = data.merge && data.merge > 1 ? `合并 ${data.merge} 根` : "原始周期";
+    $("bar-view-hint").textContent =
+        `${merge} ｜ 显示 ${data.count ?? 0} ｜ 原始 ${data.raw_count ?? "—"}`
+        + ` ｜ ${data.start || start} → ${data.end || end}`;
+    $("bar-view-meta").textContent =
+        `${ctxState.symbol}.${ctxState.exchange} ${ctxState.interval}`
+        + (ctxState.count ? ` ｜ 库内约 ${ctxState.count} 根` : "");
+}
+
+function barViewChartSize(canvas) {
+    const wrap = canvas.closest(".explain-chart-wrap") || canvas.parentElement;
+    const hint = $("bar-view-hint");
+    const hintH = hint && hint.offsetParent !== null ? hint.offsetHeight + 6 : 0;
+    const width = Math.max(280, Math.floor((wrap && wrap.clientWidth) || canvas.clientWidth || 640));
+    const available = wrap ? wrap.clientHeight - hintH : 0;
+    const height = Math.max(280, Math.floor(available > 40 ? available : Math.min(window.innerHeight * 0.55, 560)));
+    return { cssWidth: width, cssHeight: height };
+}
+
+function drawBarViewChart(data) {
+    const canvas = $("bar-view-chart");
+    if (!canvas) {
+        return;
+    }
+    const { cssWidth, cssHeight } = barViewChartSize(canvas);
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = cssWidth * dpr;
+    canvas.height = cssHeight * dpr;
+    canvas.style.width = `${cssWidth}px`;
+    canvas.style.height = `${cssHeight}px`;
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
+    ctx.fillStyle = "rgba(255,255,255,0.02)";
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+    const points = ((data && data.points) || []).filter((row) => {
+        const o = Number(row.open_price);
+        const h = Number(row.high_price);
+        const l = Number(row.low_price);
+        const c = Number(row.close_price);
+        return row.datetime && [o, h, l, c].every((v) => Number.isFinite(v) && v > 0);
+    });
+    if (!points.length) {
+        ctx.fillStyle = "#8b98a8";
+        ctx.font = "13px Microsoft YaHei, sans-serif";
+        ctx.fillText("所选时间范围内无 K 线数据", 16, 28);
+        return;
+    }
+
+    const pad = { top: 28, right: 18, bottom: 56, left: 64 };
+    const volH = Math.max(42, Math.floor((cssHeight - pad.top - pad.bottom) * 0.22));
+    const priceH = cssHeight - pad.top - pad.bottom - volH - 10;
+    const innerW = cssWidth - pad.left - pad.right;
+    const highs = points.map((row) => Number(row.high_price));
+    const lows = points.map((row) => Number(row.low_price));
+    const volumes = points.map((row) => Number(row.volume || 0));
+    const pMin = Math.min(...lows);
+    const pMax = Math.max(...highs);
+    const pPad = Math.max((pMax - pMin) * 0.06, Math.abs(pMax) * 0.0005, 0.01);
+    const yMin = pMin - pPad;
+    const yMax = pMax + pPad;
+    const vMax = Math.max(1, ...volumes);
+    const slot = innerW / points.length;
+    const bodyW = Math.max(2, Math.min(14, slot * 0.62));
+    const xOf = (index) => pad.left + slot * (index + 0.5);
+    const yOf = (p) => pad.top + (1 - (p - yMin) / Math.max(1e-9, yMax - yMin)) * priceH;
+    const volTop = pad.top + priceH + 10;
+    const upColor = "#ef5350";   // 红涨
+    const downColor = "#26a69a"; // 绿跌
+
+    ctx.strokeStyle = "rgba(255,255,255,0.22)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(pad.left, pad.top, innerW, priceH);
+
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    for (let i = 0; i <= 4; i += 1) {
+        const ratio = i / 4;
+        const price = yMax - (yMax - yMin) * ratio;
+        const y = pad.top + priceH * ratio;
+        ctx.strokeStyle = "rgba(255,255,255,0.06)";
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(pad.left + innerW, y);
+        ctx.stroke();
+        ctx.fillStyle = "#8b98a8";
+        ctx.fillText(price.toFixed(price >= 100 ? 1 : 2), 8, y + 4);
+    }
+
+    points.forEach((row, index) => {
+        const open = Number(row.open_price);
+        const high = Number(row.high_price);
+        const low = Number(row.low_price);
+        const close = Number(row.close_price);
+        const up = close >= open;
+        const color = up ? upColor : downColor;
+        const x = xOf(index);
+        const yHigh = yOf(high);
+        const yLow = yOf(low);
+        const yOpen = yOf(open);
+        const yClose = yOf(close);
+        const top = Math.min(yOpen, yClose);
+        const bodyH = Math.max(1, Math.abs(yClose - yOpen));
+
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, yHigh);
+        ctx.lineTo(x, yLow);
+        ctx.stroke();
+        if (up) {
+            ctx.strokeRect(x - bodyW / 2, top, bodyW, bodyH);
+        } else {
+            ctx.fillRect(x - bodyW / 2, top, bodyW, bodyH);
+        }
+
+        const h = (volumes[index] / vMax) * volH;
+        ctx.globalAlpha = 0.55;
+        ctx.fillRect(x - bodyW / 2, volTop + volH - h, bodyW, h);
+        ctx.globalAlpha = 1;
+    });
+
+    ctx.strokeStyle = "rgba(255,255,255,0.14)";
+    ctx.strokeRect(pad.left, volTop, innerW, volH);
+
+    const labelCount = Math.min(5, points.length);
+    ctx.fillStyle = "#8b98a8";
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    for (let i = 0; i < labelCount; i += 1) {
+        const idx = labelCount === 1 ? 0 : Math.round(i * (points.length - 1) / (labelCount - 1));
+        const label = String(points[idx].datetime || "").slice(5, 16);
+        const x = xOf(idx);
+        ctx.fillText(label, Math.min(cssWidth - 90, Math.max(pad.left, x - 28)), cssHeight - 10);
+    }
+
+    const last = points[points.length - 1];
+    ctx.fillStyle = "#d7e6ff";
+    ctx.font = "12px Microsoft YaHei, sans-serif";
+    ctx.fillText(`收 ${last.close_price}`, pad.left + 6, pad.top + 16);
+}
+
+if ($("bar-view-modal")) {
+    $("bar-view-close").addEventListener("click", closeBarViewModal);
+    $("bar-view-modal").addEventListener("click", (event) => {
+        if (event.target && event.target.dataset && event.target.dataset.barViewClose) {
+            closeBarViewModal();
+        }
+    });
+    $("bar-view-apply").addEventListener("click", () => {
+        refreshBarViewChart().catch((error) => appendLog(error.message));
+    });
+    $("bar-view-modal").querySelectorAll("[data-bar-range]").forEach((button) => {
+        button.addEventListener("click", () => {
+            const ctxState = state.barView;
+            if (!ctxState) {
+                return;
+            }
+            const range = button.dataset.barRange;
+            const fullStart = toDatetimeLocalValue(ctxState.fullStart);
+            const fullEnd = toDatetimeLocalValue(ctxState.fullEnd);
+            if (range === "all") {
+                $("bar-view-start").value = fullStart;
+                $("bar-view-end").value = fullEnd;
+            } else {
+                const endLocal = fullEnd || $("bar-view-end").value;
+                $("bar-view-end").value = endLocal;
+                const delta = range === "1d" ? -24 * 60 * 60 * 1000
+                    : range === "5d" ? -5 * 24 * 60 * 60 * 1000
+                        : -20 * 24 * 60 * 60 * 1000;
+                let startLocal = shiftDatetimeLocal(endLocal, delta);
+                if (fullStart && startLocal && startLocal < fullStart) {
+                    startLocal = fullStart;
+                }
+                $("bar-view-start").value = startLocal;
+            }
+            refreshBarViewChart().catch((error) => appendLog(error.message));
+        });
+    });
+    document.addEventListener("keydown", (event) => {
+        const modal = $("bar-view-modal");
+        if (event.key === "Escape" && modal && !modal.classList.contains("hidden")) {
+            closeBarViewModal();
+        }
+    });
+    window.addEventListener("resize", () => {
+        const modal = $("bar-view-modal");
+        if (!modal || modal.classList.contains("hidden") || !state.barView || !state.barView.series) {
+            return;
+        }
+        drawBarViewChart(state.barView.series);
     });
 }
 

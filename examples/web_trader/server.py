@@ -2229,6 +2229,77 @@ def query_bars(
     return to_plain(bars[-500:])
 
 
+def _aggregate_bars(chunk: list[Any]) -> dict[str, Any]:
+    first = chunk[0]
+    last = chunk[-1]
+    return {
+        "datetime": getattr(first, "datetime", None),
+        "open_price": getattr(first, "open_price", None),
+        "high_price": max(float(getattr(b, "high_price", 0) or 0) for b in chunk),
+        "low_price": min(float(getattr(b, "low_price", 0) or 0) for b in chunk),
+        "close_price": getattr(last, "close_price", None),
+        "volume": sum(float(getattr(b, "volume", 0) or 0) for b in chunk),
+        "turnover": sum(float(getattr(b, "turnover", 0) or 0) for b in chunk),
+        "open_interest": getattr(last, "open_interest", None),
+        "bar_count": len(chunk),
+    }
+
+
+@app.get("/data/bar/series")
+def query_bar_series(
+    symbol: str,
+    exchange: Exchange,
+    interval: Interval,
+    start: str,
+    end: str,
+    max_points: int = Query(800, ge=50, le=5000),
+    _: bool = Depends(get_access),
+) -> dict[str, Any]:
+    """OHLC bar series for the data-menu candlestick viewer."""
+    start_dt = parse_datetime(start)
+    end_dt = parse_datetime(end)
+    if end_dt < start_dt:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="结束时间早于开始时间")
+    bars = get_database().load_bar_data(
+        symbol,
+        exchange,
+        interval,
+        start_dt,
+        end_dt,
+    )
+    raw_count = len(bars)
+    merge = 1
+    if raw_count <= max_points:
+        points = [
+            {
+                "datetime": getattr(b, "datetime", None),
+                "open_price": getattr(b, "open_price", None),
+                "high_price": getattr(b, "high_price", None),
+                "low_price": getattr(b, "low_price", None),
+                "close_price": getattr(b, "close_price", None),
+                "volume": getattr(b, "volume", None),
+                "turnover": getattr(b, "turnover", None),
+                "open_interest": getattr(b, "open_interest", None),
+                "bar_count": 1,
+            }
+            for b in bars
+        ]
+    else:
+        merge = max(1, math.ceil(raw_count / max_points))
+        points = [_aggregate_bars(bars[idx : idx + merge]) for idx in range(0, raw_count, merge)]
+    return {
+        "symbol": symbol,
+        "exchange": exchange.value,
+        "interval": interval.value,
+        "start": to_plain(start_dt),
+        "end": to_plain(end_dt),
+        "merge": merge,
+        "raw_count": raw_count,
+        "count": len(points),
+        "points": to_plain(points),
+    }
+
+
 @app.delete("/data/bar")
 def delete_bars(
     symbol: str,

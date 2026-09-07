@@ -128,6 +128,9 @@ def main() -> None:
         start_md_bus_subscriber(event_engine, log=lambda m: main_engine.write_log(f"[MD_BUS] {m}"))
         # Keep Redis contract hash warm from web TD so md_receiver can MD-only recover
         # after Redis restarts without needing a TD seat.
+        # IMPORTANT: never PUBLISH back to the contract channel from this handler —
+        # the MD bus subscriber also emits EVENT_CONTRACT, which would feedback-loop
+        # and cause DataRecorder to spam CTP subscribe logs.
         try:
             import threading
             import time as _time
@@ -152,7 +155,7 @@ def main() -> None:
                     _pending.clear()
                     _last_flush = now
                 try:
-                    store_contracts_to_redis(batch)
+                    store_contracts_to_redis(batch, publish=False)
                 except Exception:
                     pass
 
@@ -174,8 +177,21 @@ def main() -> None:
                 if str(getattr(c, "symbol", "") or "").upper().startswith(("IF", "IO", "IH", "IC", "IM"))
             ]
             if existing:
-                result = store_contracts_to_redis(existing)
+                result = store_contracts_to_redis(existing, publish=False)
                 main_engine.write_log(f"[MD_BUS] seeded Redis contracts from web TD: {result}")
+        except Exception:
+            traceback.print_exc()
+
+        # Web uses Redis MD — DataRecorder must not re-subscribe via CTP on every
+        # contract event (useless + log spam when SKIP_MD=1).
+        try:
+            from vnpy_datarecorder.engine import RecorderEngine
+
+            def _skip_ctp_subscribe(self, contract) -> None:  # noqa: ANN001
+                return
+
+            RecorderEngine.subscribe = _skip_ctp_subscribe  # type: ignore[method-assign]
+            main_engine.write_log("[MD_BUS] DataRecorder CTP subscribe disabled (Redis MD)")
         except Exception:
             traceback.print_exc()
 

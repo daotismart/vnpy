@@ -693,8 +693,16 @@ class MdStreamConsumer:
             self._last_err = f"reclaim: {exc}"
 
 
-def store_contracts_to_redis(contracts: list) -> dict[str, Any]:
-    """Persist ContractData list into Redis hash (and publish) for MD-only warm start."""
+def store_contracts_to_redis(
+    contracts: list,
+    *,
+    publish: bool = True,
+) -> dict[str, Any]:
+    """Persist ContractData list into Redis hash for MD-only warm start.
+
+    Set publish=False when called from a Redis contract subscriber to avoid
+    feedback loops (PUBLISH → EVENT_CONTRACT → PUBLISH → …).
+    """
     try:
         client = create_redis_client(socket_timeout=10, socket_connect_timeout=5)
     except Exception as exc:
@@ -709,9 +717,11 @@ def store_contracts_to_redis(contracts: list) -> dict[str, Any]:
                 continue
             try:
                 payload = json.dumps(contract_to_dict(contract), ensure_ascii=False, separators=(",", ":"))
-                pipe.publish(contract_channel(), payload)
+                if publish:
+                    pipe.publish(contract_channel(), payload)
+                    pending += 1
                 pipe.hset(contracts_key(), contract.vt_symbol, payload)
-                pending += 2
+                pending += 1
                 stored += 1
                 if pending >= 200:
                     pipe.execute()
@@ -726,7 +736,7 @@ def store_contracts_to_redis(contracts: list) -> dict[str, Any]:
             client.close()
         except Exception:
             pass
-        return {"ok": True, "stored": stored, "errors": errors, "total": total}
+        return {"ok": True, "stored": stored, "errors": errors, "total": total, "publish": publish}
     except Exception as exc:
         return {"ok": False, "stored": stored, "errors": errors, "error": str(exc)}
 

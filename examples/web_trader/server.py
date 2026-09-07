@@ -1990,6 +1990,19 @@ def subscribe_futures_product(
     group = groups.get(product_key)
     if not group:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"找不到品种 {product_key}")
+    # Redis MD bus: ticks already arrive via pub/sub; CTP MD subscribe is a no-op/spam.
+    redis_md = env_flag("LIVE_CTP_SKIP_MD") or (
+        (os.getenv("LIVE_MD_SOURCE") or "").strip().lower() in {"redis", "bus", "md_bus"}
+    )
+    if redis_md:
+        fut_n = len(group["contracts"])
+        opt_n = 0
+        if include_options:
+            opt_n = len(collect_related_options(engine, group["product"], group["exchange"]))
+        message = f"已标记订阅 {product_key} {fut_n} 个期货"
+        if include_options:
+            message += f" + {opt_n} 个期权（行情来自 Redis，未向 CTP MD 重复订阅）"
+        return {"message": message, "count": fut_n, "option_count": opt_n, "redis_md": True}
     count = 0
     for _yyyymm, _month, contract in group["contracts"]:
         engine.subscribe(

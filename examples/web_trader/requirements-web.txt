@@ -19,3 +19,4 @@ psycopg[binary]>=3.2
 exchange-calendars>=4.10
 matplotlib>=3.10.1
 scipy>=1.15.2
+redis>=5.0

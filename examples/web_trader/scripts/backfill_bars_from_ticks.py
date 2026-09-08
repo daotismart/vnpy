@@ -43,13 +43,14 @@ def configure_db() -> None:
 def backfill(
     symbol: str | None = None,
     exchange: str | None = None,
-    batch_flush: int = 500,
+    batch_flush: int = 200,
 ) -> dict[str, int]:
     configure_db()
     db = get_database()
     overviews = db.get_tick_overview()
     written = 0
     symbols = 0
+    errors = 0
     for ov in overviews:
         if symbol and ov.symbol != symbol:
             continue
@@ -60,38 +61,48 @@ def backfill(
         end = ov.end
         if not start or not end:
             continue
-        # Load in day chunks to bound memory.
-        day = start.replace(hour=0, minute=0, second=0, microsecond=0)
-        end_day = end + timedelta(days=1)
-        completed: list = []
+        try:
+            # Fresh DB handle per symbol — QuestDB can drop long sessions.
+            database_module.database = None
+            db = get_database()
+            day = start.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_day = end + timedelta(days=1)
+            completed: list = []
 
-        def on_bar(bar) -> None:
-            completed.append(bar)
+            def on_bar(bar) -> None:
+                completed.append(bar)
 
-        bg = BarGenerator(on_bar)
-        while day < end_day:
-            chunk_end = day + timedelta(days=1)
-            ticks = db.load_tick_data(ov.symbol, ov.exchange, day, min(chunk_end, end_day))
-            for tick in ticks:
-                if tick.last_price:
-                    bg.update_tick(tick)
-            if completed and len(completed) >= batch_flush:
+            bg = BarGenerator(on_bar)
+            while day < end_day:
+                chunk_end = day + timedelta(days=1)
+                ticks = db.load_tick_data(ov.symbol, ov.exchange, day, min(chunk_end, end_day))
+                for tick in ticks:
+                    if tick.last_price:
+                        bg.update_tick(tick)
+                if completed and len(completed) >= batch_flush:
+                    db.save_bar_data(completed, stream=True)
+                    written += len(completed)
+                    completed.clear()
+                day = chunk_end
+            if bg.bar is not None:
+                bar = bg.bar
+                bar.datetime = bar.datetime.replace(second=0, microsecond=0)
+                completed.append(bar)
+                bg.bar = None
+            if completed:
                 db.save_bar_data(completed, stream=True)
                 written += len(completed)
                 completed.clear()
-            day = chunk_end
-        # Flush unfinished last minute as a closed bar if present.
-        if bg.bar is not None:
-            bar = bg.bar
-            bar.datetime = bar.datetime.replace(second=0, microsecond=0)
-            completed.append(bar)
-            bg.bar = None
-        if completed:
-            db.save_bar_data(completed, stream=True)
-            written += len(completed)
-            completed.clear()
-        print(f"backfilled {ov.symbol}.{ov.exchange.value}: ticks_end={end}", flush=True)
-    return {"symbols": symbols, "bars_written": written}
+            print(f"backfilled {ov.symbol}.{ov.exchange.value}: ticks_end={end}", flush=True)
+        except Exception as exc:
+            errors += 1
+            print(f"ERROR {ov.symbol}.{ov.exchange.value}: {exc}", flush=True)
+            database_module.database = None
+            try:
+                db = get_database()
+            except Exception:
+                pass
+    return {"symbols": symbols, "bars_written": written, "errors": errors}
 
 
 def main() -> int:

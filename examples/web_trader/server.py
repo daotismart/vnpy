@@ -471,11 +471,8 @@ def chain_spot_info(
             source = "parity"
 
     override = float(spot_override or 0)
-    if spot <= 0 and override > 0:
-        spot = override
-        source = "override"
-    elif override > 0 and source in {"", "parity"} and abs(spot - override) / max(override, 1.0) > 0.02:
-        # Prefer live strategy/index spot when parity drifts or und is cold.
+    if override > 0 and (spot <= 0 or source in {"", "parity"}):
+        # Explain / strategy callers pass live index spot; prefer it over parity.
         spot = override
         source = "override"
 

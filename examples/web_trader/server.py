@@ -275,8 +275,101 @@ def option_market_tick(option: OptionData | None) -> Any:
     return tick
 
 
+def option_mid_price(option: OptionData | None) -> float:
+    tick = option_market_tick(option)
+    if not tick:
+        return 0.0
+    bid = float(getattr(tick, "bid_price_1", 0) or 0)
+    ask = float(getattr(tick, "ask_price_1", 0) or 0)
+    last = float(getattr(tick, "last_price", 0) or 0)
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    return bid or ask or last
+
+
+def _option_time_to_expiry(option: OptionData | None, chain: Any = None) -> float:
+    if option is not None:
+        t = float(getattr(option, "time_to_expiry", 0) or 0)
+        if t > 0:
+            return t
+        dte = float(getattr(option, "days_to_expiry", 0) or 0)
+        if dte > 0:
+            return max(dte, 1.0) / float(ANNUAL_DAYS or 365)
+    if chain is not None:
+        dte = float(getattr(chain, "days_to_expiry", 0) or 0)
+        if dte > 0:
+            return max(dte, 1.0) / float(ANNUAL_DAYS or 365)
+    return 1.0 / 365.0
+
+
+def _chain_proxy_iv(chain: Any) -> float:
+    """Best-effort IV for GEX when OptionMaster theo_gamma / mid_impv is cold."""
+    ivs: list[float] = []
+    for index in getattr(chain, "indexes", []) or []:
+        for opt in (
+            (getattr(chain, "calls", {}) or {}).get(index),
+            (getattr(chain, "puts", {}) or {}).get(index),
+        ):
+            if not opt:
+                continue
+            iv = float(getattr(opt, "mid_impv", 0) or 0)
+            if iv > 0:
+                ivs.append(iv)
+    if ivs:
+        return sum(ivs) / len(ivs)
+    return 0.18
+
+
+def option_gamma_for_gex(
+    option: OptionData | None,
+    spot: float,
+    proxy_iv: float = 0.18,
+    chain: Any = None,
+) -> float:
+    """Return size-scaled gamma; fall back to Black-76 when theo_gamma is unset."""
+    if not option or not spot:
+        return 0.0
+    theo = float(getattr(option, "theo_gamma", 0) or 0)
+    if theo:
+        return theo
+    try:
+        from vnpy_optionmaster.pricing.black_76 import calculate_gamma
+    except Exception:
+        return 0.0
+    try:
+        strike = float(getattr(option, "strike_price", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if strike <= 0:
+        return 0.0
+    t = _option_time_to_expiry(option, chain)
+    iv = float(getattr(option, "mid_impv", 0) or 0) or float(proxy_iv or 0) or 0.18
+    rate = float(getattr(option, "interest_rate", 0) or 0.02)
+    try:
+        gamma = float(calculate_gamma(float(spot), strike, rate, t, max(iv, 0.05)) or 0)
+    except Exception:
+        return 0.0
+    size = float(getattr(option, "size", 1) or 1)
+    return max(gamma, 0.0) * size
+
+
+def option_gex_1pct(
+    option: OptionData | None,
+    spot: float,
+    volume: float,
+    proxy_iv: float = 0.18,
+    chain: Any = None,
+) -> float:
+    """标的变动 1% 时的 Delta 敞口；优先 theo_gamma，缺省时用 Black-76。"""
+    if not option or not spot:
+        return 0.0
+    gamma = option_gamma_for_gex(option, spot, proxy_iv=proxy_iv, chain=chain)
+    return float(gamma or 0) * float(volume or 0) * spot * 0.01
+
+
 def serialize_option(option: OptionData) -> dict[str, Any]:
     tick = option_market_tick(option)
+    gamma = float(getattr(option, "theo_gamma", 0) or 0)
     return {
         "vt_symbol": option.vt_symbol,
         "strike_price": option.strike_price,
@@ -290,7 +383,7 @@ def serialize_option(option: OptionData) -> dict[str, Any]:
         "last_price": getattr(tick, "last_price", 0) if tick else 0,
         "mid_impv": round(option.mid_impv * 100, 2) if option.mid_impv else 0,
         "theo_delta": option.theo_delta,
-        "theo_gamma": option.theo_gamma,
+        "theo_gamma": gamma,
         "theo_theta": option.theo_theta,
         "theo_vega": option.theo_vega,
         "pos_delta": option.pos_delta,
@@ -300,13 +393,6 @@ def serialize_option(option: OptionData) -> dict[str, Any]:
 def option_open_interest(option: OptionData | None) -> float:
     tick = option_market_tick(option)
     return float(getattr(tick, "open_interest", 0) or 0) if tick else 0.0
-
-
-def option_gex_1pct(option: OptionData | None, spot: float, volume: float) -> float:
-    """标的变动 1% 时的 Delta 敞口；theo_gamma 已含合约乘数。"""
-    if not option or not spot:
-        return 0.0
-    return float(option.theo_gamma or 0) * float(volume or 0) * spot * 0.01
 
 
 def _gex_flip_strike(strikes: list[dict[str, Any]], value_key: str) -> float | None:
@@ -364,6 +450,8 @@ def compute_chain_gex(chain) -> dict[str, Any]:
     underlying = getattr(chain, "underlying", None)
     spot = float(info.get("spot") or 0)
     atm_price = float(info.get("atm_price") or 0)
+    proxy_iv = _chain_proxy_iv(chain)
+    used_model_gamma = False
 
     strikes: list[dict[str, Any]] = []
     call_gex_sum = 0.0
@@ -384,10 +472,16 @@ def compute_chain_gex(chain) -> dict[str, Any]:
         put_oi = option_open_interest(put)
         call_pos = option_net_position(call)
         put_pos = option_net_position(put)
-        call_gex = option_gex_1pct(call, spot, call_oi)
-        put_gex = -option_gex_1pct(put, spot, put_oi)
-        call_pos_gex = option_gex_1pct(call, spot, call_pos)
-        put_pos_gex = -option_gex_1pct(put, spot, put_pos)
+        call_gamma = option_gamma_for_gex(call, spot, proxy_iv=proxy_iv, chain=chain) if call else 0.0
+        put_gamma = option_gamma_for_gex(put, spot, proxy_iv=proxy_iv, chain=chain) if put else 0.0
+        if call and not float(getattr(call, "theo_gamma", 0) or 0) and call_gamma:
+            used_model_gamma = True
+        if put and not float(getattr(put, "theo_gamma", 0) or 0) and put_gamma:
+            used_model_gamma = True
+        call_gex = call_gamma * float(call_oi or 0) * spot * 0.01 if spot else 0.0
+        put_gex = -(put_gamma * float(put_oi or 0) * spot * 0.01) if spot else 0.0
+        call_pos_gex = call_gamma * float(call_pos or 0) * spot * 0.01 if spot else 0.0
+        put_pos_gex = -(put_gamma * float(put_pos or 0) * spot * 0.01) if spot else 0.0
         pos_gex = call_pos_gex + put_pos_gex
         net_gex = call_gex + put_gex
         call_gex_sum += call_gex
@@ -401,8 +495,8 @@ def compute_chain_gex(chain) -> dict[str, Any]:
                 "strike": strike,
                 "call_oi": call_oi,
                 "put_oi": put_oi,
-                "call_gamma": float(getattr(call, "theo_gamma", 0) or 0) if call else 0.0,
-                "put_gamma": float(getattr(put, "theo_gamma", 0) or 0) if put else 0.0,
+                "call_gamma": round(call_gamma, 8),
+                "put_gamma": round(put_gamma, 8),
                 "call_gex": round(call_gex, 4),
                 "put_gex": round(put_gex, 4),
                 "net_gex": round(net_gex, 4),
@@ -458,6 +552,8 @@ def compute_chain_gex(chain) -> dict[str, Any]:
         "strikes": strikes,
         "convention": "dealer",
         "unit": "delta_1pct",
+        "used_model_gamma": used_model_gamma,
+        "proxy_iv": round(float(proxy_iv or 0), 6),
     }
 
 
@@ -577,7 +673,7 @@ def compute_gex_stack(portfolio, preferred_chain: str = "") -> dict[str, Any]:
 
 
 def option_mid_price(option: OptionData | None) -> float:
-    tick = getattr(option, "tick", None) if option else None
+    tick = option_market_tick(option)
     if not tick:
         return 0.0
     bid = float(getattr(tick, "bid_price_1", 0) or 0)
@@ -3798,8 +3894,9 @@ def live_chain_gex_profile(portfolio_name: str, chain_symbol: str = "") -> dict[
                 "put_gamma": row.get("put_gamma"),
             }
         )
+    source = "live_oi+model_gamma" if gex.get("used_model_gamma") else "live_oi+theo_gamma"
     return {
-        "source": "live_oi",
+        "source": source,
         "portfolio": portfolio_name,
         "chain_symbol": symbol or gex.get("spot_chain") or "",
         "spot": gex.get("spot"),
@@ -3812,6 +3909,8 @@ def live_chain_gex_profile(portfolio_name: str, chain_symbol: str = "") -> dict[
         "call_gex": gex.get("call_gex"),
         "put_gex": gex.get("put_gex"),
         "net_gex": gex.get("net_gex"),
+        "used_model_gamma": bool(gex.get("used_model_gamma")),
+        "proxy_iv": gex.get("proxy_iv"),
         "strikes": rows,
         "formula": "CallGEX = Γ_call × OI_call × S × 1%；PutGEX = −Γ_put × OI_put × S × 1%",
         "rule": "Call墙 = argmax CallGEX；Put墙 = argmin PutGEX（最负）",
@@ -3847,11 +3946,19 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
         and abs(float(call_wall) - float(profile_call)) < 1e-6
         and abs(float(put_wall) - float(profile_put)) < 1e-6
     )
-    wall_source = "链上真实 OI + theo_gamma" if walls_match else (
-        "策略 live_gex_walls / 必要时 synthetic_gex_walls；下图为当前链实时 GEX 剖面供对照"
-        if profile.get("strikes")
-        else "策略快照（链上剖面暂不可用）"
-    )
+    if walls_match:
+        wall_source = (
+            "链上真实 OI + Black-76 模型 gamma"
+            if profile.get("used_model_gamma")
+            else "链上真实 OI + theo_gamma"
+        )
+    elif profile.get("strikes"):
+        gamma_note = "（剖面用 Black-76 回补 gamma）" if profile.get("used_model_gamma") else ""
+        wall_source = (
+            f"策略 live_gex_walls / 必要时 synthetic_gex_walls；下图为当前链实时 GEX 剖面供对照{gamma_note}"
+        )
+    else:
+        wall_source = "策略快照（链上剖面暂不可用）"
 
     def _num(value: Any, digits: int = 4) -> str:
         try:

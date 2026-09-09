@@ -18,6 +18,8 @@ const state = {
     scriptBtPresetKey: "",
     liveMonitor: null,
     liveExplainChart: null,
+    tickView: null,
+    barView: null,
     meta: { exchanges: [], intervals: [], directions: [], offsets: [], order_types: [], option_models: [] },
 };
 
@@ -459,7 +461,7 @@ async function refreshData() {
             <td>${item.start || ""}</td>
             <td>${item.end || ""}</td>
             <td>
-                <button class="small ghost" data-data="export" data-symbol="${item.symbol}" data-exchange="${item.exchange}" data-interval="${item.interval}" data-start="${item.start || ""}" data-end="${item.end || ""}">导出</button>
+                <button class="small ghost" data-data="view" data-symbol="${item.symbol}" data-exchange="${item.exchange}" data-interval="${item.interval}" data-start="${item.start || ""}" data-end="${item.end || ""}" data-count="${item.count ?? ""}">查看</button>
                 <button class="small danger" data-data="delete" data-symbol="${item.symbol}" data-exchange="${item.exchange}" data-interval="${item.interval}">删除</button>
             </td>
         </tr>`);
@@ -473,7 +475,7 @@ async function refreshData() {
                 <td>${item.start || ""}</td>
                 <td>${item.end || ""}</td>
                 <td>
-                    <button class="small ghost" data-tick="export" data-symbol="${item.symbol}" data-exchange="${item.exchange}" data-start="${item.start || ""}" data-end="${item.end || ""}">导出</button>
+                    <button class="small ghost" data-tick="view" data-symbol="${item.symbol}" data-exchange="${item.exchange}" data-start="${item.start || ""}" data-end="${item.end || ""}" data-count="${item.count ?? ""}">查看</button>
                     <button class="small danger" data-tick="delete" data-symbol="${item.symbol}" data-exchange="${item.exchange}">删除</button>
                 </td>
             </tr>`);
@@ -870,26 +872,14 @@ $("data-body").addEventListener("click", async (event) => {
     if (!button) {
         return;
     }
-    const { symbol, exchange, interval, start, end } = button.dataset;
+    const { symbol, exchange, interval, start, end, count } = button.dataset;
     try {
         if (button.dataset.data === "delete") {
             const result = await api(`/data/bar?symbol=${encodeURIComponent(symbol)}&exchange=${encodeURIComponent(exchange)}&interval=${encodeURIComponent(interval)}`, { method: "DELETE" });
             appendLog(`已删除 ${result.count} 条`);
             await refreshData();
-        } else {
-            const response = await fetch(`/data/export?symbol=${encodeURIComponent(symbol)}&exchange=${encodeURIComponent(exchange)}&interval=${encodeURIComponent(interval)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`, {
-                headers: { Authorization: `Bearer ${state.token}` },
-            });
-            if (!response.ok) {
-                throw new Error("导出失败");
-            }
-            const blob = await response.blob();
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement("a");
-            link.href = url;
-            link.download = `${symbol}_${exchange}_${interval}.csv`;
-            link.click();
-            URL.revokeObjectURL(url);
+        } else if (button.dataset.data === "view") {
+            openBarViewModal({ symbol, exchange, interval, start, end, count });
         }
     } catch (error) {
         appendLog(error.message);
@@ -929,30 +919,537 @@ if ($("tick-data-body")) {
         if (!button) {
             return;
         }
-        const { symbol, exchange, start, end } = button.dataset;
+        const { symbol, exchange, start, end, count } = button.dataset;
         try {
             if (button.dataset.tick === "delete") {
                 const result = await api(`/data/tick?symbol=${encodeURIComponent(symbol)}&exchange=${encodeURIComponent(exchange)}`, { method: "DELETE" });
                 appendLog(`已删除 Tick ${result.count} 条`);
                 await refreshData();
-            } else {
-                const response = await fetch(`/data/tick/export?symbol=${encodeURIComponent(symbol)}&exchange=${encodeURIComponent(exchange)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`, {
-                    headers: { Authorization: `Bearer ${state.token}` },
-                });
-                if (!response.ok) {
-                    throw new Error("Tick 导出失败");
-                }
-                const blob = await response.blob();
-                const url = URL.createObjectURL(blob);
-                const link = document.createElement("a");
-                link.href = url;
-                link.download = `${symbol}_${exchange}_tick.csv`;
-                link.click();
-                URL.revokeObjectURL(url);
+            } else if (button.dataset.tick === "view") {
+                openTickViewModal({ symbol, exchange, start, end, count });
             }
         } catch (error) {
             appendLog(error.message);
         }
+    });
+}
+
+function toDatetimeLocalValue(text) {
+    if (!text) {
+        return "";
+    }
+    const raw = String(text).trim().replace("T", " ");
+    const match = raw.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::(\d{2}))?/);
+    if (!match) {
+        return "";
+    }
+    return `${match[1]}T${match[2]}${match[3] ? `:${match[3]}` : ":00"}`;
+}
+
+function fromDatetimeLocalValue(value) {
+    if (!value) {
+        return "";
+    }
+    return String(value).trim().replace("T", " ");
+}
+
+function shiftDatetimeLocal(baseLocal, deltaMs) {
+    const text = fromDatetimeLocalValue(baseLocal);
+    if (!text) {
+        return "";
+    }
+    const dt = new Date(text.replace(" ", "T"));
+    if (Number.isNaN(dt.getTime())) {
+        return "";
+    }
+    const next = new Date(dt.getTime() + deltaMs);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${next.getFullYear()}-${pad(next.getMonth() + 1)}-${pad(next.getDate())}T${pad(next.getHours())}:${pad(next.getMinutes())}:${pad(next.getSeconds())}`;
+}
+
+function closeTickViewModal() {
+    const modal = $("tick-view-modal");
+    if (!modal) {
+        return;
+    }
+    modal.classList.add("hidden");
+    modal.setAttribute("aria-hidden", "true");
+    state.tickView = null;
+}
+
+function openTickViewModal({ symbol, exchange, start, end, count }) {
+    const modal = $("tick-view-modal");
+    if (!modal) {
+        return;
+    }
+    state.tickView = {
+        symbol,
+        exchange,
+        fullStart: start || "",
+        fullEnd: end || "",
+        count: count || "",
+    };
+    $("tick-view-title").textContent = `${symbol}.${exchange} Tick 曲线`;
+    $("tick-view-meta").textContent = count ? `库内约 ${count} 条` : "";
+    $("tick-view-start").value = toDatetimeLocalValue(start);
+    $("tick-view-end").value = toDatetimeLocalValue(end);
+    $("tick-view-hint").textContent = "加载中…";
+    modal.classList.remove("hidden");
+    modal.setAttribute("aria-hidden", "false");
+    requestAnimationFrame(() => {
+        refreshTickViewChart().catch((error) => appendLog(error.message));
+    });
+}
+
+async function refreshTickViewChart() {
+    const ctxState = state.tickView;
+    if (!ctxState) {
+        return;
+    }
+    const start = fromDatetimeLocalValue($("tick-view-start").value);
+    const end = fromDatetimeLocalValue($("tick-view-end").value);
+    if (!start || !end) {
+        $("tick-view-hint").textContent = "请选择开始与结束时间";
+        return;
+    }
+    $("tick-view-hint").textContent = "查询中…";
+    const data = await api(
+        `/data/tick/series?symbol=${encodeURIComponent(ctxState.symbol)}`
+        + `&exchange=${encodeURIComponent(ctxState.exchange)}`
+        + `&start=${encodeURIComponent(start)}`
+        + `&end=${encodeURIComponent(end)}`
+        + `&max_points=2500`
+    );
+    state.tickView.series = data;
+    drawTickViewChart(data);
+    const raw = data.raw_count != null ? data.raw_count : "—";
+    $("tick-view-hint").textContent =
+        `采样 ${data.sample || "—"} ｜ 点 ${data.count ?? 0} ｜ 原始 Tick ${raw}`
+        + ` ｜ ${data.start || start} → ${data.end || end}`;
+    $("tick-view-meta").textContent =
+        `${ctxState.symbol}.${ctxState.exchange}`
+        + (ctxState.count ? ` ｜ 库内约 ${ctxState.count} 条` : "");
+}
+
+function tickViewChartSize(canvas) {
+    const wrap = canvas.closest(".explain-chart-wrap") || canvas.parentElement;
+    const hint = $("tick-view-hint");
+    const hintH = hint && hint.offsetParent !== null ? hint.offsetHeight + 6 : 0;
+    const width = Math.max(280, Math.floor((wrap && wrap.clientWidth) || canvas.clientWidth || 640));
+    const available = wrap ? wrap.clientHeight - hintH : 0;
+    const height = Math.max(280, Math.floor(available > 40 ? available : Math.min(window.innerHeight * 0.55, 560)));
+    return { cssWidth: width, cssHeight: height };
+}
+
+function drawTickViewChart(data) {
+    const canvas = $("tick-view-chart");
+    if (!canvas) {
+        return;
+    }
+    const { cssWidth, cssHeight } = tickViewChartSize(canvas);
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = cssWidth * dpr;
+    canvas.height = cssHeight * dpr;
+    canvas.style.width = `${cssWidth}px`;
+    canvas.style.height = `${cssHeight}px`;
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
+    ctx.fillStyle = "rgba(255,255,255,0.02)";
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+    const points = ((data && data.points) || []).filter((row) => {
+        const price = Number(row.last_price);
+        return Number.isFinite(price) && price > 0 && row.datetime;
+    });
+    if (!points.length) {
+        ctx.fillStyle = "#8b98a8";
+        ctx.font = "13px Microsoft YaHei, sans-serif";
+        ctx.fillText("所选时间范围内无 Tick 数据", 16, 28);
+        return;
+    }
+
+    const pad = { top: 28, right: 18, bottom: 56, left: 64 };
+    const volH = Math.max(42, Math.floor((cssHeight - pad.top - pad.bottom) * 0.22));
+    const priceH = cssHeight - pad.top - pad.bottom - volH - 10;
+    const innerW = cssWidth - pad.left - pad.right;
+    const times = points.map((row) => new Date(String(row.datetime).replace(" ", "T")).getTime());
+    const prices = points.map((row) => Number(row.last_price));
+    const volumes = points.map((row) => Number(row.volume || 0));
+    const t0 = Math.min(...times);
+    const t1 = Math.max(...times);
+    const pMin = Math.min(...prices);
+    const pMax = Math.max(...prices);
+    const pPad = Math.max((pMax - pMin) * 0.06, Math.abs(pMax) * 0.0005, 0.01);
+    const yMin = pMin - pPad;
+    const yMax = pMax + pPad;
+    const vMax = Math.max(1, ...volumes);
+    const xOf = (t) => pad.left + ((t - t0) / Math.max(1, t1 - t0)) * innerW;
+    const yOf = (p) => pad.top + (1 - (p - yMin) / Math.max(1e-9, yMax - yMin)) * priceH;
+    const volTop = pad.top + priceH + 10;
+
+    ctx.strokeStyle = "rgba(255,255,255,0.22)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(pad.left, pad.top, innerW, priceH);
+
+    // price grid
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    ctx.fillStyle = "#8b98a8";
+    for (let i = 0; i <= 4; i += 1) {
+        const ratio = i / 4;
+        const price = yMax - (yMax - yMin) * ratio;
+        const y = pad.top + priceH * ratio;
+        ctx.strokeStyle = "rgba(255,255,255,0.06)";
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(pad.left + innerW, y);
+        ctx.stroke();
+        ctx.fillStyle = "#8b98a8";
+        ctx.fillText(price.toFixed(price >= 100 ? 1 : 2), 8, y + 4);
+    }
+
+    // volume bars
+    const barW = Math.max(1, innerW / points.length * 0.7);
+    points.forEach((row, index) => {
+        const x = xOf(times[index]);
+        const h = (volumes[index] / vMax) * volH;
+        ctx.fillStyle = "rgba(84, 160, 255, 0.28)";
+        ctx.fillRect(x - barW / 2, volTop + volH - h, barW, h);
+    });
+    ctx.strokeStyle = "rgba(255,255,255,0.14)";
+    ctx.strokeRect(pad.left, volTop, innerW, volH);
+
+    // price line
+    ctx.strokeStyle = "#54a0ff";
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    points.forEach((row, index) => {
+        const x = xOf(times[index]);
+        const y = yOf(prices[index]);
+        if (index === 0) {
+            ctx.moveTo(x, y);
+        } else {
+            ctx.lineTo(x, y);
+        }
+    });
+    ctx.stroke();
+
+    // time labels
+    const labelCount = Math.min(5, points.length);
+    ctx.fillStyle = "#8b98a8";
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    for (let i = 0; i < labelCount; i += 1) {
+        const idx = labelCount === 1 ? 0 : Math.round(i * (points.length - 1) / (labelCount - 1));
+        const label = String(points[idx].datetime || "").slice(5, 19);
+        const x = xOf(times[idx]);
+        ctx.fillText(label, Math.min(cssWidth - 90, Math.max(pad.left, x - 36)), cssHeight - 10);
+    }
+
+    ctx.fillStyle = "#d7e6ff";
+    ctx.font = "12px Microsoft YaHei, sans-serif";
+    ctx.fillText(`最新 ${prices[prices.length - 1]}`, pad.left + 6, pad.top + 16);
+}
+
+if ($("tick-view-modal")) {
+    $("tick-view-close").addEventListener("click", closeTickViewModal);
+    $("tick-view-modal").addEventListener("click", (event) => {
+        if (event.target && event.target.dataset && event.target.dataset.tickViewClose) {
+            closeTickViewModal();
+        }
+    });
+    $("tick-view-apply").addEventListener("click", () => {
+        refreshTickViewChart().catch((error) => appendLog(error.message));
+    });
+    $("tick-view-modal").querySelectorAll("[data-tick-range]").forEach((button) => {
+        button.addEventListener("click", () => {
+            const ctxState = state.tickView;
+            if (!ctxState) {
+                return;
+            }
+            const range = button.dataset.tickRange;
+            const fullStart = toDatetimeLocalValue(ctxState.fullStart);
+            const fullEnd = toDatetimeLocalValue(ctxState.fullEnd);
+            if (range === "all") {
+                $("tick-view-start").value = fullStart;
+                $("tick-view-end").value = fullEnd;
+            } else {
+                const endLocal = fullEnd || $("tick-view-end").value;
+                $("tick-view-end").value = endLocal;
+                const delta = range === "30m" ? -30 * 60 * 1000
+                    : range === "2h" ? -2 * 60 * 60 * 1000
+                        : -24 * 60 * 60 * 1000;
+                let startLocal = shiftDatetimeLocal(endLocal, delta);
+                if (fullStart && startLocal && startLocal < fullStart) {
+                    startLocal = fullStart;
+                }
+                $("tick-view-start").value = startLocal;
+            }
+            refreshTickViewChart().catch((error) => appendLog(error.message));
+        });
+    });
+    document.addEventListener("keydown", (event) => {
+        const modal = $("tick-view-modal");
+        if (event.key === "Escape" && modal && !modal.classList.contains("hidden")) {
+            closeTickViewModal();
+        }
+    });
+    window.addEventListener("resize", () => {
+        const modal = $("tick-view-modal");
+        if (!modal || modal.classList.contains("hidden") || !state.tickView || !state.tickView.series) {
+            return;
+        }
+        drawTickViewChart(state.tickView.series);
+    });
+}
+
+function closeBarViewModal() {
+    const modal = $("bar-view-modal");
+    if (!modal) {
+        return;
+    }
+    modal.classList.add("hidden");
+    modal.setAttribute("aria-hidden", "true");
+    state.barView = null;
+}
+
+function openBarViewModal({ symbol, exchange, interval, start, end, count }) {
+    const modal = $("bar-view-modal");
+    if (!modal) {
+        return;
+    }
+    state.barView = {
+        symbol,
+        exchange,
+        interval,
+        fullStart: start || "",
+        fullEnd: end || "",
+        count: count || "",
+    };
+    $("bar-view-title").textContent = `${symbol}.${exchange} ${interval} K线`;
+    $("bar-view-meta").textContent = count ? `库内约 ${count} 根` : "";
+    $("bar-view-start").value = toDatetimeLocalValue(start);
+    $("bar-view-end").value = toDatetimeLocalValue(end);
+    $("bar-view-hint").textContent = "加载中…";
+    modal.classList.remove("hidden");
+    modal.setAttribute("aria-hidden", "false");
+    requestAnimationFrame(() => {
+        refreshBarViewChart().catch((error) => appendLog(error.message));
+    });
+}
+
+async function refreshBarViewChart() {
+    const ctxState = state.barView;
+    if (!ctxState) {
+        return;
+    }
+    const start = fromDatetimeLocalValue($("bar-view-start").value);
+    const end = fromDatetimeLocalValue($("bar-view-end").value);
+    if (!start || !end) {
+        $("bar-view-hint").textContent = "请选择开始与结束时间";
+        return;
+    }
+    $("bar-view-hint").textContent = "查询中…";
+    const data = await api(
+        `/data/bar/series?symbol=${encodeURIComponent(ctxState.symbol)}`
+        + `&exchange=${encodeURIComponent(ctxState.exchange)}`
+        + `&interval=${encodeURIComponent(ctxState.interval)}`
+        + `&start=${encodeURIComponent(start)}`
+        + `&end=${encodeURIComponent(end)}`
+        + `&max_points=800`
+    );
+    state.barView.series = data;
+    drawBarViewChart(data);
+    const merge = data.merge && data.merge > 1 ? `合并 ${data.merge} 根` : "原始周期";
+    $("bar-view-hint").textContent =
+        `${merge} ｜ 显示 ${data.count ?? 0} ｜ 原始 ${data.raw_count ?? "—"}`
+        + ` ｜ ${data.start || start} → ${data.end || end}`;
+    $("bar-view-meta").textContent =
+        `${ctxState.symbol}.${ctxState.exchange} ${ctxState.interval}`
+        + (ctxState.count ? ` ｜ 库内约 ${ctxState.count} 根` : "");
+}
+
+function barViewChartSize(canvas) {
+    const wrap = canvas.closest(".explain-chart-wrap") || canvas.parentElement;
+    const hint = $("bar-view-hint");
+    const hintH = hint && hint.offsetParent !== null ? hint.offsetHeight + 6 : 0;
+    const width = Math.max(280, Math.floor((wrap && wrap.clientWidth) || canvas.clientWidth || 640));
+    const available = wrap ? wrap.clientHeight - hintH : 0;
+    const height = Math.max(280, Math.floor(available > 40 ? available : Math.min(window.innerHeight * 0.55, 560)));
+    return { cssWidth: width, cssHeight: height };
+}
+
+function drawBarViewChart(data) {
+    const canvas = $("bar-view-chart");
+    if (!canvas) {
+        return;
+    }
+    const { cssWidth, cssHeight } = barViewChartSize(canvas);
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = cssWidth * dpr;
+    canvas.height = cssHeight * dpr;
+    canvas.style.width = `${cssWidth}px`;
+    canvas.style.height = `${cssHeight}px`;
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
+    ctx.fillStyle = "rgba(255,255,255,0.02)";
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+    const points = ((data && data.points) || []).filter((row) => {
+        const o = Number(row.open_price);
+        const h = Number(row.high_price);
+        const l = Number(row.low_price);
+        const c = Number(row.close_price);
+        return row.datetime && [o, h, l, c].every((v) => Number.isFinite(v) && v > 0);
+    });
+    if (!points.length) {
+        ctx.fillStyle = "#8b98a8";
+        ctx.font = "13px Microsoft YaHei, sans-serif";
+        ctx.fillText("所选时间范围内无 K 线数据", 16, 28);
+        return;
+    }
+
+    const pad = { top: 28, right: 18, bottom: 56, left: 64 };
+    const volH = Math.max(42, Math.floor((cssHeight - pad.top - pad.bottom) * 0.22));
+    const priceH = cssHeight - pad.top - pad.bottom - volH - 10;
+    const innerW = cssWidth - pad.left - pad.right;
+    const highs = points.map((row) => Number(row.high_price));
+    const lows = points.map((row) => Number(row.low_price));
+    const volumes = points.map((row) => Number(row.volume || 0));
+    const pMin = Math.min(...lows);
+    const pMax = Math.max(...highs);
+    const pPad = Math.max((pMax - pMin) * 0.06, Math.abs(pMax) * 0.0005, 0.01);
+    const yMin = pMin - pPad;
+    const yMax = pMax + pPad;
+    const vMax = Math.max(1, ...volumes);
+    const slot = innerW / points.length;
+    const bodyW = Math.max(2, Math.min(14, slot * 0.62));
+    const xOf = (index) => pad.left + slot * (index + 0.5);
+    const yOf = (p) => pad.top + (1 - (p - yMin) / Math.max(1e-9, yMax - yMin)) * priceH;
+    const volTop = pad.top + priceH + 10;
+    const upColor = "#ef5350";   // 红涨
+    const downColor = "#26a69a"; // 绿跌
+
+    ctx.strokeStyle = "rgba(255,255,255,0.22)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(pad.left, pad.top, innerW, priceH);
+
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    for (let i = 0; i <= 4; i += 1) {
+        const ratio = i / 4;
+        const price = yMax - (yMax - yMin) * ratio;
+        const y = pad.top + priceH * ratio;
+        ctx.strokeStyle = "rgba(255,255,255,0.06)";
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(pad.left + innerW, y);
+        ctx.stroke();
+        ctx.fillStyle = "#8b98a8";
+        ctx.fillText(price.toFixed(price >= 100 ? 1 : 2), 8, y + 4);
+    }
+
+    points.forEach((row, index) => {
+        const open = Number(row.open_price);
+        const high = Number(row.high_price);
+        const low = Number(row.low_price);
+        const close = Number(row.close_price);
+        const up = close >= open;
+        const color = up ? upColor : downColor;
+        const x = xOf(index);
+        const yHigh = yOf(high);
+        const yLow = yOf(low);
+        const yOpen = yOf(open);
+        const yClose = yOf(close);
+        const top = Math.min(yOpen, yClose);
+        const bodyH = Math.max(1, Math.abs(yClose - yOpen));
+
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, yHigh);
+        ctx.lineTo(x, yLow);
+        ctx.stroke();
+        if (up) {
+            ctx.strokeRect(x - bodyW / 2, top, bodyW, bodyH);
+        } else {
+            ctx.fillRect(x - bodyW / 2, top, bodyW, bodyH);
+        }
+
+        const h = (volumes[index] / vMax) * volH;
+        ctx.globalAlpha = 0.55;
+        ctx.fillRect(x - bodyW / 2, volTop + volH - h, bodyW, h);
+        ctx.globalAlpha = 1;
+    });
+
+    ctx.strokeStyle = "rgba(255,255,255,0.14)";
+    ctx.strokeRect(pad.left, volTop, innerW, volH);
+
+    const labelCount = Math.min(5, points.length);
+    ctx.fillStyle = "#8b98a8";
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    for (let i = 0; i < labelCount; i += 1) {
+        const idx = labelCount === 1 ? 0 : Math.round(i * (points.length - 1) / (labelCount - 1));
+        const label = String(points[idx].datetime || "").slice(5, 16);
+        const x = xOf(idx);
+        ctx.fillText(label, Math.min(cssWidth - 90, Math.max(pad.left, x - 28)), cssHeight - 10);
+    }
+
+    const last = points[points.length - 1];
+    ctx.fillStyle = "#d7e6ff";
+    ctx.font = "12px Microsoft YaHei, sans-serif";
+    ctx.fillText(`收 ${last.close_price}`, pad.left + 6, pad.top + 16);
+}
+
+if ($("bar-view-modal")) {
+    $("bar-view-close").addEventListener("click", closeBarViewModal);
+    $("bar-view-modal").addEventListener("click", (event) => {
+        if (event.target && event.target.dataset && event.target.dataset.barViewClose) {
+            closeBarViewModal();
+        }
+    });
+    $("bar-view-apply").addEventListener("click", () => {
+        refreshBarViewChart().catch((error) => appendLog(error.message));
+    });
+    $("bar-view-modal").querySelectorAll("[data-bar-range]").forEach((button) => {
+        button.addEventListener("click", () => {
+            const ctxState = state.barView;
+            if (!ctxState) {
+                return;
+            }
+            const range = button.dataset.barRange;
+            const fullStart = toDatetimeLocalValue(ctxState.fullStart);
+            const fullEnd = toDatetimeLocalValue(ctxState.fullEnd);
+            if (range === "all") {
+                $("bar-view-start").value = fullStart;
+                $("bar-view-end").value = fullEnd;
+            } else {
+                const endLocal = fullEnd || $("bar-view-end").value;
+                $("bar-view-end").value = endLocal;
+                const delta = range === "1d" ? -24 * 60 * 60 * 1000
+                    : range === "5d" ? -5 * 24 * 60 * 60 * 1000
+                        : -20 * 24 * 60 * 60 * 1000;
+                let startLocal = shiftDatetimeLocal(endLocal, delta);
+                if (fullStart && startLocal && startLocal < fullStart) {
+                    startLocal = fullStart;
+                }
+                $("bar-view-start").value = startLocal;
+            }
+            refreshBarViewChart().catch((error) => appendLog(error.message));
+        });
+    });
+    document.addEventListener("keydown", (event) => {
+        const modal = $("bar-view-modal");
+        if (event.key === "Escape" && modal && !modal.classList.contains("hidden")) {
+            closeBarViewModal();
+        }
+    });
+    window.addEventListener("resize", () => {
+        const modal = $("bar-view-modal");
+        if (!modal || modal.classList.contains("hidden") || !state.barView || !state.barView.series) {
+            return;
+        }
+        drawBarViewChart(state.barView.series);
     });
 }
 
@@ -3944,6 +4441,7 @@ function closeLiveExplainModal() {
     modal.classList.add("hidden");
     modal.setAttribute("aria-hidden", "true");
     state.liveExplainChart = null;
+    renderLiveExplainTable(null);
 }
 
 function openLiveExplainModal(key) {
@@ -3973,10 +4471,13 @@ function openLiveExplainModal(key) {
             hint.textContent = "柱状为各行权价 CallGEX（橙）/ PutGEX（蓝）；竖线为策略墙与现价";
         } else if (chart.type === "dual_bar") {
             hint.textContent = "蓝色为交易日 DTE，绿色为自然日 DTE";
+        } else if (chart.type === "iv_rank_hist") {
+            hint.textContent = "柱为历史 HV；绿=≤当前IV，橙=>当前IV；青线=当前IV；右侧为 IV Rank";
         } else {
             hint.textContent = "";
         }
     }
+    renderLiveExplainTable(payload.table || null);
     modal.classList.remove("hidden");
     modal.setAttribute("aria-hidden", "false");
     // Layout must settle before measuring chart wrap size.
@@ -3984,6 +4485,39 @@ function openLiveExplainModal(key) {
         drawLiveExplainChart(chart);
         requestAnimationFrame(() => drawLiveExplainChart(chart));
     });
+}
+
+function renderLiveExplainTable(table) {
+    const wrap = $("live-explain-table-wrap");
+    const el = $("live-explain-table");
+    if (!wrap || !el) {
+        return;
+    }
+    const head = el.querySelector("thead");
+    const body = el.querySelector("tbody");
+    if (!table || !Array.isArray(table.rows) || !table.rows.length) {
+        wrap.classList.add("hidden");
+        if (head) {
+            head.innerHTML = "";
+        }
+        if (body) {
+            body.innerHTML = "";
+        }
+        return;
+    }
+    const cols = Array.isArray(table.columns) ? table.columns : [];
+    if (head) {
+        head.innerHTML = `<tr>${cols.map((col) => `<th>${col}</th>`).join("")}</tr>`;
+    }
+    if (body) {
+        body.innerHTML = table.rows.map((row) => {
+            const cells = Array.isArray(row) ? row : [];
+            const flag = String(cells[2] || "");
+            const cls = flag === "是" ? "is-below" : (flag === "否" ? "is-above" : "");
+            return `<tr class="${cls}">${cells.map((cell) => `<td>${cell == null ? "—" : cell}</td>`).join("")}</tr>`;
+        }).join("");
+    }
+    wrap.classList.remove("hidden");
 }
 
 function explainChartSize(canvas) {
@@ -4015,6 +4549,10 @@ function drawLiveExplainChart(chart) {
     const type = chart && chart.type;
     if (type === "gex_walls" || type === "spot_walls") {
         drawExplainGexWalls(ctx, cssWidth, cssHeight, chart);
+        return;
+    }
+    if (type === "iv_rank_hist") {
+        drawExplainIvRankHist(ctx, cssWidth, cssHeight, chart);
         return;
     }
     if (type === "gauge") {
@@ -4176,6 +4714,111 @@ function drawExplainGexWalls(ctx, width, height, chart) {
     });
     ctx.textAlign = "left";
     ctx.textBaseline = "alphabetic";
+}
+
+function drawExplainIvRankHist(ctx, width, height, chart) {
+    const pad = { top: 36, right: 110, bottom: 42, left: 54 };
+    const innerW = width - pad.left - pad.right;
+    const innerH = height - pad.top - pad.bottom;
+    const series = Array.isArray(chart.series) ? chart.series : [];
+    const currentIv = Number(chart.current_iv || 0);
+    const rank = Number(chart.iv_rank || 0);
+    const threshold = Number(chart.threshold || 40);
+    const below = Number(chart.below_count || 0);
+    const sampleN = Number(chart.sample_n || series.length || 0);
+
+    ctx.fillStyle = "#e8edf2";
+    ctx.font = "14px Microsoft YaHei, sans-serif";
+    ctx.fillText(chart.label || "历史 HV vs 当前 IV", pad.left, 22);
+
+    if (!series.length) {
+        ctx.fillStyle = "#8b98a8";
+        ctx.font = "13px Microsoft YaHei, sans-serif";
+        ctx.fillText("暂无 HV 历史样本（等待日线灌入或策略发布）", 16, 56);
+        return;
+    }
+
+    const values = series.map((row) => Number(row.hv || 0)).filter((v) => Number.isFinite(v));
+    const maxV = Math.max(currentIv * 1.05, ...values, 0.05);
+    const minV = 0;
+    const yOf = (v) => pad.top + innerH - ((v - minV) / (maxV - minV || 1)) * innerH;
+    const barW = Math.max(2, (innerW / series.length) * 0.72);
+
+    ctx.strokeStyle = "rgba(255,255,255,0.18)";
+    ctx.strokeRect(pad.left, pad.top, innerW, innerH);
+
+    // grid
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    [0, 0.25, 0.5, 0.75, 1].forEach((ratio) => {
+        const v = minV + (maxV - minV) * ratio;
+        const y = yOf(v);
+        ctx.strokeStyle = "rgba(255,255,255,0.06)";
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(pad.left + innerW, y);
+        ctx.stroke();
+        ctx.fillStyle = "#8b98a8";
+        ctx.textAlign = "right";
+        ctx.fillText(v.toFixed(2), pad.left - 8, y + 3);
+    });
+    ctx.textAlign = "left";
+
+    series.forEach((row, index) => {
+        const hv = Number(row.hv || 0);
+        const x = pad.left + (index + 0.5) * (innerW / series.length) - barW / 2;
+        const y = yOf(hv);
+        const h = Math.max(1, yOf(0) - y);
+        ctx.fillStyle = row.below_iv ? "#1dd1a1" : "#ff9f43";
+        ctx.fillRect(x, y, barW, h);
+    });
+
+    if (currentIv > 0) {
+        const y = yOf(currentIv);
+        ctx.strokeStyle = "#54a0ff";
+        ctx.lineWidth = 1.6;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(pad.left + innerW, y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = "#54a0ff";
+        ctx.font = "12px Microsoft YaHei, sans-serif";
+        ctx.fillText(`IV ${currentIv.toFixed(4)}`, pad.left + 6, y - 6);
+    }
+
+    // right-side rank panel
+    const rx = pad.left + innerW + 16;
+    const ry = pad.top + 8;
+    ctx.fillStyle = "rgba(255,255,255,0.04)";
+    ctx.fillRect(rx - 8, ry, 96, 120);
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.strokeRect(rx - 8, ry, 96, 120);
+    ctx.fillStyle = "#8b98a8";
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    ctx.fillText("IV Rank", rx, ry + 18);
+    ctx.fillStyle = rank >= threshold ? "#1dd1a1" : "#ff9f43";
+    ctx.font = "22px Microsoft YaHei, sans-serif";
+    ctx.fillText(String(Number(rank.toFixed(1))), rx, ry + 48);
+    ctx.fillStyle = "#8b98a8";
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    ctx.fillText(`阈值 ${threshold}`, rx, ry + 70);
+    ctx.fillText(`≤IV ${below}/${sampleN}`, rx, ry + 90);
+    ctx.fillText(rank >= threshold ? "偏高可卖" : "偏低观望", rx, ry + 110);
+
+    // x labels
+    ctx.fillStyle = "#8b98a8";
+    ctx.font = "10px Microsoft YaHei, sans-serif";
+    ctx.textAlign = "center";
+    const step = Math.max(1, Math.ceil(series.length / 8));
+    series.forEach((row, index) => {
+        if (index % step !== 0 && index !== series.length - 1) {
+            return;
+        }
+        const x = pad.left + (index + 0.5) * (innerW / series.length);
+        ctx.fillText(String(row.index || index + 1), x, pad.top + innerH + 16);
+    });
+    ctx.textAlign = "left";
 }
 
 function drawExplainGauge(ctx, width, height, chart) {

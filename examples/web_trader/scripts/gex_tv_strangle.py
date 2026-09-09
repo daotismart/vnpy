@@ -1426,6 +1426,8 @@ class GexTvStrangle:
                 "spot": round(spot, 2),
                 "lsp": round(lsp, 3),
                 "iv": round(iv, 4),
+                "hv": round(hv, 4),
+                "hv60": round(hv60, 4),
                 "iv_rank": round(rank, 1),
                 "iv_high": iv_high,
                 "range_ok": range_ok,
@@ -1439,6 +1441,20 @@ class GexTvStrangle:
                 "reason": self.last_skip,
                 "kelly": kelly_info,
                 "signals": signals,
+                "hv_hist": [round(float(x), 4) for x in self.hv_hist],
+                "iv_rank_calc": {
+                    "current_iv": round(iv, 4),
+                    "current_hv": round(hv, 4),
+                    "hv60": round(hv60, 4),
+                    "iv_factor": 1.12,
+                    "hv_lookback": int(self.cfg.hv_lookback),
+                    "iv_rank_lookback": int(self.cfg.iv_rank_lookback),
+                    "sample_n": len(self.hv_hist),
+                    "below_count": sum(1 for item in self.hv_hist if float(item) <= float(iv)),
+                    "iv_rank_min": float(self.cfg.iv_rank_min),
+                    "hv_ready": bool(hv_ready),
+                    "closes_n": len(self.day_closes),
+                },
                 "pick": None
                 if pick is None
                 else {

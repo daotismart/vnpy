@@ -4244,17 +4244,13 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
         },
         "iv_rank": {
             "title": "IV Rank",
-            "value": (
-                indicators.get("iv_rank")
-                if indicators.get("iv_rank") is not None
-                else (data.get("iv_rank") if data.get("iv_rank") is not None else iv_rank_info.get("iv_rank"))
-            ),
+            "value": iv_rank_info.get("iv_rank"),
             "formula": (
                 "IV Rank = 100 × count(历史 HV ≤ 当前 IV) / N；"
                 f"IV = HV_{iv_rank_info.get('hv_lookback') or 20} × {_num(iv_rank_info.get('iv_factor'), 2)}"
             ),
             "steps": [
-                f"当前 IV Rank：{_num(indicators.get('iv_rank') if indicators.get('iv_rank') is not None else data.get('iv_rank') or iv_rank_info.get('iv_rank'), 1)}",
+                f"当前 IV Rank：{_num(iv_rank_info.get('iv_rank'), 1)}",
                 f"当前 IV：{_num(iv_rank_info.get('current_iv'), 4)}（HV={_num(iv_rank_info.get('current_hv'), 4)} × {_num(iv_rank_info.get('iv_factor'), 2)}）",
                 (
                     f"历史 HV 样本：N={iv_rank_info.get('sample_n')} "
@@ -4262,7 +4258,8 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
                 ),
                 (
                     f"其中 HV ≤ 当前 IV 的个数：{iv_rank_info.get('below_count')} "
-                    f"→ Rank = 100 × {iv_rank_info.get('below_count')} / {max(int(iv_rank_info.get('sample_n') or 0), 1)}"
+                    f"→ Rank = 100 × {iv_rank_info.get('below_count')} / {max(int(iv_rank_info.get('sample_n') or 0), 1)} "
+                    f"= {_num(iv_rank_info.get('iv_rank'), 1)}"
                 ),
                 (
                     f"HV 分布：min={_num(iv_rank_info.get('min_hv'), 4)} / "
@@ -4277,12 +4274,7 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
                 "series": iv_rank_info.get("series") or [],
                 "current_iv": iv_rank_info.get("current_iv"),
                 "current_hv": iv_rank_info.get("current_hv"),
-                "iv_rank": float(
-                    indicators.get("iv_rank")
-                    or data.get("iv_rank")
-                    or iv_rank_info.get("iv_rank")
-                    or 0
-                ),
+                "iv_rank": float(iv_rank_info.get("iv_rank") or 0),
                 "threshold": float(iv_rank_info.get("iv_rank_min") or 40),
                 "below_count": iv_rank_info.get("below_count"),
                 "sample_n": iv_rank_info.get("sample_n"),

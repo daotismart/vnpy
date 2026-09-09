@@ -17,6 +17,8 @@ def test_server_uses_black76_gamma_fallback() -> None:
     assert "used_model_gamma" in text
     assert "live_oi+model_gamma" in text
     assert "def _chain_proxy_iv" in text
+    assert "def _chain_parity_spot" in text
+    assert "spot_override" in text
     # compute_chain_gex must not rely solely on theo_gamma
     assert "call_gamma = option_gamma_for_gex" in text
     assert 'float(getattr(call, "theo_gamma", 0) or 0) if call else 0.0' not in text.split("def compute_chain_gex")[1].split("def _pick_reference_spot")[0]

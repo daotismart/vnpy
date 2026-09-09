@@ -425,28 +425,104 @@ def _gex_flip_strike(strikes: list[dict[str, Any]], value_key: str) -> float | N
     return round(float(nearest_strike), 4) if nearest_strike is not None else None
 
 
-def chain_spot_info(chain, chain_symbol: str = "") -> dict[str, Any]:
+def chain_spot_info(
+    chain,
+    chain_symbol: str = "",
+    spot_override: float = 0.0,
+) -> dict[str, Any]:
+    """Resolve chain spot for GEX / TV charts.
+
+    OptionMaster often leaves underlying.mid_price / atm_price cold under Redis-MD.
+    Fall back to underlying tick, call-put parity, then an explicit override (e.g. strategy spot).
+    """
     underlying = getattr(chain, "underlying", None) if chain else None
     mid = float(getattr(underlying, "mid_price", 0) or 0) if underlying else 0.0
     adj = float(getattr(chain, "underlying_adjustment", 0) or 0) if chain else 0.0
     atm = float(getattr(chain, "atm_price", 0) or 0) if chain else 0.0
-    from_mid = mid > 0
+    und_symbol = getattr(underlying, "vt_symbol", "") if underlying else ""
+    spot = 0.0
+    from_mid = False
+    source = ""
+
+    if mid > 0:
+        spot = mid + adj
+        from_mid = True
+        source = "underlying_mid"
+    elif atm > 0:
+        spot = atm
+        source = "atm_price"
+
+    if spot <= 0 and und_symbol and main_engine is not None:
+        tick = main_engine.get_tick(und_symbol)
+        if tick:
+            bid = float(getattr(tick, "bid_price_1", 0) or 0)
+            ask = float(getattr(tick, "ask_price_1", 0) or 0)
+            last = float(getattr(tick, "last_price", 0) or 0)
+            tick_mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else (bid or ask or last)
+            if tick_mid > 0:
+                spot = float(tick_mid) + adj
+                from_mid = True
+                source = "underlying_tick"
+
+    if spot <= 0 and chain is not None:
+        synth = _chain_parity_spot(chain)
+        if synth > 0:
+            spot = synth
+            source = "parity"
+
+    override = float(spot_override or 0)
+    if spot <= 0 and override > 0:
+        spot = override
+        source = "override"
+    elif override > 0 and source in {"", "parity"} and abs(spot - override) / max(override, 1.0) > 0.02:
+        # Prefer live strategy/index spot when parity drifts or und is cold.
+        spot = override
+        source = "override"
+
     return {
         "chain_symbol": chain_symbol,
-        "spot": (mid + adj) if from_mid else atm,
+        "spot": spot,
         "from_mid": from_mid,
         "atm_price": atm,
         "days_to_expiry": int(getattr(chain, "days_to_expiry", 0) or 0) if chain else 0,
-        "underlying": getattr(underlying, "vt_symbol", "") if underlying else "",
+        "underlying": und_symbol,
+        "spot_source": source,
     }
 
 
-def chain_spot_price(chain) -> float:
-    return float(chain_spot_info(chain).get("spot") or 0)
+def _chain_parity_spot(chain: Any) -> float:
+    """Infer futures spot from call-put parity near the tightest |C-P| strike."""
+    best_spot = 0.0
+    best_gap = None
+    for index in getattr(chain, "indexes", []) or []:
+        call = (getattr(chain, "calls", {}) or {}).get(index)
+        put = (getattr(chain, "puts", {}) or {}).get(index)
+        if not call or not put:
+            continue
+        try:
+            strike = float(getattr(call, "strike_price", 0) or index)
+        except (TypeError, ValueError):
+            continue
+        call_mid = option_mid_price(call)
+        put_mid = option_mid_price(put)
+        if strike <= 0 or call_mid <= 0 or put_mid <= 0:
+            continue
+        gap = abs(call_mid - put_mid)
+        synth = strike + call_mid - put_mid
+        if synth <= 0:
+            continue
+        if best_gap is None or gap < best_gap:
+            best_gap = gap
+            best_spot = synth
+    return float(best_spot or 0)
 
 
-def compute_chain_gex(chain) -> dict[str, Any]:
-    info = chain_spot_info(chain)
+def chain_spot_price(chain, spot_override: float = 0.0) -> float:
+    return float(chain_spot_info(chain, spot_override=spot_override).get("spot") or 0)
+
+
+def compute_chain_gex(chain, spot_override: float = 0.0) -> dict[str, Any]:
+    info = chain_spot_info(chain, spot_override=spot_override)
     underlying = getattr(chain, "underlying", None)
     spot = float(info.get("spot") or 0)
     atm_price = float(info.get("atm_price") or 0)
@@ -526,6 +602,7 @@ def compute_chain_gex(chain) -> dict[str, Any]:
     return {
         "spot": round(spot, 4) if spot else 0.0,
         "spot_from_mid": bool(info.get("from_mid")),
+        "spot_source": info.get("spot_source") or "",
         "atm_price": atm_price,
         "atm_index": getattr(chain, "atm_index", "") or "",
         "underlying": getattr(underlying, "vt_symbol", "") if underlying else "",
@@ -670,18 +747,6 @@ def compute_gex_stack(portfolio, preferred_chain: str = "") -> dict[str, Any]:
         "pin": pin["strike"] if pin else None,
         "has_pos": has_pos,
     }
-
-
-def option_mid_price(option: OptionData | None) -> float:
-    tick = option_market_tick(option)
-    if not tick:
-        return 0.0
-    bid = float(getattr(tick, "bid_price_1", 0) or 0)
-    ask = float(getattr(tick, "ask_price_1", 0) or 0)
-    last = float(getattr(tick, "last_price", 0) or 0)
-    if bid > 0 and ask > 0:
-        return (bid + ask) / 2.0
-    return bid or ask or last
 
 
 def option_margin(option: OptionData, spot: float, mid: float) -> float:
@@ -3864,7 +3929,11 @@ def resolve_chain_expiry_info(portfolio_name: str, chain_symbol: str = "") -> di
     }
 
 
-def live_chain_gex_profile(portfolio_name: str, chain_symbol: str = "") -> dict[str, Any]:
+def live_chain_gex_profile(
+    portfolio_name: str,
+    chain_symbol: str = "",
+    spot_override: float = 0.0,
+) -> dict[str, Any]:
     """Build strike-level GEX profile for live indicator explain charts."""
     if option_engine is None or not portfolio_name:
         return {}
@@ -3877,7 +3946,7 @@ def live_chain_gex_profile(portfolio_name: str, chain_symbol: str = "") -> dict[
     if not chain:
         return {}
     try:
-        gex = compute_chain_gex(chain)
+        gex = compute_chain_gex(chain, spot_override=spot_override)
     except Exception:
         return {}
     rows = []
@@ -3900,6 +3969,7 @@ def live_chain_gex_profile(portfolio_name: str, chain_symbol: str = "") -> dict[
         "portfolio": portfolio_name,
         "chain_symbol": symbol or gex.get("spot_chain") or "",
         "spot": gex.get("spot"),
+        "spot_source": gex.get("spot_source"),
         "underlying": gex.get("underlying"),
         "days_to_expiry": gex.get("days_to_expiry"),
         "call_wall": gex.get("call_wall"),
@@ -3926,13 +3996,17 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
     params = data.get("params") or {}
     portfolio = str(data.get("portfolio") or params.get("portfolio_name") or "IO.CFFEX")
     chain = str(data.get("chain") or indicators.get("chain") or "")
-    profile = live_chain_gex_profile(portfolio, chain)
+    spot = indicators.get("spot") if indicators.get("spot") is not None else data.get("spot")
+    try:
+        spot_override = float(spot or 0)
+    except (TypeError, ValueError):
+        spot_override = 0.0
+    profile = live_chain_gex_profile(portfolio, chain, spot_override=spot_override)
     dte_info = resolve_chain_expiry_info(portfolio, chain)
     trading_dte = indicators.get("dte") if indicators.get("dte") is not None else data.get("dte")
     if trading_dte is None:
         trading_dte = dte_info.get("trading_dte")
     calendar_dte = dte_info.get("calendar_dte")
-    spot = indicators.get("spot") if indicators.get("spot") is not None else data.get("spot")
     call_wall = indicators.get("call_wall") if indicators.get("call_wall") is not None else data.get("call_wall")
     put_wall = indicators.get("put_wall") if indicators.get("put_wall") is not None else data.get("put_wall")
     profile_call = profile.get("call_wall")
@@ -3954,8 +4028,9 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
         )
     elif profile.get("strikes"):
         gamma_note = "（剖面用 Black-76 回补 gamma）" if profile.get("used_model_gamma") else ""
+        spot_note = f"；spot={profile.get('spot_source') or 'chain'}"
         wall_source = (
-            f"策略 live_gex_walls / 必要时 synthetic_gex_walls；下图为当前链实时 GEX 剖面供对照{gamma_note}"
+            f"策略 live_gex_walls / 必要时 synthetic_gex_walls；下图为当前链实时 GEX 剖面供对照{gamma_note}{spot_note}"
         )
     else:
         wall_source = "策略快照（链上剖面暂不可用）"

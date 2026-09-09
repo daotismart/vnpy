@@ -108,6 +108,7 @@ services:
       LC_CTYPE: zh_CN.UTF-8
       LIVE_MD_SOURCE: redis
       MD_BUS_ENABLE: "1"
+      LIVE_RECORD_BAR: ${LIVE_RECORD_BAR:-1}
       RECORDER_HEARTBEAT_FILE: /tmp/recorder_heartbeat
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       MD_BUS_TICK_STREAM: ${MD_BUS_TICK_STREAM:-vnpy:md:tick_stream}
@@ -185,7 +186,8 @@ services:
       LIVE_CTP_SKIP_TD: "0"
       LIVE_RECORD_TICKS: "0"
       LIVE_RECORD_MAX_CHAINS: ${LIVE_RECORD_MAX_CHAINS:-0}
-      LIVE_RECORD_BAR: ${LIVE_RECORD_BAR:-1}
+      # Bars are aggregated by the standalone recorder from the durable tick stream.
+      LIVE_RECORD_BAR: "0"
       LIVE_RECORD_FILTER_WINDOW: ${LIVE_RECORD_FILTER_WINDOW:-3600}
       LIVE_MD_MAX_LAG_SEC: ${LIVE_MD_MAX_LAG_SEC:-90}
       LIVE_WING_STEPS: ${LIVE_WING_STEPS:-}

@@ -195,6 +195,20 @@ def main() -> None:
         except Exception:
             traceback.print_exc()
 
+        # Bars are written by the standalone recorder from the durable tick stream.
+        # Clear leftover web bar_recordings so incomplete pub/sub bars cannot
+        # overwrite good Stream-aggregated OHLC via QuestDB DEDUP.
+        if os.getenv("LIVE_RECORD_BAR", "0").strip().lower() in {"0", "false", "no", "off", ""}:
+            try:
+                for vt_symbol in list(recorder_engine.bar_recordings.keys()):
+                    recorder_engine.remove_bar_recording(vt_symbol)
+                main_engine.write_log(
+                    "[MD_BUS] DataRecorder bar recordings cleared "
+                    "(LIVE_RECORD_BAR=0; bars from standalone recorder)"
+                )
+            except Exception:
+                traceback.print_exc()
+
     attach_runtime(
         main_engine,
         event_engine,

@@ -220,6 +220,16 @@ GET_TICK_OVERVIEW_SQL: str = f"""
     ORDER BY symbol, exchange;
 """
 
+COUNT_TICK_RANGE_SQL: str = f"""
+    SELECT count() AS count
+    FROM {TICK_TABLE}
+    WHERE symbol = %s
+        AND exchange = %s
+        AND datetime >= %s
+        AND datetime <= %s
+        AND deleted = false;
+"""
+
 WAL_TABLE_STATUS_SQL: str = """
     SELECT
         suspended,
@@ -229,6 +239,19 @@ WAL_TABLE_STATUS_SQL: str = """
     FROM wal_tables()
     WHERE name = %s;
 """
+
+# QuestDB SAMPLE BY intervals must be literals in SQL; only allow this set.
+TICK_SERIES_SAMPLE_INTERVALS: tuple[str, ...] = (
+    "1s",
+    "5s",
+    "15s",
+    "30s",
+    "1m",
+    "5m",
+    "15m",
+    "30m",
+    "1h",
+)
 
 
 class QuestdbDatabase(BaseDatabase):
@@ -454,6 +477,108 @@ class QuestdbDatabase(BaseDatabase):
                 )
             )
         return ticks
+
+    @staticmethod
+    def choose_tick_sample_interval(start: datetime, end: datetime, max_points: int = 2000) -> str:
+        """Pick a SAMPLE BY interval that keeps chart points near max_points."""
+        span = max(1.0, (end - start).total_seconds())
+        target = max(100, int(max_points))
+        seconds_per_point = span / target
+        # (threshold_seconds, interval_literal)
+        table: list[tuple[float, str]] = [
+            (1.0, "1s"),
+            (5.0, "5s"),
+            (15.0, "15s"),
+            (30.0, "30s"),
+            (60.0, "1m"),
+            (300.0, "5m"),
+            (900.0, "15m"),
+            (1800.0, "30m"),
+            (3600.0, "1h"),
+        ]
+        chosen = "1h"
+        for threshold, label in table:
+            if seconds_per_point <= threshold:
+                chosen = label
+                break
+        if chosen not in TICK_SERIES_SAMPLE_INTERVALS:
+            chosen = "1m"
+        return chosen
+
+    def count_tick_range(
+        self,
+        symbol: str,
+        exchange: Exchange,
+        start: datetime,
+        end: datetime,
+    ) -> int:
+        params: SqlParams = (
+            symbol,
+            exchange.value,
+            self._to_pg_datetime(start),
+            self._to_pg_datetime(end),
+        )
+        return self._query_count(COUNT_TICK_RANGE_SQL, params)
+
+    def load_tick_series(
+        self,
+        symbol: str,
+        exchange: Exchange,
+        start: datetime,
+        end: datetime,
+        max_points: int = 2000,
+        sample: str | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Load downsampled tick price series for charting.
+
+        Returns (sample_interval, points).
+        """
+        interval = (sample or "").strip().lower()
+        if interval not in TICK_SERIES_SAMPLE_INTERVALS:
+            interval = self.choose_tick_sample_interval(start, end, max_points)
+
+        # SAMPLE BY interval is a SQL literal; value is validated against allow-list above.
+        sql = f"""
+            SELECT
+                datetime,
+                first(last_price) AS open_price,
+                max(last_price) AS high_price,
+                min(last_price) AS low_price,
+                last(last_price) AS last_price,
+                last(volume) AS volume,
+                count() AS tick_count
+            FROM {TICK_TABLE}
+            WHERE symbol = %s
+                AND exchange = %s
+                AND datetime >= %s
+                AND datetime <= %s
+                AND deleted = false
+            SAMPLE BY {interval} ALIGN TO CALENDAR
+        """
+        params: SqlParams = (
+            symbol,
+            exchange.value,
+            self._to_pg_datetime(start),
+            self._to_pg_datetime(end),
+        )
+        from_datetime = self._from_questdb_datetime
+        points: list[dict[str, Any]] = []
+        for row in self._iter_rows(sql, params):
+            dt = row.get("datetime")
+            if not dt:
+                continue
+            points.append(
+                {
+                    "datetime": from_datetime(dt),
+                    "open_price": row.get("open_price"),
+                    "high_price": row.get("high_price"),
+                    "low_price": row.get("low_price"),
+                    "last_price": row.get("last_price"),
+                    "volume": row.get("volume"),
+                    "tick_count": int(row.get("tick_count") or 0),
+                }
+            )
+        return interval, points
 
     def delete_bar_data(self, symbol: str, exchange: Exchange, interval: Interval) -> int:
         params: SqlParams = (symbol, exchange.value, interval.value)

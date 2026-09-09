@@ -275,8 +275,101 @@ def option_market_tick(option: OptionData | None) -> Any:
     return tick
 
 
+def option_mid_price(option: OptionData | None) -> float:
+    tick = option_market_tick(option)
+    if not tick:
+        return 0.0
+    bid = float(getattr(tick, "bid_price_1", 0) or 0)
+    ask = float(getattr(tick, "ask_price_1", 0) or 0)
+    last = float(getattr(tick, "last_price", 0) or 0)
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    return bid or ask or last
+
+
+def _option_time_to_expiry(option: OptionData | None, chain: Any = None) -> float:
+    if option is not None:
+        t = float(getattr(option, "time_to_expiry", 0) or 0)
+        if t > 0:
+            return t
+        dte = float(getattr(option, "days_to_expiry", 0) or 0)
+        if dte > 0:
+            return max(dte, 1.0) / float(ANNUAL_DAYS or 365)
+    if chain is not None:
+        dte = float(getattr(chain, "days_to_expiry", 0) or 0)
+        if dte > 0:
+            return max(dte, 1.0) / float(ANNUAL_DAYS or 365)
+    return 1.0 / 365.0
+
+
+def _chain_proxy_iv(chain: Any) -> float:
+    """Best-effort IV for GEX when OptionMaster theo_gamma / mid_impv is cold."""
+    ivs: list[float] = []
+    for index in getattr(chain, "indexes", []) or []:
+        for opt in (
+            (getattr(chain, "calls", {}) or {}).get(index),
+            (getattr(chain, "puts", {}) or {}).get(index),
+        ):
+            if not opt:
+                continue
+            iv = float(getattr(opt, "mid_impv", 0) or 0)
+            if iv > 0:
+                ivs.append(iv)
+    if ivs:
+        return sum(ivs) / len(ivs)
+    return 0.18
+
+
+def option_gamma_for_gex(
+    option: OptionData | None,
+    spot: float,
+    proxy_iv: float = 0.18,
+    chain: Any = None,
+) -> float:
+    """Return size-scaled gamma; fall back to Black-76 when theo_gamma is unset."""
+    if not option or not spot:
+        return 0.0
+    theo = float(getattr(option, "theo_gamma", 0) or 0)
+    if theo:
+        return theo
+    try:
+        from vnpy_optionmaster.pricing.black_76 import calculate_gamma
+    except Exception:
+        return 0.0
+    try:
+        strike = float(getattr(option, "strike_price", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if strike <= 0:
+        return 0.0
+    t = _option_time_to_expiry(option, chain)
+    iv = float(getattr(option, "mid_impv", 0) or 0) or float(proxy_iv or 0) or 0.18
+    rate = float(getattr(option, "interest_rate", 0) or 0.02)
+    try:
+        gamma = float(calculate_gamma(float(spot), strike, rate, t, max(iv, 0.05)) or 0)
+    except Exception:
+        return 0.0
+    size = float(getattr(option, "size", 1) or 1)
+    return max(gamma, 0.0) * size
+
+
+def option_gex_1pct(
+    option: OptionData | None,
+    spot: float,
+    volume: float,
+    proxy_iv: float = 0.18,
+    chain: Any = None,
+) -> float:
+    """标的变动 1% 时的 Delta 敞口；优先 theo_gamma，缺省时用 Black-76。"""
+    if not option or not spot:
+        return 0.0
+    gamma = option_gamma_for_gex(option, spot, proxy_iv=proxy_iv, chain=chain)
+    return float(gamma or 0) * float(volume or 0) * spot * 0.01
+
+
 def serialize_option(option: OptionData) -> dict[str, Any]:
     tick = option_market_tick(option)
+    gamma = float(getattr(option, "theo_gamma", 0) or 0)
     return {
         "vt_symbol": option.vt_symbol,
         "strike_price": option.strike_price,
@@ -290,7 +383,7 @@ def serialize_option(option: OptionData) -> dict[str, Any]:
         "last_price": getattr(tick, "last_price", 0) if tick else 0,
         "mid_impv": round(option.mid_impv * 100, 2) if option.mid_impv else 0,
         "theo_delta": option.theo_delta,
-        "theo_gamma": option.theo_gamma,
+        "theo_gamma": gamma,
         "theo_theta": option.theo_theta,
         "theo_vega": option.theo_vega,
         "pos_delta": option.pos_delta,
@@ -300,13 +393,6 @@ def serialize_option(option: OptionData) -> dict[str, Any]:
 def option_open_interest(option: OptionData | None) -> float:
     tick = option_market_tick(option)
     return float(getattr(tick, "open_interest", 0) or 0) if tick else 0.0
-
-
-def option_gex_1pct(option: OptionData | None, spot: float, volume: float) -> float:
-    """标的变动 1% 时的 Delta 敞口；theo_gamma 已含合约乘数。"""
-    if not option or not spot:
-        return 0.0
-    return float(option.theo_gamma or 0) * float(volume or 0) * spot * 0.01
 
 
 def _gex_flip_strike(strikes: list[dict[str, Any]], value_key: str) -> float | None:
@@ -339,31 +425,106 @@ def _gex_flip_strike(strikes: list[dict[str, Any]], value_key: str) -> float | N
     return round(float(nearest_strike), 4) if nearest_strike is not None else None
 
 
-def chain_spot_info(chain, chain_symbol: str = "") -> dict[str, Any]:
+def chain_spot_info(
+    chain,
+    chain_symbol: str = "",
+    spot_override: float = 0.0,
+) -> dict[str, Any]:
+    """Resolve chain spot for GEX / TV charts.
+
+    OptionMaster often leaves underlying.mid_price / atm_price cold under Redis-MD.
+    Fall back to underlying tick, call-put parity, then an explicit override (e.g. strategy spot).
+    """
     underlying = getattr(chain, "underlying", None) if chain else None
     mid = float(getattr(underlying, "mid_price", 0) or 0) if underlying else 0.0
     adj = float(getattr(chain, "underlying_adjustment", 0) or 0) if chain else 0.0
     atm = float(getattr(chain, "atm_price", 0) or 0) if chain else 0.0
-    from_mid = mid > 0
+    und_symbol = getattr(underlying, "vt_symbol", "") if underlying else ""
+    spot = 0.0
+    from_mid = False
+    source = ""
+
+    if mid > 0:
+        spot = mid + adj
+        from_mid = True
+        source = "underlying_mid"
+    elif atm > 0:
+        spot = atm
+        source = "atm_price"
+
+    if spot <= 0 and und_symbol and main_engine is not None:
+        tick = main_engine.get_tick(und_symbol)
+        if tick:
+            bid = float(getattr(tick, "bid_price_1", 0) or 0)
+            ask = float(getattr(tick, "ask_price_1", 0) or 0)
+            last = float(getattr(tick, "last_price", 0) or 0)
+            tick_mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else (bid or ask or last)
+            if tick_mid > 0:
+                spot = float(tick_mid) + adj
+                from_mid = True
+                source = "underlying_tick"
+
+    if spot <= 0 and chain is not None:
+        synth = _chain_parity_spot(chain)
+        if synth > 0:
+            spot = synth
+            source = "parity"
+
+    override = float(spot_override or 0)
+    if override > 0 and (spot <= 0 or source in {"", "parity"}):
+        # Explain / strategy callers pass live index spot; prefer it over parity.
+        spot = override
+        source = "override"
+
     return {
         "chain_symbol": chain_symbol,
-        "spot": (mid + adj) if from_mid else atm,
+        "spot": spot,
         "from_mid": from_mid,
         "atm_price": atm,
         "days_to_expiry": int(getattr(chain, "days_to_expiry", 0) or 0) if chain else 0,
-        "underlying": getattr(underlying, "vt_symbol", "") if underlying else "",
+        "underlying": und_symbol,
+        "spot_source": source,
     }
 
 
-def chain_spot_price(chain) -> float:
-    return float(chain_spot_info(chain).get("spot") or 0)
+def _chain_parity_spot(chain: Any) -> float:
+    """Infer futures spot from call-put parity near the tightest |C-P| strike."""
+    best_spot = 0.0
+    best_gap = None
+    for index in getattr(chain, "indexes", []) or []:
+        call = (getattr(chain, "calls", {}) or {}).get(index)
+        put = (getattr(chain, "puts", {}) or {}).get(index)
+        if not call or not put:
+            continue
+        try:
+            strike = float(getattr(call, "strike_price", 0) or index)
+        except (TypeError, ValueError):
+            continue
+        call_mid = option_mid_price(call)
+        put_mid = option_mid_price(put)
+        if strike <= 0 or call_mid <= 0 or put_mid <= 0:
+            continue
+        gap = abs(call_mid - put_mid)
+        synth = strike + call_mid - put_mid
+        if synth <= 0:
+            continue
+        if best_gap is None or gap < best_gap:
+            best_gap = gap
+            best_spot = synth
+    return float(best_spot or 0)
 
 
-def compute_chain_gex(chain) -> dict[str, Any]:
-    info = chain_spot_info(chain)
+def chain_spot_price(chain, spot_override: float = 0.0) -> float:
+    return float(chain_spot_info(chain, spot_override=spot_override).get("spot") or 0)
+
+
+def compute_chain_gex(chain, spot_override: float = 0.0) -> dict[str, Any]:
+    info = chain_spot_info(chain, spot_override=spot_override)
     underlying = getattr(chain, "underlying", None)
     spot = float(info.get("spot") or 0)
     atm_price = float(info.get("atm_price") or 0)
+    proxy_iv = _chain_proxy_iv(chain)
+    used_model_gamma = False
 
     strikes: list[dict[str, Any]] = []
     call_gex_sum = 0.0
@@ -384,10 +545,16 @@ def compute_chain_gex(chain) -> dict[str, Any]:
         put_oi = option_open_interest(put)
         call_pos = option_net_position(call)
         put_pos = option_net_position(put)
-        call_gex = option_gex_1pct(call, spot, call_oi)
-        put_gex = -option_gex_1pct(put, spot, put_oi)
-        call_pos_gex = option_gex_1pct(call, spot, call_pos)
-        put_pos_gex = -option_gex_1pct(put, spot, put_pos)
+        call_gamma = option_gamma_for_gex(call, spot, proxy_iv=proxy_iv, chain=chain) if call else 0.0
+        put_gamma = option_gamma_for_gex(put, spot, proxy_iv=proxy_iv, chain=chain) if put else 0.0
+        if call and not float(getattr(call, "theo_gamma", 0) or 0) and call_gamma:
+            used_model_gamma = True
+        if put and not float(getattr(put, "theo_gamma", 0) or 0) and put_gamma:
+            used_model_gamma = True
+        call_gex = call_gamma * float(call_oi or 0) * spot * 0.01 if spot else 0.0
+        put_gex = -(put_gamma * float(put_oi or 0) * spot * 0.01) if spot else 0.0
+        call_pos_gex = call_gamma * float(call_pos or 0) * spot * 0.01 if spot else 0.0
+        put_pos_gex = -(put_gamma * float(put_pos or 0) * spot * 0.01) if spot else 0.0
         pos_gex = call_pos_gex + put_pos_gex
         net_gex = call_gex + put_gex
         call_gex_sum += call_gex
@@ -401,8 +568,8 @@ def compute_chain_gex(chain) -> dict[str, Any]:
                 "strike": strike,
                 "call_oi": call_oi,
                 "put_oi": put_oi,
-                "call_gamma": float(getattr(call, "theo_gamma", 0) or 0) if call else 0.0,
-                "put_gamma": float(getattr(put, "theo_gamma", 0) or 0) if put else 0.0,
+                "call_gamma": round(call_gamma, 8),
+                "put_gamma": round(put_gamma, 8),
                 "call_gex": round(call_gex, 4),
                 "put_gex": round(put_gex, 4),
                 "net_gex": round(net_gex, 4),
@@ -432,6 +599,7 @@ def compute_chain_gex(chain) -> dict[str, Any]:
     return {
         "spot": round(spot, 4) if spot else 0.0,
         "spot_from_mid": bool(info.get("from_mid")),
+        "spot_source": info.get("spot_source") or "",
         "atm_price": atm_price,
         "atm_index": getattr(chain, "atm_index", "") or "",
         "underlying": getattr(underlying, "vt_symbol", "") if underlying else "",
@@ -458,6 +626,8 @@ def compute_chain_gex(chain) -> dict[str, Any]:
         "strikes": strikes,
         "convention": "dealer",
         "unit": "delta_1pct",
+        "used_model_gamma": used_model_gamma,
+        "proxy_iv": round(float(proxy_iv or 0), 6),
     }
 
 
@@ -574,18 +744,6 @@ def compute_gex_stack(portfolio, preferred_chain: str = "") -> dict[str, Any]:
         "pin": pin["strike"] if pin else None,
         "has_pos": has_pos,
     }
-
-
-def option_mid_price(option: OptionData | None) -> float:
-    tick = getattr(option, "tick", None) if option else None
-    if not tick:
-        return 0.0
-    bid = float(getattr(tick, "bid_price_1", 0) or 0)
-    ask = float(getattr(tick, "ask_price_1", 0) or 0)
-    last = float(getattr(tick, "last_price", 0) or 0)
-    if bid > 0 and ask > 0:
-        return (bid + ask) / 2.0
-    return bid or ask or last
 
 
 def option_margin(option: OptionData, spot: float, mid: float) -> float:
@@ -2229,6 +2387,77 @@ def query_bars(
     return to_plain(bars[-500:])
 
 
+def _aggregate_bars(chunk: list[Any]) -> dict[str, Any]:
+    first = chunk[0]
+    last = chunk[-1]
+    return {
+        "datetime": getattr(first, "datetime", None),
+        "open_price": getattr(first, "open_price", None),
+        "high_price": max(float(getattr(b, "high_price", 0) or 0) for b in chunk),
+        "low_price": min(float(getattr(b, "low_price", 0) or 0) for b in chunk),
+        "close_price": getattr(last, "close_price", None),
+        "volume": sum(float(getattr(b, "volume", 0) or 0) for b in chunk),
+        "turnover": sum(float(getattr(b, "turnover", 0) or 0) for b in chunk),
+        "open_interest": getattr(last, "open_interest", None),
+        "bar_count": len(chunk),
+    }
+
+
+@app.get("/data/bar/series")
+def query_bar_series(
+    symbol: str,
+    exchange: Exchange,
+    interval: Interval,
+    start: str,
+    end: str,
+    max_points: int = Query(800, ge=50, le=5000),
+    _: bool = Depends(get_access),
+) -> dict[str, Any]:
+    """OHLC bar series for the data-menu candlestick viewer."""
+    start_dt = parse_datetime(start)
+    end_dt = parse_datetime(end)
+    if end_dt < start_dt:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="结束时间早于开始时间")
+    bars = get_database().load_bar_data(
+        symbol,
+        exchange,
+        interval,
+        start_dt,
+        end_dt,
+    )
+    raw_count = len(bars)
+    merge = 1
+    if raw_count <= max_points:
+        points = [
+            {
+                "datetime": getattr(b, "datetime", None),
+                "open_price": getattr(b, "open_price", None),
+                "high_price": getattr(b, "high_price", None),
+                "low_price": getattr(b, "low_price", None),
+                "close_price": getattr(b, "close_price", None),
+                "volume": getattr(b, "volume", None),
+                "turnover": getattr(b, "turnover", None),
+                "open_interest": getattr(b, "open_interest", None),
+                "bar_count": 1,
+            }
+            for b in bars
+        ]
+    else:
+        merge = max(1, math.ceil(raw_count / max_points))
+        points = [_aggregate_bars(bars[idx : idx + merge]) for idx in range(0, raw_count, merge)]
+    return {
+        "symbol": symbol,
+        "exchange": exchange.value,
+        "interval": interval.value,
+        "start": to_plain(start_dt),
+        "end": to_plain(end_dt),
+        "merge": merge,
+        "raw_count": raw_count,
+        "count": len(points),
+        "points": to_plain(points),
+    }
+
+
 @app.delete("/data/bar")
 def delete_bars(
     symbol: str,
@@ -2333,6 +2562,47 @@ def query_ticks(
     if len(ticks) > limit:
         ticks = ticks[-limit:]
     return to_plain(ticks)
+
+
+@app.get("/data/tick/series")
+def query_tick_series(
+    symbol: str,
+    exchange: Exchange,
+    start: str,
+    end: str,
+    max_points: int = Query(2000, ge=100, le=10000),
+    sample: str = Query(""),
+    _: bool = Depends(get_access),
+) -> dict[str, Any]:
+    """Downsampled tick price series for the data-menu chart viewer."""
+    start_dt = parse_datetime(start)
+    end_dt = parse_datetime(end)
+    if end_dt < start_dt:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="结束时间早于开始时间")
+    db = get_database()
+    sample_interval, points = db.load_tick_series(
+        symbol,
+        exchange,
+        start_dt,
+        end_dt,
+        max_points=max_points,
+        sample=sample or None,
+    )
+    raw_count = 0
+    try:
+        raw_count = db.count_tick_range(symbol, exchange, start_dt, end_dt)
+    except Exception:
+        raw_count = sum(int(p.get("tick_count") or 0) for p in points)
+    return {
+        "symbol": symbol,
+        "exchange": exchange.value,
+        "start": to_plain(start_dt),
+        "end": to_plain(end_dt),
+        "sample": sample_interval,
+        "raw_count": raw_count,
+        "count": len(points),
+        "points": to_plain(points),
+    }
 
 
 @app.delete("/data/tick")
@@ -3656,7 +3926,11 @@ def resolve_chain_expiry_info(portfolio_name: str, chain_symbol: str = "") -> di
     }
 
 
-def live_chain_gex_profile(portfolio_name: str, chain_symbol: str = "") -> dict[str, Any]:
+def live_chain_gex_profile(
+    portfolio_name: str,
+    chain_symbol: str = "",
+    spot_override: float = 0.0,
+) -> dict[str, Any]:
     """Build strike-level GEX profile for live indicator explain charts."""
     if option_engine is None or not portfolio_name:
         return {}
@@ -3669,7 +3943,7 @@ def live_chain_gex_profile(portfolio_name: str, chain_symbol: str = "") -> dict[
     if not chain:
         return {}
     try:
-        gex = compute_chain_gex(chain)
+        gex = compute_chain_gex(chain, spot_override=spot_override)
     except Exception:
         return {}
     rows = []
@@ -3686,11 +3960,13 @@ def live_chain_gex_profile(portfolio_name: str, chain_symbol: str = "") -> dict[
                 "put_gamma": row.get("put_gamma"),
             }
         )
+    source = "live_oi+model_gamma" if gex.get("used_model_gamma") else "live_oi+theo_gamma"
     return {
-        "source": "live_oi",
+        "source": source,
         "portfolio": portfolio_name,
         "chain_symbol": symbol or gex.get("spot_chain") or "",
         "spot": gex.get("spot"),
+        "spot_source": gex.get("spot_source"),
         "underlying": gex.get("underlying"),
         "days_to_expiry": gex.get("days_to_expiry"),
         "call_wall": gex.get("call_wall"),
@@ -3700,6 +3976,8 @@ def live_chain_gex_profile(portfolio_name: str, chain_symbol: str = "") -> dict[
         "call_gex": gex.get("call_gex"),
         "put_gex": gex.get("put_gex"),
         "net_gex": gex.get("net_gex"),
+        "used_model_gamma": bool(gex.get("used_model_gamma")),
+        "proxy_iv": gex.get("proxy_iv"),
         "strikes": rows,
         "formula": "CallGEX = Γ_call × OI_call × S × 1%；PutGEX = −Γ_put × OI_put × S × 1%",
         "rule": "Call墙 = argmax CallGEX；Put墙 = argmin PutGEX（最负）",
@@ -3715,13 +3993,17 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
     params = data.get("params") or {}
     portfolio = str(data.get("portfolio") or params.get("portfolio_name") or "IO.CFFEX")
     chain = str(data.get("chain") or indicators.get("chain") or "")
-    profile = live_chain_gex_profile(portfolio, chain)
+    spot = indicators.get("spot") if indicators.get("spot") is not None else data.get("spot")
+    try:
+        spot_override = float(spot or 0)
+    except (TypeError, ValueError):
+        spot_override = 0.0
+    profile = live_chain_gex_profile(portfolio, chain, spot_override=spot_override)
     dte_info = resolve_chain_expiry_info(portfolio, chain)
     trading_dte = indicators.get("dte") if indicators.get("dte") is not None else data.get("dte")
     if trading_dte is None:
         trading_dte = dte_info.get("trading_dte")
     calendar_dte = dte_info.get("calendar_dte")
-    spot = indicators.get("spot") if indicators.get("spot") is not None else data.get("spot")
     call_wall = indicators.get("call_wall") if indicators.get("call_wall") is not None else data.get("call_wall")
     put_wall = indicators.get("put_wall") if indicators.get("put_wall") is not None else data.get("put_wall")
     profile_call = profile.get("call_wall")
@@ -3735,11 +4017,20 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
         and abs(float(call_wall) - float(profile_call)) < 1e-6
         and abs(float(put_wall) - float(profile_put)) < 1e-6
     )
-    wall_source = "链上真实 OI + theo_gamma" if walls_match else (
-        "策略 live_gex_walls / 必要时 synthetic_gex_walls；下图为当前链实时 GEX 剖面供对照"
-        if profile.get("strikes")
-        else "策略快照（链上剖面暂不可用）"
-    )
+    if walls_match:
+        wall_source = (
+            "链上真实 OI + Black-76 模型 gamma"
+            if profile.get("used_model_gamma")
+            else "链上真实 OI + theo_gamma"
+        )
+    elif profile.get("strikes"):
+        gamma_note = "（剖面用 Black-76 回补 gamma）" if profile.get("used_model_gamma") else ""
+        spot_note = f"；spot={profile.get('spot_source') or 'chain'}"
+        wall_source = (
+            f"策略 live_gex_walls / 必要时 synthetic_gex_walls；下图为当前链实时 GEX 剖面供对照{gamma_note}{spot_note}"
+        )
+    else:
+        wall_source = "策略快照（链上剖面暂不可用）"
 
     def _num(value: Any, digits: int = 4) -> str:
         try:

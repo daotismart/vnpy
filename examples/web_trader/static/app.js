@@ -4441,6 +4441,7 @@ function closeLiveExplainModal() {
     modal.classList.add("hidden");
     modal.setAttribute("aria-hidden", "true");
     state.liveExplainChart = null;
+    renderLiveExplainTable(null);
 }
 
 function openLiveExplainModal(key) {
@@ -4470,10 +4471,13 @@ function openLiveExplainModal(key) {
             hint.textContent = "柱状为各行权价 CallGEX（橙）/ PutGEX（蓝）；竖线为策略墙与现价";
         } else if (chart.type === "dual_bar") {
             hint.textContent = "蓝色为交易日 DTE，绿色为自然日 DTE";
+        } else if (chart.type === "iv_rank_hist") {
+            hint.textContent = "柱为历史 HV；绿=≤当前IV，橙=>当前IV；青线=当前IV；右侧为 IV Rank";
         } else {
             hint.textContent = "";
         }
     }
+    renderLiveExplainTable(payload.table || null);
     modal.classList.remove("hidden");
     modal.setAttribute("aria-hidden", "false");
     // Layout must settle before measuring chart wrap size.
@@ -4481,6 +4485,39 @@ function openLiveExplainModal(key) {
         drawLiveExplainChart(chart);
         requestAnimationFrame(() => drawLiveExplainChart(chart));
     });
+}
+
+function renderLiveExplainTable(table) {
+    const wrap = $("live-explain-table-wrap");
+    const el = $("live-explain-table");
+    if (!wrap || !el) {
+        return;
+    }
+    const head = el.querySelector("thead");
+    const body = el.querySelector("tbody");
+    if (!table || !Array.isArray(table.rows) || !table.rows.length) {
+        wrap.classList.add("hidden");
+        if (head) {
+            head.innerHTML = "";
+        }
+        if (body) {
+            body.innerHTML = "";
+        }
+        return;
+    }
+    const cols = Array.isArray(table.columns) ? table.columns : [];
+    if (head) {
+        head.innerHTML = `<tr>${cols.map((col) => `<th>${col}</th>`).join("")}</tr>`;
+    }
+    if (body) {
+        body.innerHTML = table.rows.map((row) => {
+            const cells = Array.isArray(row) ? row : [];
+            const flag = String(cells[2] || "");
+            const cls = flag === "是" ? "is-below" : (flag === "否" ? "is-above" : "");
+            return `<tr class="${cls}">${cells.map((cell) => `<td>${cell == null ? "—" : cell}</td>`).join("")}</tr>`;
+        }).join("");
+    }
+    wrap.classList.remove("hidden");
 }
 
 function explainChartSize(canvas) {
@@ -4512,6 +4549,10 @@ function drawLiveExplainChart(chart) {
     const type = chart && chart.type;
     if (type === "gex_walls" || type === "spot_walls") {
         drawExplainGexWalls(ctx, cssWidth, cssHeight, chart);
+        return;
+    }
+    if (type === "iv_rank_hist") {
+        drawExplainIvRankHist(ctx, cssWidth, cssHeight, chart);
         return;
     }
     if (type === "gauge") {
@@ -4673,6 +4714,111 @@ function drawExplainGexWalls(ctx, width, height, chart) {
     });
     ctx.textAlign = "left";
     ctx.textBaseline = "alphabetic";
+}
+
+function drawExplainIvRankHist(ctx, width, height, chart) {
+    const pad = { top: 36, right: 110, bottom: 42, left: 54 };
+    const innerW = width - pad.left - pad.right;
+    const innerH = height - pad.top - pad.bottom;
+    const series = Array.isArray(chart.series) ? chart.series : [];
+    const currentIv = Number(chart.current_iv || 0);
+    const rank = Number(chart.iv_rank || 0);
+    const threshold = Number(chart.threshold || 40);
+    const below = Number(chart.below_count || 0);
+    const sampleN = Number(chart.sample_n || series.length || 0);
+
+    ctx.fillStyle = "#e8edf2";
+    ctx.font = "14px Microsoft YaHei, sans-serif";
+    ctx.fillText(chart.label || "历史 HV vs 当前 IV", pad.left, 22);
+
+    if (!series.length) {
+        ctx.fillStyle = "#8b98a8";
+        ctx.font = "13px Microsoft YaHei, sans-serif";
+        ctx.fillText("暂无 HV 历史样本（等待日线灌入或策略发布）", 16, 56);
+        return;
+    }
+
+    const values = series.map((row) => Number(row.hv || 0)).filter((v) => Number.isFinite(v));
+    const maxV = Math.max(currentIv * 1.05, ...values, 0.05);
+    const minV = 0;
+    const yOf = (v) => pad.top + innerH - ((v - minV) / (maxV - minV || 1)) * innerH;
+    const barW = Math.max(2, (innerW / series.length) * 0.72);
+
+    ctx.strokeStyle = "rgba(255,255,255,0.18)";
+    ctx.strokeRect(pad.left, pad.top, innerW, innerH);
+
+    // grid
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    [0, 0.25, 0.5, 0.75, 1].forEach((ratio) => {
+        const v = minV + (maxV - minV) * ratio;
+        const y = yOf(v);
+        ctx.strokeStyle = "rgba(255,255,255,0.06)";
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(pad.left + innerW, y);
+        ctx.stroke();
+        ctx.fillStyle = "#8b98a8";
+        ctx.textAlign = "right";
+        ctx.fillText(v.toFixed(2), pad.left - 8, y + 3);
+    });
+    ctx.textAlign = "left";
+
+    series.forEach((row, index) => {
+        const hv = Number(row.hv || 0);
+        const x = pad.left + (index + 0.5) * (innerW / series.length) - barW / 2;
+        const y = yOf(hv);
+        const h = Math.max(1, yOf(0) - y);
+        ctx.fillStyle = row.below_iv ? "#1dd1a1" : "#ff9f43";
+        ctx.fillRect(x, y, barW, h);
+    });
+
+    if (currentIv > 0) {
+        const y = yOf(currentIv);
+        ctx.strokeStyle = "#54a0ff";
+        ctx.lineWidth = 1.6;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(pad.left + innerW, y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = "#54a0ff";
+        ctx.font = "12px Microsoft YaHei, sans-serif";
+        ctx.fillText(`IV ${currentIv.toFixed(4)}`, pad.left + 6, y - 6);
+    }
+
+    // right-side rank panel
+    const rx = pad.left + innerW + 16;
+    const ry = pad.top + 8;
+    ctx.fillStyle = "rgba(255,255,255,0.04)";
+    ctx.fillRect(rx - 8, ry, 96, 120);
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.strokeRect(rx - 8, ry, 96, 120);
+    ctx.fillStyle = "#8b98a8";
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    ctx.fillText("IV Rank", rx, ry + 18);
+    ctx.fillStyle = rank >= threshold ? "#1dd1a1" : "#ff9f43";
+    ctx.font = "22px Microsoft YaHei, sans-serif";
+    ctx.fillText(String(Number(rank.toFixed(1))), rx, ry + 48);
+    ctx.fillStyle = "#8b98a8";
+    ctx.font = "11px Microsoft YaHei, sans-serif";
+    ctx.fillText(`阈值 ${threshold}`, rx, ry + 70);
+    ctx.fillText(`≤IV ${below}/${sampleN}`, rx, ry + 90);
+    ctx.fillText(rank >= threshold ? "偏高可卖" : "偏低观望", rx, ry + 110);
+
+    // x labels
+    ctx.fillStyle = "#8b98a8";
+    ctx.font = "10px Microsoft YaHei, sans-serif";
+    ctx.textAlign = "center";
+    const step = Math.max(1, Math.ceil(series.length / 8));
+    series.forEach((row, index) => {
+        if (index % step !== 0 && index !== series.length - 1) {
+            return;
+        }
+        const x = pad.left + (index + 0.5) * (innerW / series.length);
+        ctx.fillText(String(row.index || index + 1), x, pad.top + innerH + 16);
+    });
+    ctx.textAlign = "left";
 }
 
 function drawExplainGauge(ctx, width, height, chart) {

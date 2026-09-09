@@ -658,6 +658,52 @@ tr.pin td:nth-child(7) {
     margin: 0;
 }
 
+.explain-table-wrap {
+    margin-top: 8px;
+    max-height: min(28vh, 220px);
+    overflow: auto;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+}
+
+.explain-table-wrap.hidden {
+    display: none;
+}
+
+.explain-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.explain-table th,
+.explain-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    text-align: left;
+    white-space: nowrap;
+}
+
+.explain-table th {
+    position: sticky;
+    top: 0;
+    background: rgba(20, 26, 34, 0.96);
+    color: #8b98a8;
+    font-weight: 600;
+}
+
+.explain-table td {
+    color: #d7dee7;
+}
+
+.explain-table tr.is-below td {
+    color: #1dd1a1;
+}
+
+.explain-table tr.is-above td {
+    color: #ff9f43;
+}
+
 @media (max-width: 720px) {
     .explain-modal {
         padding: 8px;

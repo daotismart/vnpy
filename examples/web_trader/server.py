@@ -3984,6 +3984,173 @@ def live_chain_gex_profile(
     }
 
 
+
+def _realized_hv_from_closes(closes: list[float], lookback: int = 20) -> float:
+    if len(closes) < lookback + 1:
+        return 0.18
+    rets = [
+        math.log(closes[i] / closes[i - 1])
+        for i in range(len(closes) - lookback, len(closes))
+        if closes[i - 1] > 0 and closes[i] > 0
+    ]
+    if len(rets) < 5:
+        return 0.18
+    mean = sum(rets) / len(rets)
+    var = sum((x - mean) ** 2 for x in rets) / max(len(rets) - 1, 1)
+    return max(0.08, min(0.80, math.sqrt(var) * math.sqrt(242)))
+
+
+def _load_daily_closes_for_portfolio(portfolio_name: str, lookback: int = 65) -> list[float]:
+    product = str(portfolio_name or "IO").split(".")[0].upper()
+    fname = {
+        "IO": "if_daily_cache.json",
+        "IF": "if_daily_cache.json",
+        "HO": "ih_daily_cache.json",
+        "IH": "ih_daily_cache.json",
+        "MO": "im_daily_cache.json",
+        "IM": "im_daily_cache.json",
+    }.get(product)
+    if not fname:
+        return []
+    path = WEB_SCRIPTS_DIR.joinpath(fname)
+    if not path.exists():
+        return []
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    closes: list[float] = []
+    for row in rows:
+        try:
+            if isinstance(row, (list, tuple)) and len(row) >= 5:
+                px = float(row[4])
+            elif isinstance(row, dict):
+                px = float(row.get("close") or 0)
+            else:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if px > 0:
+            closes.append(px)
+    if lookback > 0:
+        closes = closes[-lookback:]
+    return closes
+
+
+def _rebuild_hv_hist_from_closes(closes: list[float], hv_lookback: int = 20) -> list[float]:
+    hist: list[float] = []
+    if len(closes) < hv_lookback + 1:
+        return hist
+    for end in range(hv_lookback + 1, len(closes) + 1):
+        hist.append(_realized_hv_from_closes(closes[:end], hv_lookback))
+    return hist
+
+
+def resolve_iv_rank_series(data: dict[str, Any]) -> dict[str, Any]:
+    """Collect HV history + IV Rank calc inputs for explain popup."""
+    params = data.get("params") if isinstance(data.get("params"), dict) else {}
+    calc = data.get("iv_rank_calc") if isinstance(data.get("iv_rank_calc"), dict) else {}
+    books = data.get("books") if isinstance(data.get("books"), dict) else {}
+    portfolio = str(data.get("portfolio") or params.get("portfolio_name") or "IO.CFFEX")
+    book_snap = books.get(portfolio) if isinstance(books.get(portfolio), dict) else {}
+
+    def _float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    hv_lookback = int(calc.get("hv_lookback") or params.get("hv_lookback") or 20)
+    iv_rank_lookback = int(calc.get("iv_rank_lookback") or params.get("iv_rank_lookback") or 60)
+    iv_factor = _float(calc.get("iv_factor"), 1.12)
+    iv_rank_min = _float(
+        calc.get("iv_rank_min")
+        or params.get("iv_rank_min")
+        or (data.get("config") or {}).get("iv_rank_min"),
+        40.0,
+    )
+
+    hv_hist_raw = data.get("hv_hist") or book_snap.get("hv_hist") or []
+    hv_hist: list[float] = []
+    for item in hv_hist_raw:
+        try:
+            value = float(item)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            hv_hist.append(value)
+    source = "strategy" if hv_hist else ""
+
+    if not hv_hist:
+        closes = book_snap.get("day_closes") or data.get("day_closes") or []
+        close_vals: list[float] = []
+        for item in closes:
+            try:
+                px = float(item)
+            except (TypeError, ValueError):
+                continue
+            if px > 0:
+                close_vals.append(px)
+        if len(close_vals) < hv_lookback + 1:
+            close_vals = _load_daily_closes_for_portfolio(
+                portfolio, lookback=iv_rank_lookback + hv_lookback + 5
+            )
+            if close_vals:
+                source = "daily_cache"
+        elif not source:
+            source = "day_closes"
+        if close_vals:
+            rebuilt = _rebuild_hv_hist_from_closes(close_vals, hv_lookback=hv_lookback)
+            hv_hist = rebuilt[-iv_rank_lookback:] if rebuilt else []
+
+    current_hv = _float(calc.get("current_hv") or data.get("hv") or book_snap.get("hv"), 0.0)
+    current_iv = _float(
+        calc.get("current_iv") or data.get("iv") or (data.get("indicators") or {}).get("iv"),
+        0.0,
+    )
+    if current_hv <= 0 and hv_hist:
+        current_hv = hv_hist[-1]
+    if current_iv <= 0 and current_hv > 0:
+        current_iv = current_hv * iv_factor
+
+    below_count = int(calc.get("below_count") or 0)
+    if hv_hist and (not calc.get("below_count") or source != "strategy"):
+        below_count = sum(1 for item in hv_hist if item <= current_iv)
+    sample_n = len(hv_hist)
+    rank = _float(data.get("iv_rank") or (data.get("indicators") or {}).get("iv_rank"), 0.0)
+    if sample_n > 0:
+        rank = 100.0 * below_count / sample_n
+    hv_ready = bool(calc.get("hv_ready")) if "hv_ready" in calc else sample_n >= 10
+    series = [
+        {
+            "index": i + 1,
+            "hv": round(value, 4),
+            "below_iv": bool(value <= current_iv),
+        }
+        for i, value in enumerate(hv_hist)
+    ]
+    return {
+        "source": source or ("empty" if not hv_hist else source),
+        "hv_hist": [round(v, 4) for v in hv_hist],
+        "series": series,
+        "current_hv": round(current_hv, 4) if current_hv else 0.0,
+        "current_iv": round(current_iv, 4) if current_iv else 0.0,
+        "hv60": round(_float(calc.get("hv60") or data.get("hv60"), 0.0), 4),
+        "iv_factor": iv_factor,
+        "hv_lookback": hv_lookback,
+        "iv_rank_lookback": iv_rank_lookback,
+        "sample_n": sample_n,
+        "below_count": below_count,
+        "iv_rank": round(rank, 1),
+        "iv_rank_min": iv_rank_min,
+        "hv_ready": hv_ready,
+        "closes_n": int(calc.get("closes_n") or 0),
+        "min_hv": round(min(hv_hist), 4) if hv_hist else 0.0,
+        "max_hv": round(max(hv_hist), 4) if hv_hist else 0.0,
+        "median_hv": round(sorted(hv_hist)[len(hv_hist) // 2], 4) if hv_hist else 0.0,
+    }
+
+
 def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
     """Explain payloads for clickable live metrics (formula + steps + chart data)."""
     indicators = data.get("indicators") or {}
@@ -3999,6 +4166,7 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         spot_override = 0.0
     profile = live_chain_gex_profile(portfolio, chain, spot_override=spot_override)
+    iv_rank_info = resolve_iv_rank_series(data)
     dte_info = resolve_chain_expiry_info(portfolio, chain)
     trading_dte = indicators.get("dte") if indicators.get("dte") is not None else data.get("dte")
     if trading_dte is None:
@@ -4044,39 +4212,88 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
     explains: dict[str, Any] = {
         "iv": {
             "title": "IV（隐含/代理波动率）",
-            "value": indicators.get("iv") if indicators.get("iv") is not None else data.get("iv"),
-            "formula": "IV ≈ HV_20 × 1.12（实盘用实现波动代理，待期权 IV 行情可替换）",
+            "value": (
+                indicators.get("iv")
+                if indicators.get("iv") is not None
+                else (data.get("iv") if data.get("iv") is not None else iv_rank_info.get("current_iv"))
+            ),
+            "formula": (
+                f"IV ≈ HV_{iv_rank_info.get('hv_lookback') or 20} × "
+                f"{_num(iv_rank_info.get('iv_factor'), 2)}（实盘用实现波动代理）"
+            ),
             "steps": [
-                f"当前值：{_num(indicators.get('iv') if indicators.get('iv') is not None else data.get('iv'), 4)}",
-                "取近 20 日收盘实现波动 HV，再乘 1.12 作为开仓定价/墙合成用 σ",
+                f"当前 IV：{_num(indicators.get('iv') if indicators.get('iv') is not None else data.get('iv') or iv_rank_info.get('current_iv'), 4)}",
+                f"当前 HV_{iv_rank_info.get('hv_lookback') or 20}：{_num(iv_rank_info.get('current_hv'), 4)}",
+                f"HV60：{_num(iv_rank_info.get('hv60'), 4)}" if iv_rank_info.get("hv60") else "HV60：—",
+                f"计算公式：IV = HV × {_num(iv_rank_info.get('iv_factor'), 2)}",
                 "IV Rank、铁鹰定价、Delta 带宽均基于该 σ",
             ],
             "chart": {
                 "type": "gauge",
                 "min": 0,
                 "max": 0.6,
-                "value": float(indicators.get("iv") or data.get("iv") or 0),
+                "value": float(
+                    indicators.get("iv")
+                    or data.get("iv")
+                    or iv_rank_info.get("current_iv")
+                    or 0
+                ),
                 "label": "IV",
                 "zones": [{"to": 0.15, "color": "#54a0ff"}, {"to": 0.30, "color": "#1dd1a1"}, {"to": 0.6, "color": "#ff9f43"}],
             },
         },
         "iv_rank": {
             "title": "IV Rank",
-            "value": indicators.get("iv_rank") if indicators.get("iv_rank") is not None else data.get("iv_rank"),
-            "formula": "IV Rank = 100 × count(历史HV ≤ 当前IV) / N",
+            "value": (
+                indicators.get("iv_rank")
+                if indicators.get("iv_rank") is not None
+                else (data.get("iv_rank") if data.get("iv_rank") is not None else iv_rank_info.get("iv_rank"))
+            ),
+            "formula": (
+                "IV Rank = 100 × count(历史 HV ≤ 当前 IV) / N；"
+                f"IV = HV_{iv_rank_info.get('hv_lookback') or 20} × {_num(iv_rank_info.get('iv_factor'), 2)}"
+            ),
             "steps": [
-                f"当前 IV Rank：{_num(indicators.get('iv_rank') if indicators.get('iv_rank') is not None else data.get('iv_rank'), 1)}",
-                f"开仓阈值：≥ {params.get('iv_rank_min') or data.get('config', {}).get('iv_rank_min') or 40}",
-                f"是否偏高：{'是' if data.get('iv_high') else '否'}",
-                "用历史 HV 分布给当前波动率定位百分位，越高越倾向卖波动",
+                f"当前 IV Rank：{_num(indicators.get('iv_rank') if indicators.get('iv_rank') is not None else data.get('iv_rank') or iv_rank_info.get('iv_rank'), 1)}",
+                f"当前 IV：{_num(iv_rank_info.get('current_iv'), 4)}（HV={_num(iv_rank_info.get('current_hv'), 4)} × {_num(iv_rank_info.get('iv_factor'), 2)}）",
+                (
+                    f"历史 HV 样本：N={iv_rank_info.get('sample_n')} "
+                    f"（回看 {iv_rank_info.get('iv_rank_lookback')}，HV 窗 {iv_rank_info.get('hv_lookback')}）"
+                ),
+                (
+                    f"其中 HV ≤ 当前 IV 的个数：{iv_rank_info.get('below_count')} "
+                    f"→ Rank = 100 × {iv_rank_info.get('below_count')} / {max(int(iv_rank_info.get('sample_n') or 0), 1)}"
+                ),
+                (
+                    f"HV 分布：min={_num(iv_rank_info.get('min_hv'), 4)} / "
+                    f"median={_num(iv_rank_info.get('median_hv'), 4)} / "
+                    f"max={_num(iv_rank_info.get('max_hv'), 4)}"
+                ),
+                f"开仓阈值：≥ {_num(iv_rank_info.get('iv_rank_min'), 1)}；当前偏高：{'是' if data.get('iv_high') else '否'}",
+                f"样本是否就绪：{'是' if iv_rank_info.get('hv_ready') else '否'}；数据来源：{iv_rank_info.get('source') or '—'}",
             ],
             "chart": {
-                "type": "gauge",
-                "min": 0,
-                "max": 100,
-                "value": float(indicators.get("iv_rank") or data.get("iv_rank") or 0),
-                "threshold": float((data.get("config") or {}).get("iv_rank_min") or 40),
-                "label": "IV Rank",
+                "type": "iv_rank_hist",
+                "series": iv_rank_info.get("series") or [],
+                "current_iv": iv_rank_info.get("current_iv"),
+                "current_hv": iv_rank_info.get("current_hv"),
+                "iv_rank": float(
+                    indicators.get("iv_rank")
+                    or data.get("iv_rank")
+                    or iv_rank_info.get("iv_rank")
+                    or 0
+                ),
+                "threshold": float(iv_rank_info.get("iv_rank_min") or 40),
+                "below_count": iv_rank_info.get("below_count"),
+                "sample_n": iv_rank_info.get("sample_n"),
+                "label": "历史 HV vs 当前 IV",
+            },
+            "table": {
+                "columns": ["序号", "HV", "≤当前IV"],
+                "rows": [
+                    [row.get("index"), row.get("hv"), "是" if row.get("below_iv") else "否"]
+                    for row in (iv_rank_info.get("series") or [])[-20:]
+                ],
             },
         },
         "lsp": {
@@ -4352,6 +4569,8 @@ def live_monitor_payload() -> dict[str, Any]:
     indicators = {
         "spot": data.get("spot"),
         "iv": data.get("iv"),
+        "hv": data.get("hv"),
+        "hv60": data.get("hv60"),
         "iv_rank": data.get("iv_rank"),
         "lsp": data.get("lsp"),
         "dte": data.get("dte"),
@@ -4376,6 +4595,17 @@ def live_monitor_payload() -> dict[str, Any]:
     data["config"] = load_live_setting()
     data["logs"] = list(log_buffer)[-40:]
     data["explains"] = build_live_indicator_explains(data)
+    # Surface IV Rank series on the monitor payload for debugging / clients.
+    iv_explain = (data.get("explains") or {}).get("iv_rank") or {}
+    if isinstance(iv_explain.get("chart"), dict):
+        data["iv_rank_series"] = {
+            "sample_n": iv_explain["chart"].get("sample_n"),
+            "below_count": iv_explain["chart"].get("below_count"),
+            "current_iv": iv_explain["chart"].get("current_iv"),
+            "current_hv": iv_explain["chart"].get("current_hv"),
+            "series": iv_explain["chart"].get("series") or [],
+            "source": ((iv_explain.get("steps") or [""])[-1] if iv_explain.get("steps") else ""),
+        }
     return data
 
 

@@ -1,0 +1,212 @@
+{
+  "generated": "2026-09-03 03:39:58",
+  "sample": {
+    "start": "2019-12-23",
+    "end": "2026-09-02",
+    "bars": 1624,
+    "days": 1624
+  },
+  "recommend": "keep_chain",
+  "better_by_calmar": "tie",
+  "delta_stack_minus_chain": {
+    "cagr": 0.0,
+    "final_pnl": 0.0,
+    "sharpe": 0.0,
+    "calmar": 0.0,
+    "max_dd_peak_pct": 0.0,
+    "opens": 0,
+    "take_profits": 0,
+    "stops": 0,
+    "rolls": 0
+  },
+  "open_compare": {
+    "common_opens": 29,
+    "wall_diff": 20,
+    "leg_diff": 0,
+    "wall_diff_pct": 69.0,
+    "leg_diff_pct": 0.0,
+    "samples": [
+      {
+        "date": "2020-02-04",
+        "chain_walls": [
+          3800.0,
+          3750.0
+        ],
+        "stack_walls": [
+          3850.0,
+          3750.0
+        ],
+        "chain_shorts": [
+          4300.0,
+          3400.0
+        ],
+        "stack_shorts": [
+          4300.0,
+          3400.0
+        ]
+      },
+      {
+        "date": "2020-02-28",
+        "chain_walls": [
+          3950.0,
+          3900.0
+        ],
+        "stack_walls": [
+          4000.0,
+          3900.0
+        ],
+        "chain_shorts": [
+          4550.0,
+          3500.0
+        ],
+        "stack_shorts": [
+          4550.0,
+          3500.0
+        ]
+      },
+      {
+        "date": "2020-03-27",
+        "chain_walls": [
+          3700.0,
+          3650.0
+        ],
+        "stack_walls": [
+          3750.0,
+          3650.0
+        ],
+        "chain_shorts": [
+          4150.0,
+          3350.0
+        ],
+        "stack_shorts": [
+          4150.0,
+          3350.0
+        ]
+      },
+      {
+        "date": "2020-07-31",
+        "chain_walls": [
+          4700.0,
+          4650.0
+        ],
+        "stack_walls": [
+          4750.0,
+          4650.0
+        ],
+        "chain_shorts": [
+          5350.0,
+          4200.0
+        ],
+        "stack_shorts": [
+          5350.0,
+          4200.0
+        ]
+      },
+      {
+        "date": "2020-09-22",
+        "chain_walls": [
+          4650.0,
+          4600.0
+        ],
+        "stack_walls": [
+          4700.0,
+          4600.0
+        ],
+        "chain_shorts": [
+          4950.0,
+          4350.0
+        ],
+        "stack_shorts": [
+          4950.0,
+          4350.0
+        ]
+      },
+      {
+        "date": "2021-07-28",
+        "chain_walls": [
+          4750.0,
+          4700.0
+        ],
+        "stack_walls": [
+          4800.0,
+          4700.0
+        ],
+        "chain_shorts": [
+          5100.0,
+          4450.0
+        ],
+        "stack_shorts": [
+          5100.0,
+          4450.0
+        ]
+      },
+      {
+        "date": "2021-08-27",
+        "chain_walls": [
+          4800.0,
+          4750.0
+        ],
+        "stack_walls": [
+          4850.0,
+          4750.0
+        ],
+        "chain_shorts": [
+          5100.0,
+          4550.0
+        ],
+        "stack_shorts": [
+          5100.0,
+          4550.0
+        ]
+      },
+      {
+        "date": "2022-03-25",
+        "chain_walls": [
+          4150.0,
+          4100.0
+        ],
+        "stack_walls": [
+          4200.0,
+          4100.0
+        ],
+        "chain_shorts": [
+          4650.0,
+          3750.0
+        ],
+        "stack_shorts": [
+          4650.0,
+          3750.0
+        ]
+      }
+    ],
+    "note": "墙位可不同，但短腿由 14–25Δ + 翼宽/权利金约束主导；墙仅作下界时，1 档墙差常不足以改变入选行权价。"
+  },
+  "rows": [
+    {
+      "name": "次月单链墙(现行)",
+      "wall_mode": "chain",
+      "cagr": 5.96,
+      "final_pnl": 473615.71,
+      "sharpe": 2.048,
+      "calmar": 178.615,
+      "max_dd_peak_pct": -3.34,
+      "opens": 29,
+      "take_profits": 14,
+      "stops": 0,
+      "rolls": 15
+    },
+    {
+      "name": "各月加总墙+次月选腿",
+      "wall_mode": "stack",
+      "cagr": 5.96,
+      "final_pnl": 473615.71,
+      "sharpe": 2.048,
+      "calmar": 178.615,
+      "max_dd_peak_pct": -3.34,
+      "opens": 29,
+      "take_profits": 14,
+      "stops": 0,
+      "rolls": 15
+    }
+  ]
+}

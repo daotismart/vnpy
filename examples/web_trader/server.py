@@ -425,6 +425,45 @@ def _gex_flip_strike(strikes: list[dict[str, Any]], value_key: str) -> float | N
     return round(float(nearest_strike), 4) if nearest_strike is not None else None
 
 
+def _tick_mid_price(tick: Any) -> float:
+    if not tick:
+        return 0.0
+    bid = float(getattr(tick, "bid_price_1", 0) or 0)
+    ask = float(getattr(tick, "ask_price_1", 0) or 0)
+    last = float(getattr(tick, "last_price", 0) or 0)
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    return bid or ask or last
+
+
+def _chain_strike_anchor(chain: Any) -> float:
+    """Median strike as a sanity anchor when underlying mid looks wrong."""
+    strikes: list[float] = []
+    for index in getattr(chain, "indexes", []) or []:
+        try:
+            strike = float(index)
+        except (TypeError, ValueError):
+            continue
+        if strike > 0:
+            strikes.append(strike)
+    if not strikes:
+        return 0.0
+    strikes.sort()
+    return float(strikes[len(strikes) // 2])
+
+
+def _almost_double(value: float, ref: float, tol: float = 0.08) -> bool:
+    if value <= 0 or ref <= 0:
+        return False
+    return abs(value - 2.0 * ref) / max(2.0 * ref, 1e-9) <= tol
+
+
+def _spot_near(value: float, ref: float, tol: float = 0.08) -> bool:
+    if value <= 0 or ref <= 0:
+        return False
+    return abs(value - ref) / max(ref, 1e-9) <= tol
+
+
 def chain_spot_info(
     chain,
     chain_symbol: str = "",
@@ -433,6 +472,7 @@ def chain_spot_info(
     """Resolve chain spot for GEX / TV charts.
 
     OptionMaster often leaves underlying.mid_price / atm_price cold under Redis-MD.
+    Some MD paths also leave mid_price = bid+ask (≈2× true mid), which collapses GEX gamma.
     Fall back to underlying tick, call-put parity, then an explicit override (e.g. strategy spot).
     """
     underlying = getattr(chain, "underlying", None) if chain else None
@@ -440,6 +480,24 @@ def chain_spot_info(
     adj = float(getattr(chain, "underlying_adjustment", 0) or 0) if chain else 0.0
     atm = float(getattr(chain, "atm_price", 0) or 0) if chain else 0.0
     und_symbol = getattr(underlying, "vt_symbol", "") if underlying else ""
+    override = float(spot_override or 0)
+    anchor = _chain_strike_anchor(chain) if chain is not None else 0.0
+    tick_mid = 0.0
+    if und_symbol and main_engine is not None:
+        tick_mid = _tick_mid_price(main_engine.get_tick(und_symbol))
+
+    # Repair bid+ask-style mid_price before using it.
+    if mid > 0:
+        for ref in (tick_mid, override, atm, anchor):
+            if _almost_double(mid, ref):
+                mid = float(ref)
+                break
+        else:
+            # Mid far from every strike/override is unusable for GEX.
+            refs = [value for value in (override, tick_mid, atm, anchor) if value > 0]
+            if refs and not any(_spot_near(mid, ref, tol=0.20) for ref in refs):
+                mid = 0.0
+
     spot = 0.0
     from_mid = False
     source = ""
@@ -452,17 +510,10 @@ def chain_spot_info(
         spot = atm
         source = "atm_price"
 
-    if spot <= 0 and und_symbol and main_engine is not None:
-        tick = main_engine.get_tick(und_symbol)
-        if tick:
-            bid = float(getattr(tick, "bid_price_1", 0) or 0)
-            ask = float(getattr(tick, "ask_price_1", 0) or 0)
-            last = float(getattr(tick, "last_price", 0) or 0)
-            tick_mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else (bid or ask or last)
-            if tick_mid > 0:
-                spot = float(tick_mid) + adj
-                from_mid = True
-                source = "underlying_tick"
+    if spot <= 0 and tick_mid > 0:
+        spot = float(tick_mid) + adj
+        from_mid = True
+        source = "underlying_tick"
 
     if spot <= 0 and chain is not None:
         synth = _chain_parity_spot(chain)
@@ -470,11 +521,15 @@ def chain_spot_info(
             spot = synth
             source = "parity"
 
-    override = float(spot_override or 0)
-    if override > 0 and (spot <= 0 or source in {"", "parity"}):
-        # Explain / strategy callers pass live index spot; prefer it over parity.
+    if override > 0 and (
+        spot <= 0
+        or source in {"", "parity"}
+        or not _spot_near(spot, override, tol=0.05)
+    ):
+        # Strategy/explain spot wins when mid is missing, parity-only, or inconsistent.
         spot = override
         source = "override"
+        from_mid = False
 
     return {
         "chain_symbol": chain_symbol,

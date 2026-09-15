@@ -40,6 +40,7 @@ examples/web_trader/data/
 examples/web_trader/*.tgz
 examples/web_trader/scripts/*_cache.json
 examples/web_trader/scripts/*_result.json
+examples/web_trader/scripts/l1_mm_tick_cache/
 examples/web_trader/scripts/__pycache__/
 *.bak
 

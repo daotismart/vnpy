@@ -13,8 +13,8 @@ import backtest_l1_positive_strategies as bt  # noqa: E402
 
 
 def test_helpers_round_and_session() -> None:
-    assert bt.floor_to(1.35, 0.2) == 1.2
-    assert bt.ceil_to(1.21, 0.2) == 1.4
+    assert abs(bt.floor_to(1.35, 0.2) - 1.2) < 1e-9
+    assert abs(bt.ceil_to(1.21, 0.2) - 1.4) < 1e-9
     assert bt.in_session(datetime(2026, 9, 8, 9, 45))
     assert not bt.in_session(datetime(2026, 9, 8, 12, 0))
 

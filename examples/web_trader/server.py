@@ -4088,8 +4088,6 @@ def _refresh_daily_cache_file(fname: str) -> list[dict[str, Any]]:
     """Best-effort refresh of scripts/*_daily_cache.json via matching fetch module."""
     module_map = {
         "if_daily_cache.json": "fetch_if_daily",
-        "ih_daily_cache.json": "fetch_ih_daily",
-        "im_daily_cache.json": "fetch_im_daily",
         "sa_daily_cache.json": "fetch_sa_daily",
     }
     mod_name = module_map.get(fname)

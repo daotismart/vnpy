@@ -4717,7 +4717,7 @@ function drawExplainGexWalls(ctx, width, height, chart) {
 }
 
 function drawExplainIvRankHist(ctx, width, height, chart) {
-    const pad = { top: 36, right: 110, bottom: 42, left: 54 };
+    const pad = { top: 36, right: 110, bottom: 56, left: 54 };
     const innerW = width - pad.left - pad.right;
     const innerH = height - pad.top - pad.bottom;
     const series = Array.isArray(chart.series) ? chart.series : [];
@@ -4726,6 +4726,17 @@ function drawExplainIvRankHist(ctx, width, height, chart) {
     const threshold = Number(chart.threshold || 40);
     const below = Number(chart.below_count || 0);
     const sampleN = Number(chart.sample_n || series.length || 0);
+
+    const formatBarDate = (row) => {
+        const raw = String((row && row.date) || "").trim();
+        if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+            return raw.slice(5);
+        }
+        if (raw) {
+            return raw;
+        }
+        return "";
+    };
 
     ctx.fillStyle = "#e8edf2";
     ctx.font = "14px Microsoft YaHei, sans-serif";
@@ -4806,7 +4817,7 @@ function drawExplainIvRankHist(ctx, width, height, chart) {
     ctx.fillText(`≤IV ${below}/${sampleN}`, rx, ry + 90);
     ctx.fillText(rank >= threshold ? "偏高可卖" : "偏低观望", rx, ry + 110);
 
-    // x labels
+    // x labels: prefer trading dates over bar index
     ctx.fillStyle = "#8b98a8";
     ctx.font = "10px Microsoft YaHei, sans-serif";
     ctx.textAlign = "center";
@@ -4816,7 +4827,12 @@ function drawExplainIvRankHist(ctx, width, height, chart) {
             return;
         }
         const x = pad.left + (index + 0.5) * (innerW / series.length);
-        ctx.fillText(String(row.index || index + 1), x, pad.top + innerH + 16);
+        const label = formatBarDate(row) || String(row.index || index + 1);
+        ctx.save();
+        ctx.translate(x, pad.top + innerH + 12);
+        ctx.rotate(-Math.PI / 6);
+        ctx.fillText(label, 0, 0);
+        ctx.restore();
     });
     ctx.textAlign = "left";
 }

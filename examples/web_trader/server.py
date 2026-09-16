@@ -4000,41 +4000,126 @@ def _realized_hv_from_closes(closes: list[float], lookback: int = 20) -> float:
     return max(0.08, min(0.80, math.sqrt(var) * math.sqrt(242)))
 
 
-def _load_daily_closes_for_portfolio(portfolio_name: str, lookback: int = 65) -> list[float]:
+def _daily_cache_filename(portfolio_name: str) -> str:
     product = str(portfolio_name or "IO").split(".")[0].upper()
-    fname = {
+    return {
         "IO": "if_daily_cache.json",
         "IF": "if_daily_cache.json",
         "HO": "ih_daily_cache.json",
         "IH": "ih_daily_cache.json",
         "MO": "im_daily_cache.json",
         "IM": "im_daily_cache.json",
-    }.get(product)
-    if not fname:
-        return []
-    path = WEB_SCRIPTS_DIR.joinpath(fname)
-    if not path.exists():
-        return []
-    try:
-        rows = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    closes: list[float] = []
+    }.get(product, "")
+
+
+def _normalize_bar_date(value: Any) -> str:
+    text = str(value or "").strip().replace("/", "-")
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    if "T" in text:
+        return text.split("T", 1)[0][:10]
+    if " " in text:
+        return text.split(" ", 1)[0][:10]
+    return text[:10]
+
+
+def _parse_daily_bar_rows(rows: Any) -> list[dict[str, Any]]:
+    bars: list[dict[str, Any]] = []
+    if not isinstance(rows, list):
+        return bars
     for row in rows:
         try:
             if isinstance(row, (list, tuple)) and len(row) >= 5:
+                stamp = _normalize_bar_date(row[0])
                 px = float(row[4])
             elif isinstance(row, dict):
+                stamp = _normalize_bar_date(row.get("date") or row.get("datetime") or row.get("time"))
                 px = float(row.get("close") or 0)
             else:
                 continue
         except (TypeError, ValueError):
             continue
-        if px > 0:
-            closes.append(px)
+        if stamp and px > 0:
+            bars.append({"date": stamp, "close": px})
+    bars.sort(key=lambda item: item["date"])
+    dedup: dict[str, dict[str, Any]] = {}
+    for item in bars:
+        dedup[item["date"]] = item
+    return [dedup[key] for key in sorted(dedup)]
+
+
+def _load_daily_bars_for_portfolio(
+    portfolio_name: str,
+    lookback: int = 65,
+    *,
+    refresh_if_stale_days: int = 3,
+) -> tuple[list[dict[str, Any]], str]:
+    """Load dated daily closes; optionally refresh akshare cache when stale."""
+    fname = _daily_cache_filename(portfolio_name)
+    if not fname:
+        return [], "unsupported"
+    path = WEB_SCRIPTS_DIR.joinpath(fname)
+    source = "daily_cache"
+    bars = _parse_daily_bar_rows(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else []
+    last_date = bars[-1]["date"] if bars else ""
+    stale = True
+    if last_date:
+        try:
+            age = (datetime.now().date() - datetime.strptime(last_date, "%Y-%m-%d").date()).days
+            stale = age > max(0, int(refresh_if_stale_days))
+        except ValueError:
+            stale = True
+    if stale:
+        refreshed = _refresh_daily_cache_file(fname)
+        if refreshed:
+            bars = refreshed
+            source = "daily_cache_refresh"
+            last_date = bars[-1]["date"] if bars else last_date
+        elif bars:
+            source = "daily_cache_stale"
     if lookback > 0:
-        closes = closes[-lookback:]
-    return closes
+        bars = bars[-lookback:]
+    return bars, source if bars else "empty"
+
+
+def _refresh_daily_cache_file(fname: str) -> list[dict[str, Any]]:
+    """Best-effort refresh of scripts/*_daily_cache.json via matching fetch module."""
+    module_map = {
+        "if_daily_cache.json": "fetch_if_daily",
+        "ih_daily_cache.json": "fetch_ih_daily",
+        "im_daily_cache.json": "fetch_im_daily",
+        "sa_daily_cache.json": "fetch_sa_daily",
+    }
+    mod_name = module_map.get(fname)
+    if not mod_name:
+        return []
+    path = WEB_SCRIPTS_DIR.joinpath(f"{mod_name}.py")
+    if not path.exists():
+        return []
+    try:
+        spec = importlib.util.spec_from_file_location(f"vn_web_{mod_name}", path)
+        if spec is None or spec.loader is None:
+            return []
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not hasattr(module, "fetch"):
+            return []
+        df, _label = module.fetch()
+        rows = module.frame_to_rows(df)
+        cache_path = WEB_SCRIPTS_DIR.joinpath(fname)
+        cache_path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+        return _parse_daily_bar_rows(rows)
+    except Exception:
+        return []
+
+
+def _load_daily_closes_for_portfolio(portfolio_name: str, lookback: int = 65) -> list[float]:
+    bars, _source = _load_daily_bars_for_portfolio(
+        portfolio_name, lookback=lookback, refresh_if_stale_days=0
+    )
+    return [float(item["close"]) for item in bars]
 
 
 def _rebuild_hv_hist_from_closes(closes: list[float], hv_lookback: int = 20) -> list[float]:
@@ -4044,6 +4129,57 @@ def _rebuild_hv_hist_from_closes(closes: list[float], hv_lookback: int = 20) -> 
     for end in range(hv_lookback + 1, len(closes) + 1):
         hist.append(_realized_hv_from_closes(closes[:end], hv_lookback))
     return hist
+
+
+def _rebuild_hv_series_from_bars(
+    bars: list[dict[str, Any]],
+    hv_lookback: int = 20,
+    iv_rank_lookback: int = 60,
+) -> list[dict[str, Any]]:
+    """Each HV point is dated by the close day at the end of its lookback window."""
+    closes = [float(item["close"]) for item in bars]
+    dates = [str(item["date"]) for item in bars]
+    if len(closes) < hv_lookback + 1:
+        return []
+    series: list[dict[str, Any]] = []
+    for end in range(hv_lookback + 1, len(closes) + 1):
+        hv = _realized_hv_from_closes(closes[:end], hv_lookback)
+        series.append({"date": dates[end - 1], "hv": round(float(hv), 4)})
+    if iv_rank_lookback > 0:
+        series = series[-iv_rank_lookback:]
+    return series
+
+
+def _merge_strategy_closes_with_dates(
+    bars: list[dict[str, Any]],
+    day_closes: list[float],
+    day_dates: list[str],
+) -> list[dict[str, Any]]:
+    """Prefer strategy closes when dates exist; otherwise align cache dates from the end."""
+    paired: list[dict[str, Any]] = []
+    if day_closes and day_dates and len(day_dates) >= len(day_closes):
+        for stamp, px in zip(day_dates[-len(day_closes) :], day_closes):
+            stamp = _normalize_bar_date(stamp)
+            try:
+                close = float(px)
+            except (TypeError, ValueError):
+                continue
+            if stamp and close > 0:
+                paired.append({"date": stamp, "close": close})
+        if paired:
+            return paired
+    if day_closes and bars and len(bars) >= len(day_closes):
+        tail = bars[-len(day_closes) :]
+        for item, px in zip(tail, day_closes):
+            try:
+                close = float(px)
+            except (TypeError, ValueError):
+                close = float(item["close"])
+            if close > 0:
+                paired.append({"date": item["date"], "close": close})
+        if paired:
+            return paired
+    return bars
 
 
 def resolve_iv_rank_series(data: dict[str, Any]) -> dict[str, Any]:
@@ -4070,39 +4206,52 @@ def resolve_iv_rank_series(data: dict[str, Any]) -> dict[str, Any]:
         40.0,
     )
 
-    hv_hist_raw = data.get("hv_hist") or book_snap.get("hv_hist") or []
-    hv_hist: list[float] = []
-    for item in hv_hist_raw:
+    day_closes_raw = book_snap.get("day_closes") or data.get("day_closes") or []
+    day_dates_raw = book_snap.get("day_dates") or data.get("day_dates") or []
+    day_closes: list[float] = []
+    for item in day_closes_raw:
         try:
-            value = float(item)
+            px = float(item)
         except (TypeError, ValueError):
             continue
-        if value > 0:
-            hv_hist.append(value)
-    source = "strategy" if hv_hist else ""
+        if px > 0:
+            day_closes.append(px)
+    day_dates = [_normalize_bar_date(item) for item in day_dates_raw if _normalize_bar_date(item)]
 
-    if not hv_hist:
-        closes = book_snap.get("day_closes") or data.get("day_closes") or []
-        close_vals: list[float] = []
-        for item in closes:
+    cache_bars, cache_source = _load_daily_bars_for_portfolio(
+        portfolio,
+        lookback=iv_rank_lookback + hv_lookback + 5,
+        refresh_if_stale_days=3,
+    )
+    dated_bars = _merge_strategy_closes_with_dates(cache_bars, day_closes, day_dates)
+    if not dated_bars and cache_bars:
+        dated_bars = cache_bars
+
+    source = ""
+    hv_series = _rebuild_hv_series_from_bars(
+        dated_bars, hv_lookback=hv_lookback, iv_rank_lookback=iv_rank_lookback
+    )
+    if hv_series:
+        if day_dates and day_closes:
+            source = "strategy_dated"
+        elif day_closes and cache_bars:
+            source = f"{cache_source}+strategy_closes"
+        else:
+            source = cache_source
+    else:
+        # Last resort: undated strategy hv_hist (no chart dates).
+        hv_hist_raw = data.get("hv_hist") or book_snap.get("hv_hist") or []
+        for item in hv_hist_raw:
             try:
-                px = float(item)
+                value = float(item)
             except (TypeError, ValueError):
                 continue
-            if px > 0:
-                close_vals.append(px)
-        if len(close_vals) < hv_lookback + 1:
-            close_vals = _load_daily_closes_for_portfolio(
-                portfolio, lookback=iv_rank_lookback + hv_lookback + 5
-            )
-            if close_vals:
-                source = "daily_cache"
-        elif not source:
-            source = "day_closes"
-        if close_vals:
-            rebuilt = _rebuild_hv_hist_from_closes(close_vals, hv_lookback=hv_lookback)
-            hv_hist = rebuilt[-iv_rank_lookback:] if rebuilt else []
+            if value > 0:
+                hv_series.append({"date": "", "hv": round(value, 4)})
+        if hv_series:
+            source = "strategy"
 
+    hv_hist = [float(row["hv"]) for row in hv_series]
     current_hv = _float(calc.get("current_hv") or data.get("hv") or book_snap.get("hv"), 0.0)
     current_iv = _float(
         calc.get("current_iv") or data.get("iv") or (data.get("indicators") or {}).get("iv"),
@@ -4113,26 +4262,29 @@ def resolve_iv_rank_series(data: dict[str, Any]) -> dict[str, Any]:
     if current_iv <= 0 and current_hv > 0:
         current_iv = current_hv * iv_factor
 
-    below_count = int(calc.get("below_count") or 0)
-    if hv_hist and (not calc.get("below_count") or source != "strategy"):
-        below_count = sum(1 for item in hv_hist if item <= current_iv)
+    below_count = sum(1 for item in hv_hist if item <= current_iv) if hv_hist else int(calc.get("below_count") or 0)
     sample_n = len(hv_hist)
     rank = _float(data.get("iv_rank") or (data.get("indicators") or {}).get("iv_rank"), 0.0)
     if sample_n > 0:
         rank = 100.0 * below_count / sample_n
     hv_ready = bool(calc.get("hv_ready")) if "hv_ready" in calc else sample_n >= 10
+    start_date = hv_series[0].get("date") if hv_series else ""
+    end_date = hv_series[-1].get("date") if hv_series else ""
     series = [
         {
             "index": i + 1,
-            "hv": round(value, 4),
-            "below_iv": bool(value <= current_iv),
+            "date": row.get("date") or "",
+            "hv": round(float(row.get("hv") or 0), 4),
+            "below_iv": bool(float(row.get("hv") or 0) <= current_iv),
         }
-        for i, value in enumerate(hv_hist)
+        for i, row in enumerate(hv_series)
     ]
     return {
         "source": source or ("empty" if not hv_hist else source),
         "hv_hist": [round(v, 4) for v in hv_hist],
         "series": series,
+        "start_date": start_date,
+        "end_date": end_date,
         "current_hv": round(current_hv, 4) if current_hv else 0.0,
         "current_iv": round(current_iv, 4) if current_iv else 0.0,
         "hv60": round(_float(calc.get("hv60") or data.get("hv60"), 0.0), 4),
@@ -4144,7 +4296,7 @@ def resolve_iv_rank_series(data: dict[str, Any]) -> dict[str, Any]:
         "iv_rank": round(rank, 1),
         "iv_rank_min": iv_rank_min,
         "hv_ready": hv_ready,
-        "closes_n": int(calc.get("closes_n") or 0),
+        "closes_n": int(calc.get("closes_n") or len(dated_bars) or 0),
         "min_hv": round(min(hv_hist), 4) if hv_hist else 0.0,
         "max_hv": round(max(hv_hist), 4) if hv_hist else 0.0,
         "median_hv": round(sorted(hv_hist)[len(hv_hist) // 2], 4) if hv_hist else 0.0,
@@ -4255,6 +4407,11 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
                 (
                     f"历史 HV 样本：N={iv_rank_info.get('sample_n')} "
                     f"（回看 {iv_rank_info.get('iv_rank_lookback')}，HV 窗 {iv_rank_info.get('hv_lookback')}）"
+                    + (
+                        f"；区间 {iv_rank_info.get('start_date')} ~ {iv_rank_info.get('end_date')}"
+                        if iv_rank_info.get("start_date") and iv_rank_info.get("end_date")
+                        else ""
+                    )
                 ),
                 (
                     f"其中 HV ≤ 当前 IV 的个数：{iv_rank_info.get('below_count')} "
@@ -4278,12 +4435,25 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
                 "threshold": float(iv_rank_info.get("iv_rank_min") or 40),
                 "below_count": iv_rank_info.get("below_count"),
                 "sample_n": iv_rank_info.get("sample_n"),
-                "label": "历史 HV vs 当前 IV",
+                "start_date": iv_rank_info.get("start_date"),
+                "end_date": iv_rank_info.get("end_date"),
+                "label": (
+                    "历史 HV vs 当前 IV"
+                    + (
+                        f"（{iv_rank_info.get('start_date')} ~ {iv_rank_info.get('end_date')}）"
+                        if iv_rank_info.get("start_date") and iv_rank_info.get("end_date")
+                        else ""
+                    )
+                ),
             },
             "table": {
-                "columns": ["序号", "HV", "≤当前IV"],
+                "columns": ["日期", "HV", "≤当前IV"],
                 "rows": [
-                    [row.get("index"), row.get("hv"), "是" if row.get("below_iv") else "否"]
+                    [
+                        row.get("date") or row.get("index"),
+                        row.get("hv"),
+                        "是" if row.get("below_iv") else "否",
+                    ]
                     for row in (iv_rank_info.get("series") or [])[-20:]
                 ],
             },

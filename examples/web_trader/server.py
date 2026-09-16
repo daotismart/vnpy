@@ -1493,6 +1493,16 @@ def process_event(event: Event) -> None:
     global _tick_ws_last
 
     if event.type == EVENT_TICK:
+        # Redis MD path does not update CTP PositionProfit — mark locally.
+        try:
+            tick = event.data
+            refresh_engine_position_pnl(
+                main_engine,
+                getattr(tick, "vt_symbol", None),
+                allow_redis=False,
+            )
+        except Exception:
+            pass
         if not active_websockets or event_loop is None:
             return
         now = time.monotonic()
@@ -1500,6 +1510,15 @@ def process_event(event: Event) -> None:
             return
         _tick_ws_last = now
         payload = {"topic": event.type, "data": compact_tick(event.data)}
+    elif event.type == EVENT_POSITION:
+        try:
+            refresh_engine_position_pnl(main_engine)
+            seed_position_md_subscribe(main_engine)
+        except Exception:
+            pass
+        if not active_websockets or event_loop is None:
+            return
+        payload = {"topic": event.type, "data": to_plain(event.data)}
     elif event.type in {
         EVENT_LOG,
         EVENT_CTA_LOG,
@@ -1751,12 +1770,20 @@ def get_trades(_: bool = Depends(get_access)) -> list[Any]:
 
 @app.get("/position")
 def get_positions(_: bool = Depends(get_access)) -> list[Any]:
-    return to_plain(require_main().get_all_positions())
+    engine = require_main()
+    refresh_engine_position_pnl(engine)
+    seed_position_md_subscribe(engine)
+    return to_plain(engine.get_all_positions())
 
 
 @app.get("/account")
 def get_accounts(_: bool = Depends(get_access)) -> list[Any]:
-    return to_plain(require_main().get_all_accounts())
+    engine = require_main()
+    # Enrich plain account dicts with floating pnl for clients that show it.
+    rows = serialize_accounts_with_pnl(engine)
+    if rows:
+        return rows
+    return to_plain(engine.get_all_accounts())
 
 
 @app.get("/contract")
@@ -1800,6 +1827,219 @@ def tick_last_price(tick) -> float:
     if bid and ask:
         return (bid + ask) / 2
     return bid or ask
+
+
+def direction_pnl_sign(direction: Any) -> float:
+    """+1 long / -1 short for floating PnL."""
+    if direction == Direction.SHORT:
+        return -1.0
+    text = str(getattr(direction, "value", direction) or "").strip().lower()
+    if text in {"空", "short", "s", "sell"}:
+        return -1.0
+    return 1.0
+
+
+def resolve_mark_price(
+    engine: MainEngine | None,
+    vt_symbol: str,
+    *,
+    allow_redis: bool = True,
+) -> float:
+    """Best available mark: in-memory tick, then Redis latest snapshot."""
+    if not vt_symbol:
+        return 0.0
+    if engine is not None:
+        price = tick_last_price(engine.get_tick(vt_symbol))
+        if price:
+            return price
+    if not allow_redis:
+        return 0.0
+    try:
+        from md_bus import load_latest_tick_dict
+
+        data = load_latest_tick_dict(vt_symbol)
+        if not data:
+            return 0.0
+        last = float(data.get("last_price") or 0)
+        if last:
+            return last
+        bid = float(data.get("bid_price_1") or 0)
+        ask = float(data.get("ask_price_1") or 0)
+        if bid and ask:
+            return (bid + ask) / 2
+        return bid or ask
+    except Exception:
+        return 0.0
+
+
+def compute_position_floating_pnl(
+    *,
+    direction: Any,
+    volume: float,
+    avg_price: float,
+    mark_price: float,
+    size: float,
+    fallback_pnl: float = 0.0,
+) -> float:
+    """Mark-to-market PnL; keep CTP pnl when mark is unavailable."""
+    vol = float(volume or 0)
+    avg = float(avg_price or 0)
+    mark = float(mark_price or 0)
+    mult = float(size or 0) or 1.0
+    if not vol or not avg or not mark:
+        return round(float(fallback_pnl or 0), 2)
+    pnl = (mark - avg) * vol * mult * direction_pnl_sign(direction)
+    return round(float(pnl), 2)
+
+
+_last_pnl_refresh_mono = 0.0
+
+
+def refresh_engine_position_pnl(
+    engine: MainEngine | None = None,
+    vt_symbol: str | None = None,
+    *,
+    allow_redis: bool = True,
+    min_interval: float = 0.0,
+) -> float:
+    """Rewrite PositionData.pnl from Redis/engine ticks (SKIP_MD leaves CTP pnl stale/0)."""
+    global _last_pnl_refresh_mono
+    engine = engine or main_engine
+    if engine is None:
+        return 0.0
+    if min_interval > 0:
+        now = time.monotonic()
+        if now - _last_pnl_refresh_mono < min_interval:
+            return 0.0
+        _last_pnl_refresh_mono = now
+    total = 0.0
+    for pos in engine.get_all_positions() or []:
+        pos_vt = getattr(pos, "vt_symbol", "") or ""
+        if vt_symbol and pos_vt != vt_symbol:
+            total += float(getattr(pos, "pnl", 0) or 0)
+            continue
+        volume = float(getattr(pos, "volume", 0) or 0)
+        if not volume:
+            try:
+                pos.pnl = 0.0
+            except Exception:
+                pass
+            continue
+        contract = engine.get_contract(pos_vt)
+        size = float(getattr(contract, "size", 0) or 0) if contract else 0.0
+        mark = resolve_mark_price(engine, pos_vt, allow_redis=allow_redis)
+        pnl = compute_position_floating_pnl(
+            direction=getattr(pos, "direction", None),
+            volume=volume,
+            avg_price=float(getattr(pos, "price", 0) or 0),
+            mark_price=mark,
+            size=size,
+            fallback_pnl=float(getattr(pos, "pnl", 0) or 0),
+        )
+        try:
+            pos.pnl = pnl
+        except Exception:
+            pass
+        total += pnl
+    return round(total, 2)
+
+
+_last_pos_md_seed = 0.0
+
+
+def seed_position_md_subscribe(engine: MainEngine | None = None) -> dict[str, Any]:
+    """Publish open-position contracts so md_receiver can subscribe them for MTM PnL."""
+    global _last_pos_md_seed
+    engine = engine or main_engine
+    now = time.time()
+    if engine is None or now - _last_pos_md_seed < 10.0:
+        return {"ok": False, "skipped": True}
+    _last_pos_md_seed = now
+    symbols: list[str] = []
+    contracts: list[Any] = []
+    for pos in engine.get_all_positions() or []:
+        if float(getattr(pos, "volume", 0) or 0) == 0:
+            continue
+        vt_symbol = getattr(pos, "vt_symbol", "") or ""
+        if not vt_symbol:
+            continue
+        symbols.append(vt_symbol)
+        contract = engine.get_contract(vt_symbol)
+        if contract is not None:
+            contracts.append(contract)
+        # Also ensure underlying futures for option symbols when present.
+        und = getattr(contract, "option_underlying", None) if contract else None
+        if und:
+            und_vt = und if "." in str(und) else f"{und}.{getattr(contract.exchange, 'value', '')}"
+            if und_vt and und_vt not in symbols:
+                und_c = engine.get_contract(und_vt)
+                if und_c is not None:
+                    symbols.append(und_vt)
+                    contracts.append(und_c)
+    result: dict[str, Any] = {"ok": True, "symbols": symbols}
+    try:
+        from md_bus import set_extra_subscribe_symbols, store_contracts_to_redis
+
+        result["extra"] = set_extra_subscribe_symbols(symbols)
+        if contracts:
+            result["contracts"] = store_contracts_to_redis(contracts, publish=True)
+    except Exception as exc:
+        result["ok"] = False
+        result["error"] = str(exc)
+    return result
+
+
+def serialize_accounts_with_pnl(engine: MainEngine | None = None) -> list[dict[str, Any]]:
+    engine = engine or main_engine
+    if engine is None:
+        return []
+    total_pnl = refresh_engine_position_pnl(engine)
+    rows = []
+    for item in engine.get_all_accounts() or []:
+        rows.append(
+            {
+                "accountid": getattr(item, "accountid", ""),
+                "balance": getattr(item, "balance", 0),
+                "available": getattr(item, "available", 0),
+                "frozen": getattr(item, "frozen", 0),
+                # AccountData has no broker pnl field under Redis-MD; show book floating PnL.
+                "pnl": total_pnl,
+                "vt_accountid": getattr(item, "vt_accountid", ""),
+                "gateway_name": getattr(item, "gateway_name", ""),
+            }
+        )
+    return rows
+
+
+def serialize_positions_with_pnl(engine: MainEngine | None = None) -> list[dict[str, Any]]:
+    engine = engine or main_engine
+    if engine is None:
+        return []
+    refresh_engine_position_pnl(engine)
+    seed_position_md_subscribe(engine)
+    rows = []
+    for item in engine.get_all_positions() or []:
+        volume = float(getattr(item, "volume", 0) or 0)
+        if volume == 0:
+            continue
+        direction = getattr(item, "direction", None)
+        rows.append(
+            {
+                "vt_symbol": getattr(item, "vt_symbol", ""),
+                "symbol": getattr(item, "symbol", ""),
+                "exchange": getattr(getattr(item, "exchange", None), "value", str(getattr(item, "exchange", ""))),
+                "direction": getattr(direction, "value", str(direction or "")),
+                "volume": volume,
+                "frozen": getattr(item, "frozen", 0),
+                "price": getattr(item, "price", 0),
+                "pnl": getattr(item, "pnl", 0),
+                "yd_volume": getattr(item, "yd_volume", 0),
+                "vt_positionid": getattr(item, "vt_positionid", ""),
+                "gateway_name": getattr(item, "gateway_name", ""),
+                "mark_price": resolve_mark_price(engine, getattr(item, "vt_symbol", "") or ""),
+            }
+        )
+    return rows
 
 
 def account_net_pos(engine: MainEngine, vt_symbol: str, symbol: str = "") -> float:
@@ -4593,25 +4833,19 @@ def live_monitor_payload() -> dict[str, Any]:
     accounts = []
     positions = []
     if main_engine is not None:
-        accounts = [
-            {
-                "accountid": getattr(item, "accountid", ""),
-                "balance": getattr(item, "balance", 0),
-                "available": getattr(item, "available", 0),
-                "frozen": getattr(item, "frozen", 0),
-            }
-            for item in (main_engine.get_all_accounts() or [])
-        ]
+        refresh_engine_position_pnl(main_engine)
+        seed_position_md_subscribe(main_engine)
+        accounts = serialize_accounts_with_pnl(main_engine)
         positions = [
             {
-                "vt_symbol": getattr(item, "vt_symbol", ""),
-                "direction": getattr(getattr(item, "direction", None), "value", str(getattr(item, "direction", ""))),
-                "volume": getattr(item, "volume", 0),
-                "price": getattr(item, "price", 0),
-                "pnl": getattr(item, "pnl", 0),
+                "vt_symbol": item.get("vt_symbol", ""),
+                "direction": item.get("direction", ""),
+                "volume": item.get("volume", 0),
+                "price": item.get("price", 0),
+                "pnl": item.get("pnl", 0),
+                "mark_price": item.get("mark_price", 0),
             }
-            for item in (main_engine.get_all_positions() or [])
-            if float(getattr(item, "volume", 0) or 0) != 0
+            for item in serialize_positions_with_pnl(main_engine)
         ]
     indicators = {
         "spot": data.get("spot"),

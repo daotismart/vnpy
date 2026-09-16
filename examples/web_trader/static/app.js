@@ -289,7 +289,7 @@ function renderPositions() {
             <td class="${sideClass(item.direction)}">${item.direction || ""}</td>
             <td>${item.volume ?? ""}</td>
             <td>${item.price ?? ""}</td>
-            <td>${item.pnl ?? ""}</td>
+            <td class="${signedClass(item.pnl)}">${fmtPnl(item.pnl)}</td>
         </tr>`);
 }
 
@@ -2460,6 +2460,17 @@ function signedClass(value) {
     return "";
 }
 
+function fmtPnl(value) {
+    if (value === "" || value === null || value === undefined) {
+        return "—";
+    }
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+        return String(value);
+    }
+    return number.toFixed(2);
+}
+
 function setupCanvas(canvas, height = 220) {
     const ctx = canvas.getContext("2d");
     const parent = canvas.parentElement;
@@ -3036,7 +3047,7 @@ function renderLiveMonitor(data) {
             direction: "",
             volume: item.balance ?? "",
             price: item.available ?? "",
-            pnl: item.frozen ?? "",
+            pnl: item.pnl ?? "",
         });
     });
     (data.positions || []).forEach((item) => {
@@ -3056,7 +3067,7 @@ function renderLiveMonitor(data) {
             <td class="${sideClass(row.direction)}">${row.direction}</td>
             <td>${row.volume}</td>
             <td>${row.price}</td>
-            <td class="${signedClass(row.pnl)}">${row.pnl}</td>
+            <td class="${signedClass(row.pnl)}">${fmtPnl(row.pnl)}</td>
         </tr>`);
     if (logBox) {
         const lines = data.decisions || [];

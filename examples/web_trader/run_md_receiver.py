@@ -72,7 +72,9 @@ from vnpy_ctp import CtpGateway
 
 from ctp_session import patch_ctp_connect_modes, release_ctp_td
 from md_bus import (
+    load_contracts_by_vt_symbols,
     load_contracts_from_redis,
+    load_extra_subscribe_symbols,
     md_bus_status,
     start_md_bus_publisher,
     stop_md_bus,
@@ -163,6 +165,8 @@ class MdReceiver:
         self._started_at = time.time()
         self.last_log = ""
         self._subscribed_at = 0.0
+        self._last_extra_sync = 0.0
+        self.extra_symbols: set[str] = set()
         self.thread = threading.Thread(target=self._loop, name="md-receiver", daemon=True)
         event_engine.register(EVENT_CONTRACT, self._on_contract)
         event_engine.register(EVENT_TICK, self._on_tick)
@@ -215,12 +219,13 @@ class MdReceiver:
         months = sorted({_month_key(c.symbol) for c in self.contracts.values() if _month_key(c.symbol) != "9999"})
         return set(months[: self.max_chains])
 
-    def _maybe_subscribe(self, contract: ContractData) -> None:
+    def _maybe_subscribe(self, contract: ContractData, *, force: bool = False) -> None:
         if contract.vt_symbol in self.subscribed:
             return
-        allowed = self._allowed_months()
-        if allowed is not None and _month_key(contract.symbol) not in allowed:
-            return
+        if not force:
+            allowed = self._allowed_months()
+            if allowed is not None and _month_key(contract.symbol) not in allowed:
+                return
         if getattr(contract.exchange, "value", "") == "LOCAL":
             return
         req = SubscribeRequest(symbol=contract.symbol, exchange=contract.exchange)
@@ -233,20 +238,42 @@ class MdReceiver:
             return
         self.subscribed.clear()
         for contract in list(self.contracts.values()):
-            self._maybe_subscribe(contract)
+            force = contract.vt_symbol in self.extra_symbols
+            self._maybe_subscribe(contract, force=force)
         self._subscribed_at = time.time()
-        self.log(f"subscribed {len(self.subscribed)} contracts")
+        self.log(f"subscribed {len(self.subscribed)} contracts (extra={len(self.extra_symbols)})")
+
+    def _sync_extra_subscribe(self) -> None:
+        """Subscribe open-position symbols published by web beyond LIVE_MD_PREFIXES."""
+        now = time.time()
+        if now - float(self._last_extra_sync or 0.0) < 15.0:
+            return
+        self._last_extra_sync = now
+        symbols = load_extra_subscribe_symbols()
+        self.extra_symbols = set(symbols)
+        if not symbols:
+            return
+        added = 0
+        for contract in load_contracts_by_vt_symbols(symbols):
+            if contract.vt_symbol not in self.contracts:
+                self.contracts[contract.vt_symbol] = contract
+                added += 1
+            if self._md_logged_in():
+                self._maybe_subscribe(contract, force=True)
+        if added:
+            self.log(f"extra subscribe loaded {added} contracts ({','.join(symbols[:6])})")
 
     def _on_tick(self, event: Event) -> None:
         tick = event.data
         if not isinstance(tick, TickData):
             return
         symbol = (tick.symbol or "").upper()
-        if not symbol.startswith(self.prefixes):
-            return
-        self.tick_count += 1
-        self.last_tick_vt = tick.vt_symbol
-        self.last_tick_dt = tick.datetime
+        # Count prefix universe for lag health; still accept extra-symbol ticks for PnL.
+        if symbol.startswith(self.prefixes) or tick.vt_symbol in self.extra_symbols:
+            self.tick_count += 1
+            if symbol.startswith(self.prefixes):
+                self.last_tick_vt = tick.vt_symbol
+                self.last_tick_dt = tick.datetime
 
     def _loop(self) -> None:
         _stop.wait(2.0)
@@ -331,6 +358,7 @@ class MdReceiver:
             self.log("MD logged in but no ticks — resubscribe")
             self.subscribed.clear()
             self._resubscribe_all()
+        self._sync_extra_subscribe()
 
         # Empty universe during continuous auction for too long → clean Docker restart.
         if (

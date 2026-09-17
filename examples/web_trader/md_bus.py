@@ -54,6 +54,15 @@ def contracts_key() -> str:
     return _env("MD_BUS_CONTRACTS_KEY", "vnpy:md:contracts")
 
 
+def extra_subscribe_key() -> str:
+    """Redis SET of vt_symbols that md_receiver must subscribe beyond LIVE_MD_PREFIXES.
+
+    Used for open positions (e.g. SA options) so floating PnL can mark to market
+    while the main universe stays IF/IO.
+    """
+    return _env("MD_BUS_EXTRA_SUBSCRIBE_KEY", "vnpy:md:extra_subscribe")
+
+
 def tick_stream() -> str:
     """Durable Redis Stream for ticks (recorder ACK; survives restarts)."""
     return _env("MD_BUS_TICK_STREAM", "vnpy:md:tick_stream")
@@ -284,6 +293,84 @@ def load_contracts_from_redis(prefixes: tuple[str, ...] | list[str] | None = Non
         except Exception:
             continue
         out.append(contract)
+    return out
+
+
+def load_latest_tick_dict(vt_symbol: str) -> dict[str, Any] | None:
+    """Read one latest tick payload from Redis hash (may be stale outside session)."""
+    if not vt_symbol:
+        return None
+    try:
+        client = create_redis_client(socket_timeout=3, socket_connect_timeout=2)
+        raw = client.hget(latest_key(), vt_symbol)
+        try:
+            client.close()
+        except Exception:
+            pass
+        if not raw:
+            return None
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def set_extra_subscribe_symbols(vt_symbols: list[str] | set[str]) -> dict[str, Any]:
+    """Replace the Redis SET of extra MD subscribe targets (open positions etc.)."""
+    symbols = sorted({str(s).strip() for s in vt_symbols if str(s).strip()})
+    try:
+        client = create_redis_client(socket_timeout=5, socket_connect_timeout=2)
+        key = extra_subscribe_key()
+        pipe = client.pipeline(transaction=True)
+        pipe.delete(key)
+        if symbols:
+            pipe.sadd(key, *symbols)
+        pipe.execute()
+        try:
+            client.close()
+        except Exception:
+            pass
+        return {"ok": True, "count": len(symbols), "symbols": symbols, "key": key}
+    except Exception as exc:
+        return {"ok": False, "count": 0, "symbols": symbols, "error": str(exc)}
+
+
+def load_extra_subscribe_symbols() -> list[str]:
+    try:
+        client = create_redis_client(socket_timeout=3, socket_connect_timeout=2)
+        members = client.smembers(extra_subscribe_key()) or set()
+        try:
+            client.close()
+        except Exception:
+            pass
+        return sorted(str(m) for m in members if m)
+    except Exception:
+        return []
+
+
+def load_contracts_by_vt_symbols(vt_symbols: list[str] | set[str]) -> list:
+    """Load specific contracts from Redis hash by vt_symbol."""
+    wanted = [str(s).strip() for s in vt_symbols if str(s).strip()]
+    if not wanted:
+        return []
+    try:
+        client = create_redis_client(socket_timeout=10, socket_connect_timeout=3)
+    except Exception:
+        return []
+    out: list[ContractData] = []
+    for name in wanted:
+        try:
+            raw = client.hget(contracts_key(), name)
+            if not raw:
+                continue
+            contract = contract_from_dict(json.loads(raw))
+        except Exception:
+            continue
+        out.append(contract)
+    try:
+        client.close()
+    except Exception:
+        pass
     return out
 
 

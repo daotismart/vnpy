@@ -425,6 +425,45 @@ def _gex_flip_strike(strikes: list[dict[str, Any]], value_key: str) -> float | N
     return round(float(nearest_strike), 4) if nearest_strike is not None else None
 
 
+def _tick_mid_price(tick: Any) -> float:
+    if not tick:
+        return 0.0
+    bid = float(getattr(tick, "bid_price_1", 0) or 0)
+    ask = float(getattr(tick, "ask_price_1", 0) or 0)
+    last = float(getattr(tick, "last_price", 0) or 0)
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    return bid or ask or last
+
+
+def _chain_strike_anchor(chain: Any) -> float:
+    """Median strike as a sanity anchor when underlying mid looks wrong."""
+    strikes: list[float] = []
+    for index in getattr(chain, "indexes", []) or []:
+        try:
+            strike = float(index)
+        except (TypeError, ValueError):
+            continue
+        if strike > 0:
+            strikes.append(strike)
+    if not strikes:
+        return 0.0
+    strikes.sort()
+    return float(strikes[len(strikes) // 2])
+
+
+def _almost_double(value: float, ref: float, tol: float = 0.08) -> bool:
+    if value <= 0 or ref <= 0:
+        return False
+    return abs(value - 2.0 * ref) / max(2.0 * ref, 1e-9) <= tol
+
+
+def _spot_near(value: float, ref: float, tol: float = 0.08) -> bool:
+    if value <= 0 or ref <= 0:
+        return False
+    return abs(value - ref) / max(ref, 1e-9) <= tol
+
+
 def chain_spot_info(
     chain,
     chain_symbol: str = "",
@@ -433,6 +472,7 @@ def chain_spot_info(
     """Resolve chain spot for GEX / TV charts.
 
     OptionMaster often leaves underlying.mid_price / atm_price cold under Redis-MD.
+    Some MD paths also leave mid_price = bid+ask (≈2× true mid), which collapses GEX gamma.
     Fall back to underlying tick, call-put parity, then an explicit override (e.g. strategy spot).
     """
     underlying = getattr(chain, "underlying", None) if chain else None
@@ -440,6 +480,24 @@ def chain_spot_info(
     adj = float(getattr(chain, "underlying_adjustment", 0) or 0) if chain else 0.0
     atm = float(getattr(chain, "atm_price", 0) or 0) if chain else 0.0
     und_symbol = getattr(underlying, "vt_symbol", "") if underlying else ""
+    override = float(spot_override or 0)
+    anchor = _chain_strike_anchor(chain) if chain is not None else 0.0
+    tick_mid = 0.0
+    if und_symbol and main_engine is not None:
+        tick_mid = _tick_mid_price(main_engine.get_tick(und_symbol))
+
+    # Repair bid+ask-style mid_price before using it.
+    if mid > 0:
+        for ref in (tick_mid, override, atm, anchor):
+            if _almost_double(mid, ref):
+                mid = float(ref)
+                break
+        else:
+            # Mid far from every strike/override is unusable for GEX.
+            refs = [value for value in (override, tick_mid, atm, anchor) if value > 0]
+            if refs and not any(_spot_near(mid, ref, tol=0.20) for ref in refs):
+                mid = 0.0
+
     spot = 0.0
     from_mid = False
     source = ""
@@ -452,17 +510,10 @@ def chain_spot_info(
         spot = atm
         source = "atm_price"
 
-    if spot <= 0 and und_symbol and main_engine is not None:
-        tick = main_engine.get_tick(und_symbol)
-        if tick:
-            bid = float(getattr(tick, "bid_price_1", 0) or 0)
-            ask = float(getattr(tick, "ask_price_1", 0) or 0)
-            last = float(getattr(tick, "last_price", 0) or 0)
-            tick_mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else (bid or ask or last)
-            if tick_mid > 0:
-                spot = float(tick_mid) + adj
-                from_mid = True
-                source = "underlying_tick"
+    if spot <= 0 and tick_mid > 0:
+        spot = float(tick_mid) + adj
+        from_mid = True
+        source = "underlying_tick"
 
     if spot <= 0 and chain is not None:
         synth = _chain_parity_spot(chain)
@@ -470,11 +521,15 @@ def chain_spot_info(
             spot = synth
             source = "parity"
 
-    override = float(spot_override or 0)
-    if override > 0 and (spot <= 0 or source in {"", "parity"}):
-        # Explain / strategy callers pass live index spot; prefer it over parity.
+    if override > 0 and (
+        spot <= 0
+        or source in {"", "parity"}
+        or not _spot_near(spot, override, tol=0.05)
+    ):
+        # Strategy/explain spot wins when mid is missing, parity-only, or inconsistent.
         spot = override
         source = "override"
+        from_mid = False
 
     return {
         "chain_symbol": chain_symbol,
@@ -1438,6 +1493,16 @@ def process_event(event: Event) -> None:
     global _tick_ws_last
 
     if event.type == EVENT_TICK:
+        # Redis MD path does not update CTP PositionProfit — mark locally.
+        try:
+            tick = event.data
+            refresh_engine_position_pnl(
+                main_engine,
+                getattr(tick, "vt_symbol", None),
+                allow_redis=False,
+            )
+        except Exception:
+            pass
         if not active_websockets or event_loop is None:
             return
         now = time.monotonic()
@@ -1445,6 +1510,15 @@ def process_event(event: Event) -> None:
             return
         _tick_ws_last = now
         payload = {"topic": event.type, "data": compact_tick(event.data)}
+    elif event.type == EVENT_POSITION:
+        try:
+            refresh_engine_position_pnl(main_engine)
+            seed_position_md_subscribe(main_engine)
+        except Exception:
+            pass
+        if not active_websockets or event_loop is None:
+            return
+        payload = {"topic": event.type, "data": to_plain(event.data)}
     elif event.type in {
         EVENT_LOG,
         EVENT_CTA_LOG,
@@ -1696,12 +1770,20 @@ def get_trades(_: bool = Depends(get_access)) -> list[Any]:
 
 @app.get("/position")
 def get_positions(_: bool = Depends(get_access)) -> list[Any]:
-    return to_plain(require_main().get_all_positions())
+    engine = require_main()
+    refresh_engine_position_pnl(engine)
+    seed_position_md_subscribe(engine)
+    return to_plain(engine.get_all_positions())
 
 
 @app.get("/account")
 def get_accounts(_: bool = Depends(get_access)) -> list[Any]:
-    return to_plain(require_main().get_all_accounts())
+    engine = require_main()
+    # Enrich plain account dicts with floating pnl for clients that show it.
+    rows = serialize_accounts_with_pnl(engine)
+    if rows:
+        return rows
+    return to_plain(engine.get_all_accounts())
 
 
 @app.get("/contract")
@@ -1745,6 +1827,219 @@ def tick_last_price(tick) -> float:
     if bid and ask:
         return (bid + ask) / 2
     return bid or ask
+
+
+def direction_pnl_sign(direction: Any) -> float:
+    """+1 long / -1 short for floating PnL."""
+    if direction == Direction.SHORT:
+        return -1.0
+    text = str(getattr(direction, "value", direction) or "").strip().lower()
+    if text in {"空", "short", "s", "sell"}:
+        return -1.0
+    return 1.0
+
+
+def resolve_mark_price(
+    engine: MainEngine | None,
+    vt_symbol: str,
+    *,
+    allow_redis: bool = True,
+) -> float:
+    """Best available mark: in-memory tick, then Redis latest snapshot."""
+    if not vt_symbol:
+        return 0.0
+    if engine is not None:
+        price = tick_last_price(engine.get_tick(vt_symbol))
+        if price:
+            return price
+    if not allow_redis:
+        return 0.0
+    try:
+        from md_bus import load_latest_tick_dict
+
+        data = load_latest_tick_dict(vt_symbol)
+        if not data:
+            return 0.0
+        last = float(data.get("last_price") or 0)
+        if last:
+            return last
+        bid = float(data.get("bid_price_1") or 0)
+        ask = float(data.get("ask_price_1") or 0)
+        if bid and ask:
+            return (bid + ask) / 2
+        return bid or ask
+    except Exception:
+        return 0.0
+
+
+def compute_position_floating_pnl(
+    *,
+    direction: Any,
+    volume: float,
+    avg_price: float,
+    mark_price: float,
+    size: float,
+    fallback_pnl: float = 0.0,
+) -> float:
+    """Mark-to-market PnL; keep CTP pnl when mark is unavailable."""
+    vol = float(volume or 0)
+    avg = float(avg_price or 0)
+    mark = float(mark_price or 0)
+    mult = float(size or 0) or 1.0
+    if not vol or not avg or not mark:
+        return round(float(fallback_pnl or 0), 2)
+    pnl = (mark - avg) * vol * mult * direction_pnl_sign(direction)
+    return round(float(pnl), 2)
+
+
+_last_pnl_refresh_mono = 0.0
+
+
+def refresh_engine_position_pnl(
+    engine: MainEngine | None = None,
+    vt_symbol: str | None = None,
+    *,
+    allow_redis: bool = True,
+    min_interval: float = 0.0,
+) -> float:
+    """Rewrite PositionData.pnl from Redis/engine ticks (SKIP_MD leaves CTP pnl stale/0)."""
+    global _last_pnl_refresh_mono
+    engine = engine or main_engine
+    if engine is None:
+        return 0.0
+    if min_interval > 0:
+        now = time.monotonic()
+        if now - _last_pnl_refresh_mono < min_interval:
+            return 0.0
+        _last_pnl_refresh_mono = now
+    total = 0.0
+    for pos in engine.get_all_positions() or []:
+        pos_vt = getattr(pos, "vt_symbol", "") or ""
+        if vt_symbol and pos_vt != vt_symbol:
+            total += float(getattr(pos, "pnl", 0) or 0)
+            continue
+        volume = float(getattr(pos, "volume", 0) or 0)
+        if not volume:
+            try:
+                pos.pnl = 0.0
+            except Exception:
+                pass
+            continue
+        contract = engine.get_contract(pos_vt)
+        size = float(getattr(contract, "size", 0) or 0) if contract else 0.0
+        mark = resolve_mark_price(engine, pos_vt, allow_redis=allow_redis)
+        pnl = compute_position_floating_pnl(
+            direction=getattr(pos, "direction", None),
+            volume=volume,
+            avg_price=float(getattr(pos, "price", 0) or 0),
+            mark_price=mark,
+            size=size,
+            fallback_pnl=float(getattr(pos, "pnl", 0) or 0),
+        )
+        try:
+            pos.pnl = pnl
+        except Exception:
+            pass
+        total += pnl
+    return round(total, 2)
+
+
+_last_pos_md_seed = 0.0
+
+
+def seed_position_md_subscribe(engine: MainEngine | None = None) -> dict[str, Any]:
+    """Publish open-position contracts so md_receiver can subscribe them for MTM PnL."""
+    global _last_pos_md_seed
+    engine = engine or main_engine
+    now = time.time()
+    if engine is None or now - _last_pos_md_seed < 10.0:
+        return {"ok": False, "skipped": True}
+    _last_pos_md_seed = now
+    symbols: list[str] = []
+    contracts: list[Any] = []
+    for pos in engine.get_all_positions() or []:
+        if float(getattr(pos, "volume", 0) or 0) == 0:
+            continue
+        vt_symbol = getattr(pos, "vt_symbol", "") or ""
+        if not vt_symbol:
+            continue
+        symbols.append(vt_symbol)
+        contract = engine.get_contract(vt_symbol)
+        if contract is not None:
+            contracts.append(contract)
+        # Also ensure underlying futures for option symbols when present.
+        und = getattr(contract, "option_underlying", None) if contract else None
+        if und:
+            und_vt = und if "." in str(und) else f"{und}.{getattr(contract.exchange, 'value', '')}"
+            if und_vt and und_vt not in symbols:
+                und_c = engine.get_contract(und_vt)
+                if und_c is not None:
+                    symbols.append(und_vt)
+                    contracts.append(und_c)
+    result: dict[str, Any] = {"ok": True, "symbols": symbols}
+    try:
+        from md_bus import set_extra_subscribe_symbols, store_contracts_to_redis
+
+        result["extra"] = set_extra_subscribe_symbols(symbols)
+        if contracts:
+            result["contracts"] = store_contracts_to_redis(contracts, publish=True)
+    except Exception as exc:
+        result["ok"] = False
+        result["error"] = str(exc)
+    return result
+
+
+def serialize_accounts_with_pnl(engine: MainEngine | None = None) -> list[dict[str, Any]]:
+    engine = engine or main_engine
+    if engine is None:
+        return []
+    total_pnl = refresh_engine_position_pnl(engine)
+    rows = []
+    for item in engine.get_all_accounts() or []:
+        rows.append(
+            {
+                "accountid": getattr(item, "accountid", ""),
+                "balance": getattr(item, "balance", 0),
+                "available": getattr(item, "available", 0),
+                "frozen": getattr(item, "frozen", 0),
+                # AccountData has no broker pnl field under Redis-MD; show book floating PnL.
+                "pnl": total_pnl,
+                "vt_accountid": getattr(item, "vt_accountid", ""),
+                "gateway_name": getattr(item, "gateway_name", ""),
+            }
+        )
+    return rows
+
+
+def serialize_positions_with_pnl(engine: MainEngine | None = None) -> list[dict[str, Any]]:
+    engine = engine or main_engine
+    if engine is None:
+        return []
+    refresh_engine_position_pnl(engine)
+    seed_position_md_subscribe(engine)
+    rows = []
+    for item in engine.get_all_positions() or []:
+        volume = float(getattr(item, "volume", 0) or 0)
+        if volume == 0:
+            continue
+        direction = getattr(item, "direction", None)
+        rows.append(
+            {
+                "vt_symbol": getattr(item, "vt_symbol", ""),
+                "symbol": getattr(item, "symbol", ""),
+                "exchange": getattr(getattr(item, "exchange", None), "value", str(getattr(item, "exchange", ""))),
+                "direction": getattr(direction, "value", str(direction or "")),
+                "volume": volume,
+                "frozen": getattr(item, "frozen", 0),
+                "price": getattr(item, "price", 0),
+                "pnl": getattr(item, "pnl", 0),
+                "yd_volume": getattr(item, "yd_volume", 0),
+                "vt_positionid": getattr(item, "vt_positionid", ""),
+                "gateway_name": getattr(item, "gateway_name", ""),
+                "mark_price": resolve_mark_price(engine, getattr(item, "vt_symbol", "") or ""),
+            }
+        )
+    return rows
 
 
 def account_net_pos(engine: MainEngine, vt_symbol: str, symbol: str = "") -> float:
@@ -4000,41 +4295,124 @@ def _realized_hv_from_closes(closes: list[float], lookback: int = 20) -> float:
     return max(0.08, min(0.80, math.sqrt(var) * math.sqrt(242)))
 
 
-def _load_daily_closes_for_portfolio(portfolio_name: str, lookback: int = 65) -> list[float]:
+def _daily_cache_filename(portfolio_name: str) -> str:
     product = str(portfolio_name or "IO").split(".")[0].upper()
-    fname = {
+    return {
         "IO": "if_daily_cache.json",
         "IF": "if_daily_cache.json",
         "HO": "ih_daily_cache.json",
         "IH": "ih_daily_cache.json",
         "MO": "im_daily_cache.json",
         "IM": "im_daily_cache.json",
-    }.get(product)
-    if not fname:
-        return []
-    path = WEB_SCRIPTS_DIR.joinpath(fname)
-    if not path.exists():
-        return []
-    try:
-        rows = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    closes: list[float] = []
+    }.get(product, "")
+
+
+def _normalize_bar_date(value: Any) -> str:
+    text = str(value or "").strip().replace("/", "-")
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    if "T" in text:
+        return text.split("T", 1)[0][:10]
+    if " " in text:
+        return text.split(" ", 1)[0][:10]
+    return text[:10]
+
+
+def _parse_daily_bar_rows(rows: Any) -> list[dict[str, Any]]:
+    bars: list[dict[str, Any]] = []
+    if not isinstance(rows, list):
+        return bars
     for row in rows:
         try:
             if isinstance(row, (list, tuple)) and len(row) >= 5:
+                stamp = _normalize_bar_date(row[0])
                 px = float(row[4])
             elif isinstance(row, dict):
+                stamp = _normalize_bar_date(row.get("date") or row.get("datetime") or row.get("time"))
                 px = float(row.get("close") or 0)
             else:
                 continue
         except (TypeError, ValueError):
             continue
-        if px > 0:
-            closes.append(px)
+        if stamp and px > 0:
+            bars.append({"date": stamp, "close": px})
+    bars.sort(key=lambda item: item["date"])
+    dedup: dict[str, dict[str, Any]] = {}
+    for item in bars:
+        dedup[item["date"]] = item
+    return [dedup[key] for key in sorted(dedup)]
+
+
+def _load_daily_bars_for_portfolio(
+    portfolio_name: str,
+    lookback: int = 65,
+    *,
+    refresh_if_stale_days: int = 3,
+) -> tuple[list[dict[str, Any]], str]:
+    """Load dated daily closes; optionally refresh akshare cache when stale."""
+    fname = _daily_cache_filename(portfolio_name)
+    if not fname:
+        return [], "unsupported"
+    path = WEB_SCRIPTS_DIR.joinpath(fname)
+    source = "daily_cache"
+    bars = _parse_daily_bar_rows(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else []
+    last_date = bars[-1]["date"] if bars else ""
+    stale = True
+    if last_date:
+        try:
+            age = (datetime.now().date() - datetime.strptime(last_date, "%Y-%m-%d").date()).days
+            stale = age > max(0, int(refresh_if_stale_days))
+        except ValueError:
+            stale = True
+    if stale:
+        refreshed = _refresh_daily_cache_file(fname)
+        if refreshed:
+            bars = refreshed
+            source = "daily_cache_refresh"
+            last_date = bars[-1]["date"] if bars else last_date
+        elif bars:
+            source = "daily_cache_stale"
     if lookback > 0:
-        closes = closes[-lookback:]
-    return closes
+        bars = bars[-lookback:]
+    return bars, source if bars else "empty"
+
+
+def _refresh_daily_cache_file(fname: str) -> list[dict[str, Any]]:
+    """Best-effort refresh of scripts/*_daily_cache.json via matching fetch module."""
+    module_map = {
+        "if_daily_cache.json": "fetch_if_daily",
+        "sa_daily_cache.json": "fetch_sa_daily",
+    }
+    mod_name = module_map.get(fname)
+    if not mod_name:
+        return []
+    path = WEB_SCRIPTS_DIR.joinpath(f"{mod_name}.py")
+    if not path.exists():
+        return []
+    try:
+        spec = importlib.util.spec_from_file_location(f"vn_web_{mod_name}", path)
+        if spec is None or spec.loader is None:
+            return []
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not hasattr(module, "fetch"):
+            return []
+        df, _label = module.fetch()
+        rows = module.frame_to_rows(df)
+        cache_path = WEB_SCRIPTS_DIR.joinpath(fname)
+        cache_path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+        return _parse_daily_bar_rows(rows)
+    except Exception:
+        return []
+
+
+def _load_daily_closes_for_portfolio(portfolio_name: str, lookback: int = 65) -> list[float]:
+    bars, _source = _load_daily_bars_for_portfolio(
+        portfolio_name, lookback=lookback, refresh_if_stale_days=0
+    )
+    return [float(item["close"]) for item in bars]
 
 
 def _rebuild_hv_hist_from_closes(closes: list[float], hv_lookback: int = 20) -> list[float]:
@@ -4044,6 +4422,57 @@ def _rebuild_hv_hist_from_closes(closes: list[float], hv_lookback: int = 20) -> 
     for end in range(hv_lookback + 1, len(closes) + 1):
         hist.append(_realized_hv_from_closes(closes[:end], hv_lookback))
     return hist
+
+
+def _rebuild_hv_series_from_bars(
+    bars: list[dict[str, Any]],
+    hv_lookback: int = 20,
+    iv_rank_lookback: int = 60,
+) -> list[dict[str, Any]]:
+    """Each HV point is dated by the close day at the end of its lookback window."""
+    closes = [float(item["close"]) for item in bars]
+    dates = [str(item["date"]) for item in bars]
+    if len(closes) < hv_lookback + 1:
+        return []
+    series: list[dict[str, Any]] = []
+    for end in range(hv_lookback + 1, len(closes) + 1):
+        hv = _realized_hv_from_closes(closes[:end], hv_lookback)
+        series.append({"date": dates[end - 1], "hv": round(float(hv), 4)})
+    if iv_rank_lookback > 0:
+        series = series[-iv_rank_lookback:]
+    return series
+
+
+def _merge_strategy_closes_with_dates(
+    bars: list[dict[str, Any]],
+    day_closes: list[float],
+    day_dates: list[str],
+) -> list[dict[str, Any]]:
+    """Prefer strategy closes when dates exist; otherwise align cache dates from the end."""
+    paired: list[dict[str, Any]] = []
+    if day_closes and day_dates and len(day_dates) >= len(day_closes):
+        for stamp, px in zip(day_dates[-len(day_closes) :], day_closes):
+            stamp = _normalize_bar_date(stamp)
+            try:
+                close = float(px)
+            except (TypeError, ValueError):
+                continue
+            if stamp and close > 0:
+                paired.append({"date": stamp, "close": close})
+        if paired:
+            return paired
+    if day_closes and bars and len(bars) >= len(day_closes):
+        tail = bars[-len(day_closes) :]
+        for item, px in zip(tail, day_closes):
+            try:
+                close = float(px)
+            except (TypeError, ValueError):
+                close = float(item["close"])
+            if close > 0:
+                paired.append({"date": item["date"], "close": close})
+        if paired:
+            return paired
+    return bars
 
 
 def resolve_iv_rank_series(data: dict[str, Any]) -> dict[str, Any]:
@@ -4070,39 +4499,52 @@ def resolve_iv_rank_series(data: dict[str, Any]) -> dict[str, Any]:
         40.0,
     )
 
-    hv_hist_raw = data.get("hv_hist") or book_snap.get("hv_hist") or []
-    hv_hist: list[float] = []
-    for item in hv_hist_raw:
+    day_closes_raw = book_snap.get("day_closes") or data.get("day_closes") or []
+    day_dates_raw = book_snap.get("day_dates") or data.get("day_dates") or []
+    day_closes: list[float] = []
+    for item in day_closes_raw:
         try:
-            value = float(item)
+            px = float(item)
         except (TypeError, ValueError):
             continue
-        if value > 0:
-            hv_hist.append(value)
-    source = "strategy" if hv_hist else ""
+        if px > 0:
+            day_closes.append(px)
+    day_dates = [_normalize_bar_date(item) for item in day_dates_raw if _normalize_bar_date(item)]
 
-    if not hv_hist:
-        closes = book_snap.get("day_closes") or data.get("day_closes") or []
-        close_vals: list[float] = []
-        for item in closes:
+    cache_bars, cache_source = _load_daily_bars_for_portfolio(
+        portfolio,
+        lookback=iv_rank_lookback + hv_lookback + 5,
+        refresh_if_stale_days=3,
+    )
+    dated_bars = _merge_strategy_closes_with_dates(cache_bars, day_closes, day_dates)
+    if not dated_bars and cache_bars:
+        dated_bars = cache_bars
+
+    source = ""
+    hv_series = _rebuild_hv_series_from_bars(
+        dated_bars, hv_lookback=hv_lookback, iv_rank_lookback=iv_rank_lookback
+    )
+    if hv_series:
+        if day_dates and day_closes:
+            source = "strategy_dated"
+        elif day_closes and cache_bars:
+            source = f"{cache_source}+strategy_closes"
+        else:
+            source = cache_source
+    else:
+        # Last resort: undated strategy hv_hist (no chart dates).
+        hv_hist_raw = data.get("hv_hist") or book_snap.get("hv_hist") or []
+        for item in hv_hist_raw:
             try:
-                px = float(item)
+                value = float(item)
             except (TypeError, ValueError):
                 continue
-            if px > 0:
-                close_vals.append(px)
-        if len(close_vals) < hv_lookback + 1:
-            close_vals = _load_daily_closes_for_portfolio(
-                portfolio, lookback=iv_rank_lookback + hv_lookback + 5
-            )
-            if close_vals:
-                source = "daily_cache"
-        elif not source:
-            source = "day_closes"
-        if close_vals:
-            rebuilt = _rebuild_hv_hist_from_closes(close_vals, hv_lookback=hv_lookback)
-            hv_hist = rebuilt[-iv_rank_lookback:] if rebuilt else []
+            if value > 0:
+                hv_series.append({"date": "", "hv": round(value, 4)})
+        if hv_series:
+            source = "strategy"
 
+    hv_hist = [float(row["hv"]) for row in hv_series]
     current_hv = _float(calc.get("current_hv") or data.get("hv") or book_snap.get("hv"), 0.0)
     current_iv = _float(
         calc.get("current_iv") or data.get("iv") or (data.get("indicators") or {}).get("iv"),
@@ -4113,26 +4555,29 @@ def resolve_iv_rank_series(data: dict[str, Any]) -> dict[str, Any]:
     if current_iv <= 0 and current_hv > 0:
         current_iv = current_hv * iv_factor
 
-    below_count = int(calc.get("below_count") or 0)
-    if hv_hist and (not calc.get("below_count") or source != "strategy"):
-        below_count = sum(1 for item in hv_hist if item <= current_iv)
+    below_count = sum(1 for item in hv_hist if item <= current_iv) if hv_hist else int(calc.get("below_count") or 0)
     sample_n = len(hv_hist)
     rank = _float(data.get("iv_rank") or (data.get("indicators") or {}).get("iv_rank"), 0.0)
     if sample_n > 0:
         rank = 100.0 * below_count / sample_n
     hv_ready = bool(calc.get("hv_ready")) if "hv_ready" in calc else sample_n >= 10
+    start_date = hv_series[0].get("date") if hv_series else ""
+    end_date = hv_series[-1].get("date") if hv_series else ""
     series = [
         {
             "index": i + 1,
-            "hv": round(value, 4),
-            "below_iv": bool(value <= current_iv),
+            "date": row.get("date") or "",
+            "hv": round(float(row.get("hv") or 0), 4),
+            "below_iv": bool(float(row.get("hv") or 0) <= current_iv),
         }
-        for i, value in enumerate(hv_hist)
+        for i, row in enumerate(hv_series)
     ]
     return {
         "source": source or ("empty" if not hv_hist else source),
         "hv_hist": [round(v, 4) for v in hv_hist],
         "series": series,
+        "start_date": start_date,
+        "end_date": end_date,
         "current_hv": round(current_hv, 4) if current_hv else 0.0,
         "current_iv": round(current_iv, 4) if current_iv else 0.0,
         "hv60": round(_float(calc.get("hv60") or data.get("hv60"), 0.0), 4),
@@ -4144,7 +4589,7 @@ def resolve_iv_rank_series(data: dict[str, Any]) -> dict[str, Any]:
         "iv_rank": round(rank, 1),
         "iv_rank_min": iv_rank_min,
         "hv_ready": hv_ready,
-        "closes_n": int(calc.get("closes_n") or 0),
+        "closes_n": int(calc.get("closes_n") or len(dated_bars) or 0),
         "min_hv": round(min(hv_hist), 4) if hv_hist else 0.0,
         "max_hv": round(max(hv_hist), 4) if hv_hist else 0.0,
         "median_hv": round(sorted(hv_hist)[len(hv_hist) // 2], 4) if hv_hist else 0.0,
@@ -4255,6 +4700,11 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
                 (
                     f"历史 HV 样本：N={iv_rank_info.get('sample_n')} "
                     f"（回看 {iv_rank_info.get('iv_rank_lookback')}，HV 窗 {iv_rank_info.get('hv_lookback')}）"
+                    + (
+                        f"；区间 {iv_rank_info.get('start_date')} ~ {iv_rank_info.get('end_date')}"
+                        if iv_rank_info.get("start_date") and iv_rank_info.get("end_date")
+                        else ""
+                    )
                 ),
                 (
                     f"其中 HV ≤ 当前 IV 的个数：{iv_rank_info.get('below_count')} "
@@ -4278,12 +4728,25 @@ def build_live_indicator_explains(data: dict[str, Any]) -> dict[str, Any]:
                 "threshold": float(iv_rank_info.get("iv_rank_min") or 40),
                 "below_count": iv_rank_info.get("below_count"),
                 "sample_n": iv_rank_info.get("sample_n"),
-                "label": "历史 HV vs 当前 IV",
+                "start_date": iv_rank_info.get("start_date"),
+                "end_date": iv_rank_info.get("end_date"),
+                "label": (
+                    "历史 HV vs 当前 IV"
+                    + (
+                        f"（{iv_rank_info.get('start_date')} ~ {iv_rank_info.get('end_date')}）"
+                        if iv_rank_info.get("start_date") and iv_rank_info.get("end_date")
+                        else ""
+                    )
+                ),
             },
             "table": {
-                "columns": ["序号", "HV", "≤当前IV"],
+                "columns": ["日期", "HV", "≤当前IV"],
                 "rows": [
-                    [row.get("index"), row.get("hv"), "是" if row.get("below_iv") else "否"]
+                    [
+                        row.get("date") or row.get("index"),
+                        row.get("hv"),
+                        "是" if row.get("below_iv") else "否",
+                    ]
                     for row in (iv_rank_info.get("series") or [])[-20:]
                 ],
             },
@@ -4538,25 +5001,19 @@ def live_monitor_payload() -> dict[str, Any]:
     accounts = []
     positions = []
     if main_engine is not None:
-        accounts = [
-            {
-                "accountid": getattr(item, "accountid", ""),
-                "balance": getattr(item, "balance", 0),
-                "available": getattr(item, "available", 0),
-                "frozen": getattr(item, "frozen", 0),
-            }
-            for item in (main_engine.get_all_accounts() or [])
-        ]
+        refresh_engine_position_pnl(main_engine)
+        seed_position_md_subscribe(main_engine)
+        accounts = serialize_accounts_with_pnl(main_engine)
         positions = [
             {
-                "vt_symbol": getattr(item, "vt_symbol", ""),
-                "direction": getattr(getattr(item, "direction", None), "value", str(getattr(item, "direction", ""))),
-                "volume": getattr(item, "volume", 0),
-                "price": getattr(item, "price", 0),
-                "pnl": getattr(item, "pnl", 0),
+                "vt_symbol": item.get("vt_symbol", ""),
+                "direction": item.get("direction", ""),
+                "volume": item.get("volume", 0),
+                "price": item.get("price", 0),
+                "pnl": item.get("pnl", 0),
+                "mark_price": item.get("mark_price", 0),
             }
-            for item in (main_engine.get_all_positions() or [])
-            if float(getattr(item, "volume", 0) or 0) != 0
+            for item in serialize_positions_with_pnl(main_engine)
         ]
     indicators = {
         "spot": data.get("spot"),

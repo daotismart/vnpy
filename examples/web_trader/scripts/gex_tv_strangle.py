@@ -687,6 +687,7 @@ class GexTvStrangle:
         self.day_highs: deque[float] = deque(maxlen=cfg.iv_rank_lookback + 5)
         self.day_lows: deque[float] = deque(maxlen=cfg.iv_rank_lookback + 5)
         self.day_closes: deque[float] = deque(maxlen=cfg.iv_rank_lookback + 5)
+        self.day_dates: deque[str] = deque(maxlen=cfg.iv_rank_lookback + 5)
         self.hv_hist: deque[float] = deque(maxlen=cfg.iv_rank_lookback)
         self.today: date | None = None
         self.session_high = 0.0
@@ -736,6 +737,7 @@ class GexTvStrangle:
             "book": self.book_payload(),
             "hv_hist": list(self.hv_hist),
             "day_closes": list(self.day_closes),
+            "day_dates": list(self.day_dates),
             "day_highs": list(self.day_highs),
             "day_lows": list(self.day_lows),
         }
@@ -912,6 +914,13 @@ class GexTvStrangle:
                     dest.append(float(value))
                 except (TypeError, ValueError):
                     continue
+        for value in saved.get("day_dates") or []:
+            stamp = str(value or "").strip()[:10]
+            if stamp:
+                self.day_dates.append(stamp)
+        # Align / backfill dates from cache when restores only have closes.
+        if self.day_closes and len(self.day_dates) < len(self.day_closes):
+            self._backfill_day_dates_from_cache()
         if len(self.day_closes) < self.cfg.hv_lookback + 1:
             self.seed_hv_from_cache()
         elif not self.hv_hist:
@@ -964,6 +973,8 @@ class GexTvStrangle:
     def seed_hv_from_cache(self) -> None:
         if len(self.day_closes) >= self.cfg.hv_lookback + 1:
             self.rebuild_hv_hist()
+            if len(self.day_dates) < len(self.day_closes):
+                self._backfill_day_dates_from_cache()
             return
         product = self.cfg.portfolio_name.split(".")[0].upper()
         fname = {
@@ -983,30 +994,73 @@ class GexTvStrangle:
             rows = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return
-        closes: list[float] = []
+        bars: list[tuple[str, float]] = []
         for row in rows:
             try:
                 if isinstance(row, (list, tuple)) and len(row) >= 5:
+                    stamp = str(row[0])[:10]
                     px = float(row[4])
                 elif isinstance(row, dict):
+                    stamp = str(row.get("date") or row.get("datetime") or "")[:10]
                     px = float(row.get("close") or 0)
                 else:
                     continue
             except (TypeError, ValueError):
                 continue
-            if px > 0:
-                closes.append(px)
-        if len(closes) < self.cfg.hv_lookback + 1:
+            if stamp and px > 0:
+                bars.append((stamp, px))
+        if len(bars) < self.cfg.hv_lookback + 1:
             return
         self.day_closes.clear()
+        self.day_dates.clear()
         self.day_highs.clear()
         self.day_lows.clear()
-        for px in closes[-(self.cfg.iv_rank_lookback + 5) :]:
+        for stamp, px in bars[-(self.cfg.iv_rank_lookback + 5) :]:
+            self.day_dates.append(stamp)
             self.day_closes.append(px)
             self.day_highs.append(px)
             self.day_lows.append(px)
         self.rebuild_hv_hist()
         self.write(f"已从 {fname} 灌入 HV 样本 {len(self.day_closes)} 日 / {len(self.hv_hist)} 段")
+
+    def _backfill_day_dates_from_cache(self) -> None:
+        """Fill missing day_dates by aligning the tail of the daily cache."""
+        if not self.day_closes:
+            return
+        product = self.cfg.portfolio_name.split(".")[0].upper()
+        fname = {
+            "IO": "if_daily_cache.json",
+            "IF": "if_daily_cache.json",
+            "HO": "ih_daily_cache.json",
+            "IH": "ih_daily_cache.json",
+            "MO": "im_daily_cache.json",
+            "IM": "im_daily_cache.json",
+        }.get(product)
+        if not fname:
+            return
+        path = Path(__file__).resolve().parent.joinpath(fname)
+        if not path.exists():
+            return
+        try:
+            rows = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        dates: list[str] = []
+        for row in rows:
+            if isinstance(row, (list, tuple)) and row:
+                stamp = str(row[0])[:10]
+            elif isinstance(row, dict):
+                stamp = str(row.get("date") or row.get("datetime") or "")[:10]
+            else:
+                continue
+            if stamp:
+                dates.append(stamp)
+        if len(dates) < len(self.day_closes):
+            return
+        tail = dates[-len(self.day_closes) :]
+        self.day_dates.clear()
+        for stamp in tail:
+            self.day_dates.append(stamp)
 
     def skip_once(self, reason: str) -> None:
         now = now_ts()
@@ -1038,6 +1092,7 @@ class GexTvStrangle:
                 self.day_highs.append(self.session_high)
                 self.day_lows.append(self.session_low)
                 self.day_closes.append(self.last_spot)
+                self.day_dates.append(self.today.isoformat())
                 self.hv_hist.append(self.realized_hv())
             self.today = today
             self.session_high = self.session_low = spot
@@ -1442,6 +1497,8 @@ class GexTvStrangle:
                 "kelly": kelly_info,
                 "signals": signals,
                 "hv_hist": [round(float(x), 4) for x in self.hv_hist],
+                "day_closes": [round(float(x), 4) for x in self.day_closes],
+                "day_dates": list(self.day_dates),
                 "iv_rank_calc": {
                     "current_iv": round(iv, 4),
                     "current_hv": round(hv, 4),
@@ -1454,6 +1511,8 @@ class GexTvStrangle:
                     "iv_rank_min": float(self.cfg.iv_rank_min),
                     "hv_ready": bool(hv_ready),
                     "closes_n": len(self.day_closes),
+                    "start_date": self.day_dates[0] if self.day_dates else "",
+                    "end_date": self.day_dates[-1] if self.day_dates else "",
                 },
                 "pick": None
                 if pick is None

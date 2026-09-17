@@ -73,12 +73,23 @@ def frame_to_rows(df) -> list[list]:
 
 def fetch() -> tuple[object, str]:
     import akshare as ak
+    from datetime import datetime
 
+    # Keep CSI300 fallback open-ended so Rank history does not freeze on a hard-coded day.
+    end = datetime.now().strftime("%Y%m%d")
     errors: list[str] = []
     attempts = [
         ("futures_main_sina IF0", lambda: ak.futures_main_sina(symbol="IF0")),
         ("futures_zh_daily_sina IF0", lambda: ak.futures_zh_daily_sina(symbol="IF0")),
-        ("index_zh_a_hist 000300", lambda: ak.index_zh_a_hist(symbol="000300", period="daily", start_date="20191223", end_date="20260831")),
+        (
+            "index_zh_a_hist 000300",
+            lambda: ak.index_zh_a_hist(
+                symbol="000300",
+                period="daily",
+                start_date="20191223",
+                end_date=end,
+            ),
+        ),
     ]
     for label, func in attempts:
         try:
